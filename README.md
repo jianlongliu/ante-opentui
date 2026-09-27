@@ -14,35 +14,31 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 
 ## 实现清单
 
-### 已实现（均已实测）
+**未实现（按优先级；每条验证法见 `TODO.md`）**
 
-| # | 项 | 说明 |
-| --- | --- | --- |
-| 1 | 真 v2 TUI 起界 | 顶栏、块字 logo、composer、页脚全部由垫片喂出 |
-| 2 | 提示词送达 | `POST /api/session` → `POST …/model` → `POST …/prompt` |
-| 3 | 真 Ante 回复 | `ante-sdk` 连 `ante serve --stdio`；模型名、耗时、token 均为真实数据 |
-| 4 | 流式文本 | `step.started` → `text.started` → `text.delta` ×N → `text.ended` |
-| 5 | 推理（thinking） | `session.reasoning.started/delta/ended`；显示为 `+ Thought · 762ms` |
-| 6 | 工具调用 | `✓ Bash [命令, 描述]`，含参数与输出 |
-| 7 | 审批 | Ante 暂停 → TUI 弹 `△ Permission required` → 在 TUI 批准 → `ApprovalResponse` → Ante 继续执行 |
-| 8 | 消息顺序与去重 | `inbox.enqueued`+`delivered` 入列表；复用客户端提交自带的 message id |
-| 9 | boot 接口全套 | `health` `location` `fs/list` `agent` `provider` `model` `config` `vcs` `project` `plugin` `migration` … |
-| 10 | 事件流（SSE） | `{id, type, created, data}` 帧，首帧 `server.connected` |
+- [ ] **中断收尾** —— `POST …/interrupt` 已通、Ante 也收到了，但**中断后界面卡转轮**；缺收尾事件（`step.ended` / `execution.interrupted`）
+- [ ] **多轮消息落位** —— 单轮正常；连发多条时用户消息成组堆在底部、没进对话流（疑 `inbox.delivered` 的 `admitted` 条件不满足）
+- [ ] **会话列表 / `/sessions` / `/resume`** —— 接口返回空，选择器打开是空的。Ante 侧数据现成：`~/.ante/sessions/*/meta.json` + `ResumeSession`
+- [ ] **`shift+tab` 切 agent、模型选择** —— 垫片只提供一个 agent（`build`），未实现 `POST …/agent`
+- [ ] **`@` 文件补全** —— `/api/fs/list` 返回空
+- [ ] **diff / LSP / formatter / MCP / VCS** —— 打桩。**这些是 Ante 根本没有的概念，只能显示为空，别指望填上**
+- [ ] **`/compact` 压缩、撤销回滚、贴图、PTY、分享**
+- [ ] **次要事件** —— `session.step.streamed`、`instructions.updated`、`renamed`、`model.selected` 未发（缺了不致命）
+- [ ] **垫片命令行参数** —— 不解析；非数字参数被忽略、端口被占直接 panic（`AddrInUse`）
 
-### 未实现（按优先级；详细验证法见 `TODO.md`）
+**已实现（均已实测）**
 
-| # | 项 | 现状 |
-| --- | --- | --- |
-| 1 | **中断收尾** | `POST …/interrupt` 已通、Ante 也收到了，但**中断后界面卡转轮**——缺收尾事件（`step.ended` / `execution.interrupted`） |
-| 2 | **多轮消息落位** | 单轮正常；连发多条时用户消息成组堆在底部、没进对话流（疑 `inbox.delivered` 的 `admitted` 条件不满足） |
-| 3 | **会话列表 / `/sessions` / `/resume`** | 接口返回空，选择器打开是空的。Ante 侧数据现成：`~/.ante/sessions/*/meta.json` + `ResumeSession` |
-| 4 | **`shift+tab` 切 agent、模型选择** | 未实现——垫片只提供一个 agent（`build`），未实现 `POST …/agent` |
-| 5 | `@` 文件补全 | `/api/fs/list` 返回空，列表自然为空 |
-| 6 | diff 视图 / LSP / formatter / MCP / VCS | 一律打桩。**这些是 Ante 根本没有的概念，只能显示为空，别指望填上** |
-| 7 | `/compact` 压缩、撤销回滚 | 未实现 |
-| 8 | 贴图、PTY、分享 | 未实现 |
-| 9 | 次要事件 | 未发：`session.step.streamed`、`session.instructions.updated`、`session.renamed`、`session.model.selected`（缺了不致命） |
-| 10 | 垫片命令行参数 | 不解析：非数字参数被忽略、回落到 41999；端口被占直接 panic（`AddrInUse`） |
+- [x] **真 v2 TUI 起界** —— 顶栏、块字 logo、composer、页脚全部由垫片喂出
+- [x] **提示词送达** —— `POST /api/session` → `POST …/model` → `POST …/prompt`
+- [x] **真 Ante 回复** —— `ante-sdk` 连 `ante serve --stdio`；模型名、耗时、token 均为真实数据
+- [x] **流式文本** —— `step.started` → `text.started` → `text.delta` ×N → `text.ended`
+- [x] **推理（thinking）** —— `session.reasoning.started/delta/ended`，显示为 `+ Thought · 762ms`
+- [x] **工具调用** —— `✓ Bash [命令, 描述]`，含参数与输出
+- [x] **审批** —— Ante 暂停 → TUI 弹 `△ Permission required` → 在 TUI 批准 → `ApprovalResponse` → Ante 继续执行
+- [x] **消息顺序与去重** —— `inbox.enqueued`+`delivered` 入列表；复用客户端提交自带的 message id
+- [x] **boot 接口全套** —— `health` `location` `fs/list` `agent` `provider` `model` `config` `vcs` `project` `plugin` `migration` …
+- [x] **事件流（SSE）** —— `{id, type, created, data}` 帧，首帧 `server.connected`
+
 
 ## 怎么跑
 
