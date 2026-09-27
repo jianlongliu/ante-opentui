@@ -151,13 +151,8 @@ session.step.started → session.text.started → session.text.delta ×N → ses
 
 ## 下一步
 
-1. 补次要事件（真 server 会发，缺了不致命）：`session.step.streamed`、`session.inbox.enqueued/delivered`、`session.instructions.updated`、`session.renamed`、`session.model.selected`。
-2. 补 `session.step.streamed` / `session.inbox.*` / `session.renamed` 等次要事件（真 server 会发，缺了不致命）。
-3. 补桩端点（LSP/MCP/formatter/VCS/OAuth）直到 TUI 无空洞。
-4. 垫片不解析命令行参数：非数字参数被忽略、回落到 41999；端口被占直接 panic（`AddrInUse`）。补优雅报错。
-2. 映射审批：Ante `TurnPause{Approval}` → opencode 的 permission 请求，并把回执转回 `ApprovalResponse`。
-3. 补齐其余桩端点（LSP/MCP/formatter/VCS/OAuth 等）直到 TUI 不再有空洞。
-4. 之后转**魔改**：在 `packages/client/` 那条缝后面直接接 Ante，把垫片假装的服务面砍掉。
+见上面的**实现清单 · 未实现**，按那份优先级做；每条的具体验证法在 `TODO.md`。
+其中「中断收尾」和「多轮消息落位」是当前功能的直接缺陷，先修；「会话列表」「agent 切换」是缺口；LSP/formatter/git 那类 Ante 没有的概念，只打桩。
 
 ## 魔改上游 TUI
 
