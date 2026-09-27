@@ -132,7 +132,7 @@ session.step.started → session.text.started → session.text.delta ×N → ses
 
 ## 下一步
 
-1. 映射审批：Ante `TurnPause{Approval}` → opencode 的 permission 请求，回执转回 `ApprovalResponse`。
+1. 补次要事件（真 server 会发，缺了不致命）：`session.step.streamed`、`session.inbox.enqueued/delivered`、`session.instructions.updated`、`session.renamed`、`session.model.selected`。
 2. 补 `session.step.streamed` / `session.inbox.*` / `session.renamed` 等次要事件（真 server 会发，缺了不致命）。
 3. 补桩端点（LSP/MCP/formatter/VCS/OAuth）直到 TUI 无空洞。
 4. 垫片不解析命令行参数：非数字参数被忽略、回落到 41999；端口被占直接 panic（`AddrInUse`）。补优雅报错。
@@ -174,6 +174,15 @@ cd vendor/opencode && bun run dev -- --server http://127.0.0.1:41999
 
 **体积**：工作树约 159M，其中宣传视频（`packages/console/app/src/asset/lander/*.mp4`）与 `artifacts/` 占大头；
 `.git` 经 `git gc --prune=now` 回收后约 84M。裁剪这些文件会让 subtree 每次都冲突，故保持原样。
+
+## 审批
+
+Ante 暂停时（`TurnPause{Approval}`）垫片发 `permission.asked`，TUI 弹窗；用户在 TUI 里选
+`once` / `always` / `reject`，垫片经 `POST /api/session/{id}/permission/{requestID}/reply` 收回，
+转成 Ante 的 `Accept` / `AcceptAlways` / `Deny` 发 `ApprovalResponse`。
+
+Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yolo`（默认 `auto`）。
+要测审批弹窗用 `strict`——`auto` 下多数命令被判定为「可证明安全」直接放行。
 
 ## 目录
 

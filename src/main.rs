@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ante_sdk::{
     ConnectOptions, OpSender, connect,
-    protocol::{Evt, Op, SessionRequest},
+    protocol::{Evt, Id, Op, ReviewDecision, SessionRequest, ToolDecision, ToolUse, TurnPauseReason},
 };
 use axum::{
     Json, Router,
@@ -73,6 +73,16 @@ struct Ante {
     /// Which opencode session the events belong to. One Ante session is
     /// mirrored, so this is the most recent one the TUI opened.
     active: Arc<Mutex<Option<String>>>,
+    /// A pause waiting for a decision: the Ante turn and tools, keyed by the
+    /// request id the TUI will reply with.
+    pending: Arc<Mutex<Option<PendingApproval>>>,
+}
+
+/// An Ante turn paused for approval, held until the TUI answers.
+struct PendingApproval {
+    request_id: String,
+    turn_id: Id,
+    tools: Vec<ToolUse>,
 }
 
 impl Ante {
@@ -81,6 +91,7 @@ impl Ante {
             ops: Arc::new(tokio::sync::Mutex::new(None)),
             started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             active: Arc::new(Mutex::new(None)),
+            pending: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -432,10 +443,126 @@ async fn spawn_ante(store: Store) {
                     &session,
                 );
             }
-            // Approvals are next: Ante pauses the turn and waits for a decision.
+            // Ante pauses the turn for a decision; the TUI shows this as a
+            // permission prompt and answers on the reply route.
+            Evt::TurnPause {
+                turn_id,
+                reason: TurnPauseReason::Approval { tools, .. },
+            } => {
+                let request_id = uid("per");
+                let first = tools.first();
+                let payload = json!({
+                    "id": request_id,
+                    "sessionID": session,
+                    "action": first.map(|tool| tool.name.clone()).unwrap_or_default(),
+                    "resources": first
+                        .map(|tool| vec![tool.args.to_string()])
+                        .unwrap_or_default(),
+                });
+                *store.ante.pending.lock().unwrap() = Some(PendingApproval {
+                    request_id: request_id.clone(),
+                    turn_id,
+                    tools,
+                });
+                store.publish("permission.asked", payload);
+            }
             _ => {}
         }
     }
+}
+
+/// What the TUI polls to learn about a pending permission prompt.
+fn pending_requests(store: &Store) -> Json<Value> {
+    let requests: Vec<Value> = match store.ante.pending.lock() {
+        Ok(guard) => guard
+            .iter()
+            .map(|pending| {
+                let first = pending.tools.first();
+                json!({
+                    "id": pending.request_id,
+                    "sessionID": store.ante.active.lock().ok().and_then(|s| s.clone()).unwrap_or_default(),
+                    "action": first.map(|tool| tool.name.clone()).unwrap_or_default(),
+                    "resources": first.map(|tool| vec![tool.args.to_string()]).unwrap_or_default(),
+                })
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    envelope(json!(requests))
+}
+
+async fn permission_request(State(store): State<Store>) -> Json<Value> {
+    pending_requests(&store)
+}
+
+async fn session_permissions(State(store): State<Store>) -> Json<Value> {
+    let requests: Vec<Value> = match store.ante.pending.lock() {
+        Ok(guard) => guard
+            .iter()
+            .map(|pending| {
+                let first = pending.tools.first();
+                json!({
+                    "id": pending.request_id,
+                    "sessionID": store.ante.active.lock().ok().and_then(|s| s.clone()).unwrap_or_default(),
+                    "action": first.map(|tool| tool.name.clone()).unwrap_or_default(),
+                    "resources": first.map(|tool| vec![tool.args.to_string()]).unwrap_or_default(),
+                })
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    Json(json!({ "data": requests }))
+}
+
+/// The TUI's answer. `once`/`always`/`reject` map onto Ante's review decisions.
+async fn permission_reply(
+    State(store): State<Store>,
+    Path((session, request_id)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> axum::http::StatusCode {
+    let decision = match body.get("decision").and_then(|v| v.as_str()) {
+        Some("once") => ReviewDecision::Accept,
+        Some("always") => ReviewDecision::AcceptAlways,
+        Some("reject") => ReviewDecision::Deny,
+        other => {
+            eprintln!("permission: unknown decision {other:?}");
+            return axum::http::StatusCode::BAD_REQUEST;
+        }
+    };
+    let taken = store
+        .ante
+        .pending
+        .lock()
+        .ok()
+        .and_then(|mut guard| match guard.as_ref() {
+            Some(pending) if pending.request_id == request_id => guard.take(),
+            _ => None,
+        });
+    let Some(pending) = taken else {
+        eprintln!("permission: no pending request {request_id}");
+        return axum::http::StatusCode::NOT_FOUND;
+    };
+
+    let responses: Vec<ToolDecision> = pending
+        .tools
+        .iter()
+        .map(|tool| ToolDecision {
+            tool_use_id: tool.id.clone(),
+            decision: decision.clone(),
+            message: None,
+        })
+        .collect();
+    if let Some(ops) = store.ante.ops.lock().await.clone() {
+        let op = Op::ApprovalResponse { turn_id: pending.turn_id, responses };
+        if let Err(err) = ops.send(ante_sdk::protocol::op_msg(op)).await {
+            eprintln!("permission: send failed: {err}");
+        }
+    }
+    store.publish(
+        "permission.replied",
+        json!({ "sessionID": session, "requestID": request_id, "reply": body.get("decision") }),
+    );
+    axum::http::StatusCode::NO_CONTENT
 }
 
 async fn health() -> Json<Value> {
@@ -570,7 +697,15 @@ async fn session_prompt(
     match ops {
         Some(ops) => {
             if !store.ante.started.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                let _ = ops.send(ante_sdk::protocol::op_msg(Op::StartSession(SessionRequest::default()))).await;
+                // `SHIM_PERMISSION_MODE=strict|auto|yolo` decides whether Ante
+                // asks before acting; default follows the usual auto setting.
+                let mode = match std::env::var("SHIM_PERMISSION_MODE").as_deref() {
+                    Ok("strict") => Some(ante_sdk::protocol::PermissionMode::Strict),
+                    Ok("yolo") => Some(ante_sdk::protocol::PermissionMode::Yolo),
+                    Ok("auto") | _ => Some(ante_sdk::protocol::PermissionMode::Auto),
+                };
+                let request = SessionRequest { permission_mode: mode, ..Default::default() };
+                let _ = ops.send(ante_sdk::protocol::op_msg(Op::StartSession(request))).await;
             }
             if let Err(err) = ops.send(ante_sdk::protocol::op_msg(Op::UserInput(text.clone()))).await {
                 eprintln!("ante: send failed: {err}");
@@ -631,6 +766,9 @@ async fn main() {
         .route("/api/session/{id}", get(session_get))
         .route("/api/session/{id}/message", get(session_messages))
         .route("/api/session/{id}/prompt", post(session_prompt))
+        .route("/api/session/{id}/permission", get(session_permissions))
+        .route("/api/session/{id}/permission/{request_id}/reply", post(permission_reply))
+        .route("/api/permission/request", get(permission_request))
         .route("/api/session/{id}/model", post(no_content))
         .route("/api/session/{id}/agent", post(no_content))
         .route("/api/session/{id}/view", post(no_content))
