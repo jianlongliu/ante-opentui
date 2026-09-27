@@ -122,9 +122,33 @@ Cargo 依赖（`Cargo.lock` 实际解析值，非 `Cargo.toml` 的约束范围�
 3. 把假回复换成真 Ante：进程内用 `ante-sdk` 连 `ante serve --stdio`，把 Ante 事件翻译成上面的 `session.*`。
 4. 逐个补桩端点直到 TUI 不再报错。
 
+## 魔改上游 TUI
+
+上游 opencode 以 **git subtree** 放在 `vendor/opencode/`（分支 `v2`，约 7.8k 文件）。
+
+```sh
+# 改完跑起来（入口在 packages/cli）
+cd vendor/opencode
+bun install                    # 首次，需代理
+bun run dev -- --server http://127.0.0.1:41999
+
+# 跟上游
+git subtree pull --prefix=vendor/opencode https://github.com/anomalyco/opencode v2 --squash
+```
+
+**补丁只压一条缝**：改动集中在上游「TUI 调后端」的那层（`packages/client/`，生成式 HTTP client 所在），
+`packages/tui/` 的界面代码尽量不动。这样上游更新等于 rebase 一小块，冲突可控；
+散着改则每次合并都要打仗。
+
+**依赖**：Bun（本机 `1.4.2`，mise 装的）。
+
+**体积**：工作树约 159M，其中宣传视频（`packages/console/app/src/asset/lander/*.mp4`）与 `artifacts/` 占大头；
+`.git` 经 `git gc --prune=now` 回收后约 84M。裁剪这些文件会让 subtree 每次都冲突，故保持原样。
+
 ## 目录
 
 ```
-src/main.rs   全部实现：路由、信封、SSE、会话/消息存储
-Cargo.toml    axum + tokio + serde
+src/                 垫片本体：路由、信封、SSE、会话/消息存储
+vendor/opencode/     上游 opencode（subtree，v2 分支）——魔改对象
+Cargo.toml           axum + tokio + serde
 ```
