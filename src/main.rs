@@ -289,6 +289,12 @@ async fn session_prompt(
         let _ = part_id;
         store.publish_durable("session.execution.started", json!({ "sessionID": session }), &session);
 
+        // The block must be opened first; deltas land in it.
+        store.publish_durable(
+            "session.text.started",
+            json!({ "sessionID": session, "assistantMessageID": message_id, "ordinal": 0 }),
+            &session,
+        );
         let mut so_far = String::new();
         let mut ordinal = 0u32;
         for word in REPLY.split_inclusive(' ') {
