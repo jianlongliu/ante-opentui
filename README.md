@@ -18,7 +18,7 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 | --- | --- |
 | 真 v2 TUI 起界 | ✅ 顶栏、块字 logo、composer、页脚全部由本垫片喂出 |
 | 提示词送达 | ✅ `POST /api/session` → `POST …/model` → `POST …/prompt` |
-| 助手回复渲染 | ❌ 事件已改名 `session.text.delta`，仍不显示；下一步补 durable 信封 |
+| 助手回复渲染 | ✅ 真 TUI 里显示助手文本，流式到达 |
 | 回复内容 | ❌ 仍是垫片里的假字符串，**尚未接 Ante** |
 | 打桩覆盖 | LSP / MCP / formatter / VCS / OAuth / revert / fork 全部返回空 |
 
@@ -89,12 +89,24 @@ Cargo 依赖（`Cargo.lock` 实际解析值，非 `Cargo.toml` 的约束范围�
 
 | 事件 | data |
 | --- | --- |
-| `session.execution.started` / `.succeeded` | `{sessionID}`（durable） |
+| `session.step.started` | `{sessionID, assistantMessageID, agent, model, started}`（durable）——**追加助手消息本身** |
+| `session.text.started` | `{sessionID, assistantMessageID, ordinal}`（durable）——在消息内开一个文本块 |
 | `session.text.delta` | `{sessionID, assistantMessageID, ordinal, delta}`（ephemeral） |
 | `session.text.ended` | `{sessionID, assistantMessageID, ordinal, text}`（durable） |
+| `session.execution.started` / `.succeeded` | `{sessionID}`（durable） |
 | `session.message.content.updated` | `{sessionID, messageID, content:[…]}`（replay 用） |
 
-其余：`session.inbox.enqueued/delivered`、`session.step.started/ended`、`session.reasoning.delta`、
+**一轮回复的必需顺序**（缺任何一环，后面的都被静默丢弃）：
+
+```
+session.step.started → session.text.started → session.text.delta ×N → session.text.ended
+```
+
+理由是客户端实现（`packages/client/src/solid/data.ts`）：
+`step.started` 用 `message.append` **把助手消息追加进列表**；`text.started` 起才 `editAssistant` 往消息里推文本块。
+**消息不存在时，所有 `editAssistant`/`editText` 都是空操作**——事件照收，界面照旧不动，也不报错。
+
+其余：`session.inbox.enqueued/delivered`、`session.reasoning.delta`、
 `session.permissions`、`session.model.selected`、`session.compaction.*`、`session.revert.*`。
 
 ## 关键坑
@@ -104,7 +116,7 @@ Cargo 依赖（`Cargo.lock` 实际解析值，非 `Cargo.toml` 的约束范围�
 | 回车后 composer 清空、**一个请求都不发**，界面不报错 | 响应信封的 `location` 缺 `project`；客户端读 `.info.project.id` 抛未处理异常 |
 | 回车毫无反应 | `/api/agent`、`/api/provider`、`/api/model` 为空 → composer 没有模型，拒绝提交 |
 | `Failed to switch model: UnexpectedStatus` | `POST …/model` 必须回 204 |
-| 助手回复不渲染 | 发的是上一代的 `message.part.updated`；v2 用 `session.text.delta` |
+| 助手回复不渲染（事件照发，界面不动也不报错） | 两层原因：① 事件名用了上一代的 `message.part.updated`；② **即使名字对了，还缺 `session.step.started`**——助手消息没被追加进列表，后续 `editAssistant` 全是空操作 |
 | 事件流 `Connection lost` | SSE 帧必须是 `{id,type,data}` 形式且**首帧 `server.connected`**，并且走 chunked |
 
 ## 权威出处
@@ -117,10 +129,10 @@ Cargo 依赖（`Cargo.lock` 实际解析值，非 `Cargo.toml` 的约束范围�
 
 ## 下一步
 
-1. 给 durable 事件补 `durable:{aggregateID:sessionID, seq, version:1}`，验助手回复是否渲染。
-2. 若仍不渲染，试在 `session.text.delta` 前先发 `session.step.started`（建助手消息占位）。
-3. 把假回复换成真 Ante：进程内用 `ante-sdk` 连 `ante serve --stdio`，把 Ante 事件翻译成上面的 `session.*`。
-4. 逐个补桩端点直到 TUI 不再报错。
+1. 把假回复换成真 Ante：进程内用 `ante-sdk` 连 `ante serve --stdio`，把 Ante 事件翻译成上面的 `session.*` 序列。
+2. 补 `session.step.ended` / `session.usage.updated`，让轮次收尾与 token 统计正确。
+3. 逐个补桩端点直到 TUI 不再报错。
+4. 之后转魔改：在 `packages/client/` 那条缝后面直接接 Ante，把垫片假装的服务面砍掉。
 
 ## 魔改上游 TUI
 
