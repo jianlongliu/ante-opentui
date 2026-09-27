@@ -682,12 +682,40 @@ async fn session_prompt(
     Json(body): Json<Value>,
 ) -> Json<Value> {
     let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let user_id = uid("msg");
+    // The client sends its own message id; reusing it keeps its optimistic copy
+    // and the inbox item the same entry instead of rendering the message twice.
+    let user_id = body
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| uid("msg"));
     let user = json!({
         "id": user_id, "type": "user", "text": text, "time": { "created": now_ms() },
     });
     store.messages.lock().ok().and_then(|mut m| m.get_mut(&id).map(|list| list.push(user.clone())));
     store.publish("message.updated", json!({ "sessionID": id, "info": user }));
+
+    // Tell the client about the user's message: `inbox.enqueued` admits it into
+    // the transcript, and `delivered` moves it into place. Without these the
+    // client only has its own optimistic copy and the order comes out wrong.
+    let item = json!({
+        "id": user_id,
+        "sessionID": id,
+        "time": { "created": now_ms() },
+        "type": "user",
+        "payload": { "text": text, "files": [], "agents": [], "skills": [] },
+        "delivery": {},
+    });
+    store.publish_durable(
+        "session.inbox.enqueued",
+        json!({ "inboxID": user_id, "sessionID": id, "item": item }),
+        &id,
+    );
+    store.publish_durable(
+        "session.inbox.delivered",
+        json!({ "inboxID": user_id, "sessionID": id }),
+        &id,
+    );
 
     // Point the event pump at this session, then hand the text to Ante.
     if let Ok(mut active) = store.ante.active.lock() {
