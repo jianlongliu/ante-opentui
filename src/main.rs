@@ -272,7 +272,7 @@ async fn session_prompt(
     let store = store.clone();
     let session = id.clone();
     tokio::spawn(async move {
-        const REPLY: &str = "Hello from the Ante shim.\n\nThe event stream is live, so this text is arriving as message.part.updated frames.";
+        const REPLY: &str = "Hello from the Ante shim.\n\nThis text arrives as session.text.delta frames, folded into an assistant message opened by session.step.started.";
         let message_id = uid("msg");
         let part_id = uid("prt");
         let mut assistant = json!({
@@ -289,7 +289,20 @@ async fn session_prompt(
         let _ = part_id;
         store.publish_durable("session.execution.started", json!({ "sessionID": session }), &session);
 
-        // The block must be opened first; deltas land in it.
+        // The assistant message must exist before anything can edit it: this is
+        // the event that appends it. Without it every later edit is a no-op.
+        store.publish_durable(
+            "session.step.started",
+            json!({
+                "sessionID": session,
+                "assistantMessageID": message_id,
+                "agent": "build",
+                "model": { "id": MODEL, "providerID": PROVIDER },
+                "started": now_ms(),
+            }),
+            &session,
+        );
+        // The text block inside that message, then its deltas.
         store.publish_durable(
             "session.text.started",
             json!({ "sessionID": session, "assistantMessageID": message_id, "ordinal": 0 }),
