@@ -20,7 +20,8 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 | 提示词送达 | ✅ `POST /api/session` → `POST …/model` → `POST …/prompt` |
 | 助手回复渲染 | ✅ 真 TUI 里显示，流式到达 |
 | 回复内容 | ✅ **真 Ante**：`ante-sdk` 连 `ante serve --stdio`；模型名、耗时、token 均为真实数据 |
-| 工具调用 | ❌ Ante 的 `ToolStart/ToolEnd` 尚未映射成 `session.tool.*` |
+| 工具调用 | ⚠️ 已映射（`ToolStart`→`input.started/ended`+`called`，`ToolEnd`→`success/failed`），但**含工具的轮次渲染不出东西**——连之后的助手文本也没了，说明某个 tool 事件被客户端解码拒绝、把折叠打断了。Ante 侧确认有发（`ANTE_SHIM_TRACE` 可验） |
+| 推理（thinking） | ✅ 已映射为 `session.reasoning.started/delta/ended` |
 | 审批（TurnPause） | ❌ 尚未映射成 opencode 的 permission 请求 |
 | 打桩覆盖 | LSP / MCP / formatter / VCS / OAuth / revert / fork 全部返回空 |
 
@@ -131,7 +132,9 @@ session.step.started → session.text.started → session.text.delta ×N → ses
 
 ## 下一步
 
-1. 映射工具调用：Ante `ToolStart`/`ToolEnd` → `session.tool.input.started`/`called`/`success`/`failed`。
+1. **二分定位工具事件**：逐条单独发（先只发 `tool.input.started`，再加 `ended`、`called`、`success`），
+   看哪一条发出后助手文本就不再渲染。事件被解码拒绝时客户端**不报错、静默丢弃**，所以只能这样二分。
+   已知可疑点：`failed.error` 是 `SessionError.Error`（对象）而非字符串，形状未映射。
 2. 映射审批：Ante `TurnPause{Approval}` → opencode 的 permission 请求，并把回执转回 `ApprovalResponse`。
 3. 补齐其余桩端点（LSP/MCP/formatter/VCS/OAuth 等）直到 TUI 不再有空洞。
 4. 之后转**魔改**：在 `packages/client/` 那条缝后面直接接 Ante，把垫片假装的服务面砍掉。

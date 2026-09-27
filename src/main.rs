@@ -178,6 +178,21 @@ async fn no_content() -> axum::http::StatusCode {
     axum::http::StatusCode::NO_CONTENT
 }
 
+/// The readable part of a tool result, for the tool cell.
+fn result_text(result: &Value) -> String {
+    match result {
+        Value::String(text) => text.clone(),
+        Value::Object(map) => map
+            .get("stdout")
+            .or_else(|| map.get("content"))
+            .or_else(|| map.get("message"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| result.to_string()),
+        other => other.to_string(),
+    }
+}
+
 fn tokens_json(input: u32, output: u32) -> Value {
     json!({ "input": input, "output": output, "reasoning": 0,
             "cache": { "read": 0, "write": 0 } })
@@ -210,17 +225,27 @@ async fn spawn_ante(store: Store) {
     let mut ordinal = 0u32;
     let mut tokens_in = 0u32;
     let mut tokens_out = 0u32;
+    let mut reasoning_open = false;
 
     while let Some(msg) = rx.recv().await {
         let Some(session) = store.ante.active.lock().ok().and_then(|s| s.clone()) else {
             continue;
         };
+        if let Some(path) = std::env::var_os("ANTE_SHIM_TRACE") {
+            use std::io::Write as _;
+            let debug = format!("{:?}", msg.event);
+            let name = debug.split(['(', ' ', '{']).next().unwrap_or("?");
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                let _ = file.write_all(format!("{name}\n").as_bytes());
+            }
+        }
         match msg.event {
             // A turn opens a fresh assistant message, which is what every later
             // edit attaches to.
             Evt::TurnStart { .. } => {
                 message_id = uid("msg");
                 text_started = false;
+                reasoning_open = false;
                 ordinal = 0;
                 store.publish_durable(
                     "session.step.started",
@@ -289,8 +314,98 @@ async fn spawn_ante(store: Store) {
                     &session,
                 );
             }
-            // Tool calls and approvals are next; Ante's shapes for them are
-            // richer than opencode's, so they need their own mapping.
+            // Ante streams reasoning; opencode shows it as a reasoning item
+            // inside the same assistant message.
+            Evt::ThinkingDelta(delta) => {
+                if !reasoning_open {
+                    reasoning_open = true;
+                    store.publish_durable(
+                        "session.reasoning.started",
+                        json!({ "sessionID": session, "assistantMessageID": message_id, "state": null }),
+                        &session,
+                    );
+                }
+                store.publish(
+                    "session.reasoning.delta",
+                    json!({ "sessionID": session, "assistantMessageID": message_id, "delta": delta }),
+                );
+            }
+            Evt::Thinking(text) => {
+                reasoning_open = false;
+                store.publish_durable(
+                    "session.reasoning.ended",
+                    json!({ "sessionID": session, "assistantMessageID": message_id, "text": text }),
+                    &session,
+                );
+            }
+            // A tool call is announced, its arguments land, then it runs.
+            Evt::ToolStart(tool) => {
+                let args = tool.args.to_string();
+                store.publish_durable(
+                    "session.tool.input.started",
+                    json!({
+                        "sessionID": session,
+                        "assistantMessageID": message_id,
+                        "id": tool.id,
+                        "name": tool.name,
+                    }),
+                    &session,
+                );
+                store.publish_durable(
+                    "session.tool.input.ended",
+                    json!({
+                        "sessionID": session,
+                        "assistantMessageID": message_id,
+                        "id": tool.id,
+                        "text": args,
+                    }),
+                    &session,
+                );
+                store.publish_durable(
+                    "session.tool.called",
+                    json!({
+                        "sessionID": session,
+                        "assistantMessageID": message_id,
+                        "id": tool.id,
+                        "executed": true,
+                        "input": tool.args,
+                    }),
+                    &session,
+                );
+            }
+            // NOTE: the failure payload's `error` is `SessionError.Error` (an
+            // object) upstream; the shape is not mapped yet, so failures may be
+            // dropped by the client. Success is the path verified so far.
+            Evt::ToolEnd(end) => {
+                let failed = !matches!(
+                    end.status,
+                    ante_sdk::protocol::ToolEndStatus::Completed
+                );
+                let text = result_text(&end.result_json);
+                let payload = if failed {
+                    json!({
+                        "sessionID": session,
+                        "assistantMessageID": message_id,
+                        "id": end.tool_use_id,
+                        "error": text,
+                        "metadata": {},
+                        "content": [],
+                        "executed": true,
+                    })
+                } else {
+                    json!({
+                        "sessionID": session,
+                        "assistantMessageID": message_id,
+                        "id": end.tool_use_id,
+                        "metadata": {},
+                        "content": [{ "type": "text", "text": text }],
+                        "executed": true,
+                    })
+                };
+                let name = if failed { "session.tool.failed" } else { "session.tool.success" };
+                store.publish_durable(name, payload, &session);
+            }
+            // Approvals are next: Ante pauses the turn and waits for a decision.
             _ => {}
         }
     }
