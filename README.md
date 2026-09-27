@@ -18,8 +18,10 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 | --- | --- |
 | 真 v2 TUI 起界 | ✅ 顶栏、块字 logo、composer、页脚全部由本垫片喂出 |
 | 提示词送达 | ✅ `POST /api/session` → `POST …/model` → `POST …/prompt` |
-| 助手回复渲染 | ✅ 真 TUI 里显示助手文本，流式到达 |
-| 回复内容 | ❌ 仍是垫片里的假字符串，**尚未接 Ante** |
+| 助手回复渲染 | ✅ 真 TUI 里显示，流式到达 |
+| 回复内容 | ✅ **真 Ante**：`ante-sdk` 连 `ante serve --stdio`；模型名、耗时、token 均为真实数据 |
+| 工具调用 | ❌ Ante 的 `ToolStart/ToolEnd` 尚未映射成 `session.tool.*` |
+| 审批（TurnPause） | ❌ 尚未映射成 opencode 的 permission 请求 |
 | 打桩覆盖 | LSP / MCP / formatter / VCS / OAuth / revert / fork 全部返回空 |
 
 ## 怎么跑
@@ -129,10 +131,10 @@ session.step.started → session.text.started → session.text.delta ×N → ses
 
 ## 下一步
 
-1. 把假回复换成真 Ante：进程内用 `ante-sdk` 连 `ante serve --stdio`，把 Ante 事件翻译成上面的 `session.*` 序列。
-2. 补 `session.step.ended` / `session.usage.updated`，让轮次收尾与 token 统计正确。
-3. 逐个补桩端点直到 TUI 不再报错。
-4. 之后转魔改：在 `packages/client/` 那条缝后面直接接 Ante，把垫片假装的服务面砍掉。
+1. 映射工具调用：Ante `ToolStart`/`ToolEnd` → `session.tool.input.started`/`called`/`success`/`failed`。
+2. 映射审批：Ante `TurnPause{Approval}` → opencode 的 permission 请求，并把回执转回 `ApprovalResponse`。
+3. 补齐其余桩端点（LSP/MCP/formatter/VCS/OAuth 等）直到 TUI 不再有空洞。
+4. 之后转**魔改**：在 `packages/client/` 那条缝后面直接接 Ante，把垫片假装的服务面砍掉。
 
 ## 魔改上游 TUI
 
