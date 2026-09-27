@@ -20,7 +20,7 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 | 提示词送达 | ✅ `POST /api/session` → `POST …/model` → `POST …/prompt` |
 | 助手回复渲染 | ✅ 真 TUI 里显示，流式到达 |
 | 回复内容 | ✅ **真 Ante**：`ante-sdk` 连 `ante serve --stdio`；模型名、耗时、token 均为真实数据 |
-| 工具调用 | ⚠️ 已映射（`ToolStart`→`input.started/ended`+`called`，`ToolEnd`→`success/failed`），但**含工具的轮次渲染不出东西**——连之后的助手文本也没了，说明某个 tool 事件被客户端解码拒绝、把折叠打断了。Ante 侧确认有发（`ANTE_SHIM_TRACE` 可验） |
+| 工具调用 | ⚠️ 事件已映射，但**多 step 的轮次（含工具）整轮无内容渲染**——助手消息头出来了（模型 · 耗时），内容为空 |
 | 推理（thinking） | ✅ 已映射为 `session.reasoning.started/delta/ended` |
 | 审批（TurnPause） | ❌ 尚未映射成 opencode 的 permission 请求 |
 | 打桩覆盖 | LSP / MCP / formatter / VCS / OAuth / revert / fork 全部返回空 |
@@ -132,9 +132,22 @@ session.step.started → session.text.started → session.text.delta ×N → ses
 
 ## 下一步
 
-1. **二分定位工具事件**：逐条单独发（先只发 `tool.input.started`，再加 `ended`、`called`、`success`），
-   看哪一条发出后助手文本就不再渲染。事件被解码拒绝时客户端**不报错、静默丢弃**，所以只能这样二分。
-   已知可疑点：`failed.error` 是 `SessionError.Error`（对象）而非字符串，形状未映射。
+**多 step 轮次不渲染**，已排除的原因（都用 `SHIM_SKIP_EVENTS` / `SHIM_TOOL_EVENTS` 单独验过）：
+
+| 排除项 | 结论 |
+| --- | --- |
+| 单 step 轮次（纯文本） | ✅ 正常渲染——对照实验 `CONTROL-OK` 通过 |
+| 只关工具事件 | ✗ 仍不渲染 |
+| 只关推理事件 | ✗ 仍不渲染 |
+| 只关 usage 事件 | ✗ 仍不渲染 |
+| 每 step 建独立助手消息（改前是每轮一个） | ✗ 仍不渲染 |
+
+**下一步诊断**（择一，前者最准）：
+
+1. **拿真 server 做 oracle**：`opencode2 serve` 起真服务，`curl -u opencode:<密码> -N /api/event` 订阅，
+   再通过真服务跑一次带工具的提示，抓下完整事件序列逐条对照。**会消耗模型额度，需先确认。**
+2. 在垫片里**打印自己发布的 opencode 事件**（目前只打印 Ante 侧），核对 `step.started`/`text.started`
+   是否真的发出、message id 是否对得上。
 2. 映射审批：Ante `TurnPause{Approval}` → opencode 的 permission 请求，并把回执转回 `ApprovalResponse`。
 3. 补齐其余桩端点（LSP/MCP/formatter/VCS/OAuth 等）直到 TUI 不再有空洞。
 4. 之后转**魔改**：在 `packages/client/` 那条缝后面直接接 Ante，把垫片假装的服务面砍掉。

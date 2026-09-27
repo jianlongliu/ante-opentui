@@ -178,6 +178,24 @@ async fn no_content() -> axum::http::StatusCode {
     axum::http::StatusCode::NO_CONTENT
 }
 
+/// Debug switch for bisecting which tool event the client rejects:
+/// `SHIM_TOOL_EVENTS=session.tool.input.started,session.tool.called`.
+/// Unset means every tool event is emitted.
+fn tool_event_enabled(name: &str) -> bool {
+    match std::env::var("SHIM_TOOL_EVENTS") {
+        Ok(list) => list.split(',').any(|item| item.trim() == name),
+        Err(_) => true,
+    }
+}
+
+/// `SHIM_SKIP_EVENTS=session.reasoning.started,session.reasoning.delta` drops
+/// the named opencode events, for bisecting a bad payload.
+fn event_skipped(name: &str) -> bool {
+    std::env::var("SHIM_SKIP_EVENTS")
+        .map(|list| list.split(',').any(|item| item.trim() == name))
+        .unwrap_or(false)
+}
+
 /// The readable part of a tool result, for the tool cell.
 fn result_text(result: &Value) -> String {
     match result {
@@ -220,46 +238,74 @@ async fn spawn_ante(store: Store) {
     let (ops, mut rx) = client.into_parts();
     *store.ante.ops.lock().await = Some(ops);
 
+    // A turn is made of steps (one model call each): Ante starts a step, may
+    // call tools, then starts another. opencode models each step as its own
+    // assistant message, so the step is opened lazily on its first content
+    // event and closed once a tool ends.
     let mut message_id = String::new();
+    let mut step_open = false;
     let mut text_started = false;
+    let mut reasoning_open = false;
     let mut ordinal = 0u32;
     let mut tokens_in = 0u32;
     let mut tokens_out = 0u32;
-    let mut reasoning_open = false;
 
     while let Some(msg) = rx.recv().await {
         let Some(session) = store.ante.active.lock().ok().and_then(|s| s.clone()) else {
             continue;
         };
-        if let Some(path) = std::env::var_os("ANTE_SHIM_TRACE") {
-            use std::io::Write as _;
-            let debug = format!("{:?}", msg.event);
-            let name = debug.split(['(', ' ', '{']).next().unwrap_or("?");
-            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-                let _ = file.write_all(format!("{name}\n").as_bytes());
-            }
+        // Open a step (a new assistant message) on demand.
+        macro_rules! ensure_step {
+            () => {
+                if !step_open {
+                    step_open = true;
+                    text_started = false;
+                    reasoning_open = false;
+                    ordinal = 0;
+                    message_id = uid("msg");
+                    store.publish_durable(
+                        "session.step.started",
+                        json!({
+                            "sessionID": session,
+                            "assistantMessageID": message_id,
+                            "agent": "build",
+                            "model": { "id": MODEL, "providerID": PROVIDER },
+                            "started": now_ms(),
+                        }),
+                        &session,
+                    );
+                }
+            };
         }
         match msg.event {
-            // A turn opens a fresh assistant message, which is what every later
-            // edit attaches to.
             Evt::TurnStart { .. } => {
-                message_id = uid("msg");
-                text_started = false;
+                step_open = false;
+            }
+            Evt::ThinkingDelta(delta) => {
+                ensure_step!();
+                if !reasoning_open {
+                    reasoning_open = true;
+                    store.publish_durable(
+                        "session.reasoning.started",
+                        json!({ "sessionID": session, "assistantMessageID": message_id }),
+                        &session,
+                    );
+                }
+                store.publish(
+                    "session.reasoning.delta",
+                    json!({ "sessionID": session, "assistantMessageID": message_id, "delta": delta }),
+                );
+            }
+            Evt::Thinking(text) => {
                 reasoning_open = false;
-                ordinal = 0;
                 store.publish_durable(
-                    "session.step.started",
-                    json!({
-                        "sessionID": session,
-                        "assistantMessageID": message_id,
-                        "agent": "build",
-                        "model": { "id": MODEL, "providerID": PROVIDER },
-                        "started": now_ms(),
-                    }),
+                    "session.reasoning.ended",
+                    json!({ "sessionID": session, "assistantMessageID": message_id, "text": text }),
                     &session,
                 );
             }
             Evt::MessageDelta(delta) => {
+                ensure_step!();
                 if !text_started {
                     text_started = true;
                     store.publish_durable(
@@ -280,6 +326,7 @@ async fn spawn_ante(store: Store) {
                 ordinal += 1;
             }
             Evt::AgentMessage(text) => {
+                ensure_step!();
                 store.publish_durable(
                     "session.text.ended",
                     json!({
@@ -291,55 +338,8 @@ async fn spawn_ante(store: Store) {
                     &session,
                 );
             }
-            Evt::UsageUpdate { usage, .. } => {
-                tokens_in = usage.input_tokens;
-                tokens_out = usage.output_tokens;
-                store.publish_durable(
-                    "session.usage.updated",
-                    json!({ "sessionID": session, "cost": 0, "tokens": tokens_json(tokens_in, tokens_out) }),
-                    &session,
-                );
-            }
-            Evt::TurnEnd { status, .. } => {
-                let failed = matches!(status, ante_sdk::protocol::TurnEndStatus::Error { .. });
-                store.publish_durable(
-                    "session.step.ended",
-                    json!({
-                        "sessionID": session,
-                        "assistantMessageID": message_id,
-                        "finish": if failed { "error" } else { "stop" },
-                        "cost": 0,
-                        "tokens": tokens_json(tokens_in, tokens_out),
-                    }),
-                    &session,
-                );
-            }
-            // Ante streams reasoning; opencode shows it as a reasoning item
-            // inside the same assistant message.
-            Evt::ThinkingDelta(delta) => {
-                if !reasoning_open {
-                    reasoning_open = true;
-                    store.publish_durable(
-                        "session.reasoning.started",
-                        json!({ "sessionID": session, "assistantMessageID": message_id, "state": null }),
-                        &session,
-                    );
-                }
-                store.publish(
-                    "session.reasoning.delta",
-                    json!({ "sessionID": session, "assistantMessageID": message_id, "delta": delta }),
-                );
-            }
-            Evt::Thinking(text) => {
-                reasoning_open = false;
-                store.publish_durable(
-                    "session.reasoning.ended",
-                    json!({ "sessionID": session, "assistantMessageID": message_id, "text": text }),
-                    &session,
-                );
-            }
-            // A tool call is announced, its arguments land, then it runs.
             Evt::ToolStart(tool) => {
+                ensure_step!();
                 let args = tool.args.to_string();
                 store.publish_durable(
                     "session.tool.input.started",
@@ -373,14 +373,8 @@ async fn spawn_ante(store: Store) {
                     &session,
                 );
             }
-            // NOTE: the failure payload's `error` is `SessionError.Error` (an
-            // object) upstream; the shape is not mapped yet, so failures may be
-            // dropped by the client. Success is the path verified so far.
             Evt::ToolEnd(end) => {
-                let failed = !matches!(
-                    end.status,
-                    ante_sdk::protocol::ToolEndStatus::Completed
-                );
+                let failed = !matches!(end.status, ante_sdk::protocol::ToolEndStatus::Completed);
                 let text = result_text(&end.result_json);
                 let payload = if failed {
                     json!({
@@ -404,6 +398,29 @@ async fn spawn_ante(store: Store) {
                 };
                 let name = if failed { "session.tool.failed" } else { "session.tool.success" };
                 store.publish_durable(name, payload, &session);
+                // The next content begins a fresh step (and message).
+                step_open = false;
+            }
+            Evt::UsageUpdate { usage, .. } => {
+                tokens_in = usage.input_tokens;
+                tokens_out = usage.output_tokens;
+            }
+            Evt::TurnEnd { status, .. } => {
+                let failed = matches!(status, ante_sdk::protocol::TurnEndStatus::Error { .. });
+                if step_open {
+                    store.publish_durable(
+                        "session.step.ended",
+                        json!({
+                            "sessionID": session,
+                            "assistantMessageID": message_id,
+                            "finish": if failed { "error" } else { "stop" },
+                            "cost": 0,
+                            "tokens": tokens_json(tokens_in, tokens_out),
+                        }),
+                        &session,
+                    );
+                    step_open = false;
+                }
             }
             // Approvals are next: Ante pauses the turn and waits for a decision.
             _ => {}
