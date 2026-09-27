@@ -15,6 +15,10 @@ use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ante_sdk::{
+    ConnectOptions, OpSender, connect,
+    protocol::{Evt, Op, SessionRequest},
+};
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -58,8 +62,32 @@ fn uid(prefix: &str) -> String {
     format!("{prefix}_{:016x}{:04x}", now_ms(), n)
 }
 
+/// The Ante side of the shim: one connection, driven from two places — the
+/// event pump reads it, request handlers write to it.
+#[derive(Clone)]
+struct Ante {
+    /// Present once connected; ops reach Ante through it.
+    ops: Arc<tokio::sync::Mutex<Option<OpSender>>>,
+    /// The Ante session has been opened.
+    started: Arc<std::sync::atomic::AtomicBool>,
+    /// Which opencode session the events belong to. One Ante session is
+    /// mirrored, so this is the most recent one the TUI opened.
+    active: Arc<Mutex<Option<String>>>,
+}
+
+impl Ante {
+    fn new() -> Self {
+        Self {
+            ops: Arc::new(tokio::sync::Mutex::new(None)),
+            started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            active: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Store {
+    ante: Ante,
     sessions: Arc<Mutex<Vec<Value>>>,
     messages: Arc<Mutex<HashMap<String, Vec<Value>>>>,
     /// Frames fan out to every connected `/api/event` feed.
@@ -69,7 +97,12 @@ struct Store {
 impl Store {
     fn new() -> Self {
         let (events, _) = broadcast::channel(1024);
-        Self { sessions: Arc::new(Mutex::new(Vec::new())), messages: Arc::new(Mutex::new(HashMap::new())), events }
+        Self {
+            sessions: Arc::new(Mutex::new(Vec::new())),
+            messages: Arc::new(Mutex::new(HashMap::new())),
+            events,
+            ante: Ante::new(),
+        }
     }
 
     /// Ephemeral event: no durable envelope.
@@ -143,6 +176,124 @@ async fn log_request(req: axum::extract::Request, next: axum::middleware::Next) 
 /// unexpected status.
 async fn no_content() -> axum::http::StatusCode {
     axum::http::StatusCode::NO_CONTENT
+}
+
+fn tokens_json(input: u32, output: u32) -> Value {
+    json!({ "input": input, "output": output, "reasoning": 0,
+            "cache": { "read": 0, "write": 0 } })
+}
+
+/// Connect to Ante and pump its events into opencode's event shapes.
+///
+/// One Ante session is mirrored into whichever opencode session the TUI most
+/// recently opened. The reply is not faked: this is Ante's own output.
+async fn spawn_ante(store: Store) {
+    let endpoint: ante_sdk::Endpoint = match "stdio".parse() {
+        Ok(endpoint) => endpoint,
+        Err(err) => {
+            eprintln!("ante: bad endpoint: {err}");
+            return;
+        }
+    };
+    let client = match connect(endpoint, ConnectOptions::default()).await {
+        Ok(client) => client,
+        Err(err) => {
+            eprintln!("ante: connect failed: {err}");
+            return;
+        }
+    };
+    let (ops, mut rx) = client.into_parts();
+    *store.ante.ops.lock().await = Some(ops);
+
+    let mut message_id = String::new();
+    let mut text_started = false;
+    let mut ordinal = 0u32;
+    let mut tokens_in = 0u32;
+    let mut tokens_out = 0u32;
+
+    while let Some(msg) = rx.recv().await {
+        let Some(session) = store.ante.active.lock().ok().and_then(|s| s.clone()) else {
+            continue;
+        };
+        match msg.event {
+            // A turn opens a fresh assistant message, which is what every later
+            // edit attaches to.
+            Evt::TurnStart { .. } => {
+                message_id = uid("msg");
+                text_started = false;
+                ordinal = 0;
+                store.publish_durable(
+                    "session.step.started",
+                    json!({
+                        "sessionID": session,
+                        "assistantMessageID": message_id,
+                        "agent": "build",
+                        "model": { "id": MODEL, "providerID": PROVIDER },
+                        "started": now_ms(),
+                    }),
+                    &session,
+                );
+            }
+            Evt::MessageDelta(delta) => {
+                if !text_started {
+                    text_started = true;
+                    store.publish_durable(
+                        "session.text.started",
+                        json!({ "sessionID": session, "assistantMessageID": message_id, "ordinal": 0 }),
+                        &session,
+                    );
+                }
+                store.publish(
+                    "session.text.delta",
+                    json!({
+                        "sessionID": session,
+                        "assistantMessageID": message_id,
+                        "ordinal": ordinal,
+                        "delta": delta,
+                    }),
+                );
+                ordinal += 1;
+            }
+            Evt::AgentMessage(text) => {
+                store.publish_durable(
+                    "session.text.ended",
+                    json!({
+                        "sessionID": session,
+                        "assistantMessageID": message_id,
+                        "ordinal": ordinal,
+                        "text": text,
+                    }),
+                    &session,
+                );
+            }
+            Evt::UsageUpdate { usage, .. } => {
+                tokens_in = usage.input_tokens;
+                tokens_out = usage.output_tokens;
+                store.publish_durable(
+                    "session.usage.updated",
+                    json!({ "sessionID": session, "cost": 0, "tokens": tokens_json(tokens_in, tokens_out) }),
+                    &session,
+                );
+            }
+            Evt::TurnEnd { status, .. } => {
+                let failed = matches!(status, ante_sdk::protocol::TurnEndStatus::Error { .. });
+                store.publish_durable(
+                    "session.step.ended",
+                    json!({
+                        "sessionID": session,
+                        "assistantMessageID": message_id,
+                        "finish": if failed { "error" } else { "stop" },
+                        "cost": 0,
+                        "tokens": tokens_json(tokens_in, tokens_out),
+                    }),
+                    &session,
+                );
+            }
+            // Tool calls and approvals are next; Ante's shapes for them are
+            // richer than opencode's, so they need their own mapping.
+            _ => {}
+        }
+    }
 }
 
 async fn health() -> Json<Value> {
@@ -269,80 +420,22 @@ async fn session_prompt(
     store.messages.lock().ok().and_then(|mut m| m.get_mut(&id).map(|list| list.push(user.clone())));
     store.publish("message.updated", json!({ "sessionID": id, "info": user }));
 
-    let store = store.clone();
-    let session = id.clone();
-    tokio::spawn(async move {
-        const REPLY: &str = "Hello from the Ante shim.\n\nThis text arrives as session.text.delta frames, folded into an assistant message opened by session.step.started.";
-        let message_id = uid("msg");
-        let part_id = uid("prt");
-        let mut assistant = json!({
-            "id": message_id, "type": "assistant", "agent": "build",
-            "model": { "id": "deepseek-v4.1-flash" },
-            "content": [],
-            "time": { "created": now_ms() },
-        });
-        if let Ok(mut m) = store.messages.lock()
-            && let Some(list) = m.get_mut(&session)
-        {
-            list.push(assistant.clone());
+    // Point the event pump at this session, then hand the text to Ante.
+    if let Ok(mut active) = store.ante.active.lock() {
+        *active = Some(id.clone());
+    }
+    let ops = store.ante.ops.lock().await.clone();
+    match ops {
+        Some(ops) => {
+            if !store.ante.started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let _ = ops.send(ante_sdk::protocol::op_msg(Op::StartSession(SessionRequest::default()))).await;
+            }
+            if let Err(err) = ops.send(ante_sdk::protocol::op_msg(Op::UserInput(text.clone()))).await {
+                eprintln!("ante: send failed: {err}");
+            }
         }
-        let _ = part_id;
-        store.publish_durable("session.execution.started", json!({ "sessionID": session }), &session);
-
-        // The assistant message must exist before anything can edit it: this is
-        // the event that appends it. Without it every later edit is a no-op.
-        store.publish_durable(
-            "session.step.started",
-            json!({
-                "sessionID": session,
-                "assistantMessageID": message_id,
-                "agent": "build",
-                "model": { "id": MODEL, "providerID": PROVIDER },
-                "started": now_ms(),
-            }),
-            &session,
-        );
-        // The text block inside that message, then its deltas.
-        store.publish_durable(
-            "session.text.started",
-            json!({ "sessionID": session, "assistantMessageID": message_id, "ordinal": 0 }),
-            &session,
-        );
-        let mut so_far = String::new();
-        let mut ordinal = 0u32;
-        for word in REPLY.split_inclusive(' ') {
-            so_far.push_str(word);
-            store.publish(
-                "session.text.delta",
-                json!({
-                    "sessionID": session,
-                    "assistantMessageID": message_id,
-                    "ordinal": ordinal,
-                    "delta": word,
-                }),
-            );
-            ordinal += 1;
-            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-        }
-        store.publish_durable(
-            "session.text.ended",
-            json!({
-                "sessionID": session,
-                "assistantMessageID": message_id,
-                "ordinal": ordinal,
-                "text": so_far,
-            }),
-            &session,
-        );
-        assistant["content"] = assistant_content(&so_far);
-        if let Ok(mut m) = store.messages.lock()
-            && let Some(list) = m.get_mut(&session)
-            && let Some(last) = list.last_mut()
-        {
-            *last = assistant.clone();
-        }
-        store.publish_durable("session.execution.succeeded", json!({ "sessionID": session }), &session);
-    });
+        None => eprintln!("ante: not connected; prompt dropped"),
+    }
 
     Json(json!({ "data": { "id": user_id, "sessionID": id, "type": "user", "time": { "created": now_ms() }, "payload": { "text": text }, "delivery": {} } }))
 }
@@ -371,6 +464,9 @@ fn frame(event: &Value) -> Event {
 async fn main() {
     let port: u16 = std::env::args().nth(1).and_then(|p| p.parse().ok()).unwrap_or(41999);
     let store = Store::new();
+    // Ante is connected lazily at startup; its events feed every opencode
+    // session this shim serves.
+    tokio::spawn(spawn_ante(store.clone()));
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/health", get(health))
