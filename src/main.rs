@@ -565,6 +565,18 @@ async fn permission_reply(
     axum::http::StatusCode::NO_CONTENT
 }
 
+/// Esc in the TUI. The client owns the gesture; this just relays it to Ante.
+async fn session_interrupt(State(store): State<Store>, Path(_id): Path<String>) -> Json<Value> {
+    let mut interrupted = false;
+    if let Some(ops) = store.ante.ops.lock().await.clone() {
+        match ops.send(ante_sdk::protocol::op_msg(Op::Interrupt)).await {
+            Ok(()) => interrupted = true,
+            Err(err) => eprintln!("interrupt: send failed: {err}"),
+        }
+    }
+    Json(json!({ "interrupted": interrupted }))
+}
+
 async fn health() -> Json<Value> {
     Json(json!({ "healthy": true, "version": VERSION, "pid": std::process::id() }))
 }
@@ -794,6 +806,7 @@ async fn main() {
         .route("/api/session/{id}", get(session_get))
         .route("/api/session/{id}/message", get(session_messages))
         .route("/api/session/{id}/prompt", post(session_prompt))
+        .route("/api/session/{id}/interrupt", post(session_interrupt))
         .route("/api/session/{id}/permission", get(session_permissions))
         .route("/api/session/{id}/permission/{request_id}/reply", post(permission_reply))
         .route("/api/permission/request", get(permission_request))
