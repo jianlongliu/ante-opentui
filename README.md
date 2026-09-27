@@ -22,7 +22,10 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 | 回复内容 | ✅ **真 Ante**：`ante-sdk` 连 `ante serve --stdio`；模型名、耗时、token 均为真实数据 |
 | 工具调用 | ✅ `+ Thought`、`✓ Bash [参数]`、助手正文、命令输出全部渲染 |
 | 推理（thinking） | ✅ 已映射为 `session.reasoning.started/delta/ended` |
-| 审批（TurnPause） | ❌ 尚未映射成 opencode 的 permission 请求 |
+| 审批（`TurnPause`） | ✅ 实测闭环：Ante 暂停 → TUI 弹 `△ Permission required` → 在 TUI 批准 → 垫片回 `ApprovalResponse` → Ante 继续执行 |
+| 消息顺序 / 不重复 | ✅ 用户消息在上、回复在下；靠 `session.inbox.enqueued`+`delivered` 入列表，并复用客户端提交自带的 message id |
+| `shift+tab` 切 agent、模型选择 | ❌ 未做——垫片只提供一个 agent（`build`），也未实现 `POST …/agent` |
+| 会话列表 / `@` 补全 / diff / LSP / 压缩 / 撤销 | ❌ 未做（相关接口返回空） |
 | 打桩覆盖 | LSP / MCP / formatter / VCS / OAuth / revert / fork 全部返回空 |
 
 ## 怎么跑
