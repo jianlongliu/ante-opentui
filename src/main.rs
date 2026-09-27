@@ -72,8 +72,33 @@ impl Store {
         Self { sessions: Arc::new(Mutex::new(Vec::new())), messages: Arc::new(Mutex::new(HashMap::new())), events }
     }
 
+    /// Ephemeral event: no durable envelope.
     fn publish(&self, name: &str, data: Value) {
-        let _ = self.events.send(json!({ "id": uid("evt"), "type": name, "data": data }));
+        self.publish_inner(name, data, None);
+    }
+
+    /// Durable event. `Payload` for a durable definition requires the
+    /// `{aggregateID, seq, version}` envelope on top of the common fields.
+    fn publish_durable(&self, name: &str, data: Value, aggregate: &str) {
+        self.publish_inner(name, data, Some(aggregate.to_string()));
+    }
+
+    fn publish_inner(&self, name: &str, data: Value, aggregate: Option<String>) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let mut event = json!({
+            "id": uid("evt"),
+            "type": name,
+            "created": now_ms(),
+            "data": data,
+        });
+        if let Some(aggregate_id) = aggregate {
+            event["durable"] = json!({
+                "aggregateID": aggregate_id,
+                "seq": SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                "version": 1,
+            });
+        }
+        let _ = self.events.send(event);
     }
 
     fn session(&self, id: &str) -> Option<Value> {
@@ -210,7 +235,7 @@ async fn session_create(State(store): State<Store>) -> Json<Value> {
         sessions.push(info.clone());
     }
     store.messages.lock().map(|mut m| m.insert(id.clone(), Vec::new())).ok();
-    store.publish("session.created", json!({ "sessionID": id }));
+    store.publish_durable("session.created", json!({ "sessionID": id }), &id);
     Json(json!({ "data": info }))
 }
 
@@ -262,7 +287,7 @@ async fn session_prompt(
             list.push(assistant.clone());
         }
         let _ = part_id;
-        store.publish("session.execution.started", json!({ "sessionID": session }));
+        store.publish_durable("session.execution.started", json!({ "sessionID": session }), &session);
 
         let mut so_far = String::new();
         let mut ordinal = 0u32;
@@ -280,7 +305,7 @@ async fn session_prompt(
             ordinal += 1;
             tokio::time::sleep(std::time::Duration::from_millis(60)).await;
         }
-        store.publish(
+        store.publish_durable(
             "session.text.ended",
             json!({
                 "sessionID": session,
@@ -288,6 +313,7 @@ async fn session_prompt(
                 "ordinal": ordinal,
                 "text": so_far,
             }),
+            &session,
         );
         assistant["content"] = assistant_content(&so_far);
         if let Ok(mut m) = store.messages.lock()
@@ -296,7 +322,7 @@ async fn session_prompt(
         {
             *last = assistant.clone();
         }
-        store.publish("session.execution.succeeded", json!({ "sessionID": session }));
+        store.publish_durable("session.execution.succeeded", json!({ "sessionID": session }), &session);
     });
 
     Json(json!({ "data": { "id": user_id, "sessionID": id, "type": "user", "time": { "created": now_ms() }, "payload": { "text": text }, "delivery": {} } }))
@@ -306,26 +332,20 @@ async fn session_prompt(
 /// be `server.connected`, or the client gives up on the stream.
 async fn events(State(store): State<Store>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = store.events.subscribe();
-    let first = stream::once(async { Ok(frame("server.connected", json!({}), "0")) });
+    let connected = json!({
+        "id": "evt_0", "type": "server.connected", "created": now_ms(), "data": {},
+    });
+    let first = stream::once(async move { Ok(frame(&connected)) });
     let rest = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|item| async move {
-        match item {
-            Ok(value) => {
-                let name = value["type"].as_str().unwrap_or("").to_string();
-                let data = value["data"].clone();
-                let id = value["id"].as_str().unwrap_or("").to_string();
-                Some(Ok(frame(&name, data, &id)))
-            }
-            Err(_) => None,
-        }
+        item.ok().map(|event| Ok(frame(&event)))
     });
     Sse::new(first.chain(rest)).keep_alive(KeepAlive::default())
 }
 
-fn frame(name: &str, data: Value, id: &str) -> Event {
-    Event::default()
-        .id(id.to_string())
-        .event(name.to_string())
-        .data(json!({ "id": id, "type": name, "created": now_ms(), "data": data }).to_string())
+fn frame(event: &Value) -> Event {
+    let id = event["id"].as_str().unwrap_or("");
+    let name = event["type"].as_str().unwrap_or("");
+    Event::default().id(id.to_string()).event(name.to_string()).data(event.to_string())
 }
 
 #[tokio::main]

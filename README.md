@@ -131,16 +131,28 @@ Cargo 依赖（`Cargo.lock` 实际解析值，非 `Cargo.toml` 的约束范围�
 cd vendor/opencode
 bun install                    # 首次，需代理
 bun run dev -- --server http://127.0.0.1:41999
-
-# 跟上游
-git subtree pull --prefix=vendor/opencode https://github.com/anomalyco/opencode v2 --squash
 ```
+
+**依赖**：Bun（本机 `1.4.2`，mise 装的，`bun` 在 `~/.local/share/mise/shims`）。
 
 **补丁只压一条缝**：改动集中在上游「TUI 调后端」的那层（`packages/client/`，生成式 HTTP client 所在），
 `packages/tui/` 的界面代码尽量不动。这样上游更新等于 rebase 一小块，冲突可控；
 散着改则每次合并都要打仗。
 
-**依赖**：Bun（本机 `1.4.2`，mise 装的）。
+**跟上游的例行步骤**（上游源码在仓库里，就等于有了契约测试）：
+
+```sh
+git subtree pull --prefix=vendor/opencode https://github.com/anomalyco/opencode v2 --squash
+cd vendor/opencode && bun install        # 依赖有变时才需要
+cd - && cargo build --release            # 垫片
+./target/release/opencode-shim 41999 &
+cd vendor/opencode && bun run dev -- --server http://127.0.0.1:41999
+```
+
+跑起来看界面有没有坏——**垫片假装的是接口，上游改了接口既不会有合并冲突、也不会有类型检查**，
+只能靠「拿真客户端跑一遍」当场发现。这是本方案唯一的防漂移手段，别省。
+
+
 
 **体积**：工作树约 159M，其中宣传视频（`packages/console/app/src/asset/lander/*.mp4`）与 `artifacts/` 占大头；
 `.git` 经 `git gc --prune=now` 回收后约 84M。裁剪这些文件会让 subtree 每次都冲突，故保持原样。
