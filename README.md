@@ -34,6 +34,34 @@ opencode --server http://127.0.0.1:41999   # 终端 B
 - 编译要走代理：`export http_proxy=http://127.0.0.1:7890 https_proxy=http://127.0.0.1:7890`
 - 环境变量 `ANTECODE_DEBUG` 不影响本程序；请求日志直接打在 stdout。
 
+## 依赖与版本
+
+工具链（本机实测，pacman 的 `rust` 包）：
+
+| 项 | 版本 |
+| --- | --- |
+| rustc / cargo | **1.98.1**（Arch `rust 1:1.98.1-1`） |
+| edition | **2024**（`let` 链语法需要，改回 2021 会编译失败） |
+
+Cargo 依赖（`Cargo.lock` 实际解析值，非 `Cargo.toml` 的约束范围）：
+
+| 依赖 | 版本 | 用途 |
+| --- | --- | --- |
+| axum | 0.8.9 | HTTP 路由与 SSE |
+| tokio | 1.53.1 | 运行时（features: macros, rt-multi-thread, sync, time, process, io-util） |
+| tokio-stream | 0.1.19 | 广播转事件流（**必须开 `sync` feature**，否则找不到 `BroadcastStream`） |
+| serde | 1.0.229 | 派生（features: derive） |
+| serde_json | 1.0.151 | 信封与事件载荷 |
+| futures | 0.3.34 | 流拼接 |
+
+外部依赖：
+
+| 项 | 说明 |
+| --- | --- |
+| 网络 | 编译时 **必须走代理**，crates.io 直连被 TLS 拦（`export http_proxy=https_proxy=http://127.0.0.1:7890`） |
+| opencode 客户端 | **2.0.18**，官方脚本装在 `~/.opencode/bin`（`opencode`/`opencode2` 均指向它） |
+| Ante | 接后端时用 `ante-sdk`（path 依赖 `~/Documents/ante/crates/ante-sdk`，未发 crates.io，需先 clone 该仓库） |
+
 ## 客户端现状（本机）
 
 官方脚本安装，`opencode` 与 `opencode2` 都指向它：
