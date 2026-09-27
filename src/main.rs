@@ -280,6 +280,11 @@ async fn spawn_ante(store: Store) {
         match msg.event {
             Evt::TurnStart { .. } => {
                 step_open = false;
+                store.publish_durable(
+                    "session.execution.started",
+                    json!({ "sessionID": session }),
+                    &session,
+                );
             }
             Evt::ThinkingDelta(delta) => {
                 ensure_step!();
@@ -287,7 +292,7 @@ async fn spawn_ante(store: Store) {
                     reasoning_open = true;
                     store.publish_durable(
                         "session.reasoning.started",
-                        json!({ "sessionID": session, "assistantMessageID": message_id }),
+                        json!({ "sessionID": session, "assistantMessageID": message_id, "ordinal": 0 }),
                         &session,
                     );
                 }
@@ -300,7 +305,7 @@ async fn spawn_ante(store: Store) {
                 reasoning_open = false;
                 store.publish_durable(
                     "session.reasoning.ended",
-                    json!({ "sessionID": session, "assistantMessageID": message_id, "text": text }),
+                    json!({ "sessionID": session, "assistantMessageID": message_id, "ordinal": 0, "text": text }),
                     &session,
                 );
             }
@@ -367,7 +372,7 @@ async fn spawn_ante(store: Store) {
                         "sessionID": session,
                         "assistantMessageID": message_id,
                         "id": tool.id,
-                        "executed": true,
+                        "executed": false,
                         "input": tool.args,
                     }),
                     &session,
@@ -421,6 +426,11 @@ async fn spawn_ante(store: Store) {
                     );
                     step_open = false;
                 }
+                store.publish_durable(
+                    if failed { "session.execution.failed" } else { "session.execution.succeeded" },
+                    json!({ "sessionID": session }),
+                    &session,
+                );
             }
             // Approvals are next: Ante pauses the turn and waits for a decision.
             _ => {}
