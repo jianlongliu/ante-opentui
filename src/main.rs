@@ -431,7 +431,7 @@ fn ante_executable() -> Option<std::path::PathBuf> {
 
 /// Which opencode client to hand the terminal to.
 fn client_executable() -> std::path::PathBuf {
-    if let Some(path) = std::env::var_os("OANTE_CLIENT") {
+    if let Some(path) = std::env::var_os("ANTEX_CLIENT") {
         return std::path::PathBuf::from(path);
     }
     for name in ["opencode2", "opencode"] {
@@ -1711,20 +1711,20 @@ fn frame(event: &Value) -> Event {
 }
 
 const USAGE: &str = "\
-oante — 用 opencode 的 TUI 驱动 Ante
+antex — 用 opencode 的 TUI 驱动 Ante
 
 用法:
-  oante                  起服务并直接进 TUI（一条命令，退出时服务一起停）
-  oante PORT             同上，指定端口（默认 41999）
-  oante serve [PORT]     只起服务，留在前台；另开终端连它
-  oante -h | --help      显示本帮助
+  antex                  起服务并直接进 TUI（一条命令，退出时服务一起停）
+  antex PORT             同上，指定端口（默认 41999）
+  antex serve [PORT]     只起服务，留在前台；另开终端连它
+  antex -h | --help      显示本帮助
 
 只起服务时，客户端这样连：
   opencode2 --server http://127.0.0.1:41999
 
 环境变量:
   ANTE_BIN       指定 ante 可执行文件（默认 $PATH，再退到 ~/.ante/bin/ante）
-  OANTE_CLIENT   指定 opencode 客户端（默认 $PATH 上的 opencode2，再退到 opencode）
+  ANTEX_CLIENT   指定 opencode 客户端（默认 $PATH 上的 opencode2，再退到 opencode）
 ";
 
 struct Args {
@@ -1842,10 +1842,10 @@ async fn main() {
     let _ = LOG_FILE.set(if args.serve_only {
         None
     } else {
-        Some(std::env::temp_dir().join("oante.log"))
+        Some(std::env::temp_dir().join("antex.log"))
     });
     if args.serve_only {
-        println!("oante 服务已起在 http://127.0.0.1:{port}");
+        println!("antex 服务已起在 http://127.0.0.1:{port}");
         println!("客户端这样连：opencode2 --server http://127.0.0.1:{port}");
         axum::serve(listener, app).await.expect("serve");
         return;
@@ -1855,7 +1855,7 @@ async fn main() {
     // opencode TUI — one command instead of two.
     tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, app).await {
-            eprintln!("oante: 服务结束：{err}");
+            eprintln!("antex: 服务结束：{err}");
         }
     });
     let directory =
@@ -1871,7 +1871,7 @@ async fn main() {
         Ok(status) => std::process::exit(status.code().unwrap_or(0)),
         Err(err) => {
             eprintln!("起不了 opencode 客户端（{}）：{err}", client.display());
-            eprintln!("用 OANTE_CLIENT 指定它的路径；或只起服务：oante serve {port}");
+            eprintln!("用 ANTEX_CLIENT 指定它的路径；或只起服务：antex serve {port}");
             std::process::exit(1);
         }
     }

@@ -1,9 +1,13 @@
 [package]
-name = "oante"
+name = "ante-opentui"
 version = "0.1.0"
 edition = "2024"
 description = "Opencode v2 server API on top of the Ante agent, so opencode's own TUI can drive Ante"
 publish = false
+
+[[bin]]
+name = "antex"
+path = "src/main.rs"
 
 [dependencies]
 ante-sdk = "0.2.5"

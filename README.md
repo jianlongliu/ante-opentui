@@ -1,4 +1,4 @@
-# oante（项目 ante-opencode）
+# antex（项目 ante-opentui）
 
 > 最后核对：2026-09-28 · 目标客户端 opencode 2.0.18 · Rust 1.98
 
@@ -65,28 +65,28 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 装一次（软链到 `PATH`，之后任意目录可用）：
 
 ```sh
-cd ~/Projects/ante-opencode
+cd ~/Projects/ante-opentui
 export http_proxy=http://127.0.0.1:7890 https_proxy=http://127.0.0.1:7890   # 编译要代理
 cargo build --release
-ln -sfn "$PWD/target/release/oante" ~/.local/bin/oante
+ln -sfn "$PWD/target/release/antex" ~/.local/bin/antex
 ```
 
 日常就一条命令——**起服务并直接进 TUI，退出时服务一起停**：
 
 ```sh
-oante
+antex
 ```
 
 想分开（一个终端起服务、另一个连）也行：
 
 ```sh
-oante serve 41999                             # 终端 A：只起服务，留在前台
+antex serve 41999                             # 终端 A：只起服务，留在前台
 opencode2 --server http://127.0.0.1:41999     # 终端 B
 ```
 
-- `oante PORT` 指定端口（默认 41999）；`oante -h` 看用法。
+- `antex PORT` 指定端口（默认 41999）；`antex -h` 看用法。
 - 环境变量：`ANTE_BIN` 指定 `ante` 可执行文件（默认 `$PATH`，再退到 `~/.ante/bin/ante`）；`OANTE_CLIENT` 指定客户端（默认 `opencode2` → `opencode`）。**所以不必先 export PATH。**
-- **一体化模式下请求日志写 `/tmp/oante.log`**——写 stdout 会糊在 TUI 上（踩过）；`serve` 模式仍打在 stdout。
+- **一体化模式下请求日志写 `/tmp/antex.log`**——写 stdout 会糊在 TUI 上（踩过）；`serve` 模式仍打在 stdout。
 
 ## 依赖与版本
 
@@ -209,7 +209,7 @@ bun run dev -- --server http://127.0.0.1:41999
 git subtree pull --prefix=vendor/opencode https://github.com/anomalyco/opencode v2 --squash
 cd vendor/opencode && bun install        # 依赖有变时才需要
 cd - && cargo build --release            # 垫片
-./target/release/oante serve 41999 &
+./target/release/antex serve 41999 &
 cd vendor/opencode && bun run dev -- --server http://127.0.0.1:41999
 ```
 

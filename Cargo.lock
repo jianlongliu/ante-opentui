@@ -12,6 +12,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ante-opentui"
+version = "0.1.0"
+dependencies = [
+ "ante-sdk",
+ "axum",
+ "chrono",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
 name = "ante-protocol-shape"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -515,20 +529,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "oante"
-version = "0.1.0"
-dependencies = [
- "ante-sdk",
- "axum",
- "chrono",
- "futures",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
 ]
 
 [[package]]
