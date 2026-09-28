@@ -677,6 +677,13 @@ async fn empty_reads() -> Json<Value> {
     envelope(json!([]))
 }
 
+/// `/inbox` and `/form` answer `{data: []}` and nothing else — their schemas set
+/// `additionalProperties: false`, so the usual `location` field makes the whole
+/// response fail validation (and the session view then refuses to open).
+async fn bare_empty() -> Json<Value> {
+    Json(json!({ "data": [] }))
+}
+
 /// `/api/session/active` and friends: the client's submit path reads
 /// `.info.project.id`, so a bare empty envelope makes it throw.
 async fn active_session() -> Json<Value> {
@@ -760,17 +767,148 @@ async fn session_create(State(store): State<Store>) -> Json<Value> {
     Json(json!({ "data": info }))
 }
 
-async fn session_get(State(store): State<Store>, Path(id): Path<String>) -> Json<Value> {
-    Json(store.session(&id).unwrap_or_else(|| session_info(&id, "Ante session")))
+/// The session's own metadata, read back from Ante. Returning a synthesized one
+/// loses the real directory, and the client uses that to decide whether the
+/// session belongs to the location it is showing.
+fn ante_session_info(id: &str) -> Option<Value> {
+    let home = std::env::var_os("ANTE_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+            home.join(".ante")
+        });
+    let raw = std::fs::read_to_string(home.join("sessions").join(id).join("meta.json")).ok()?;
+    let meta: Value = serde_json::from_str(&raw).ok()?;
+    let created = meta
+        .get("started_time")
+        .and_then(|v| v.as_str())
+        .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+        .map(|when| when.timestamp_millis())
+        .unwrap_or_else(now_ms);
+    let directory = meta.get("dir").and_then(|v| v.as_str()).unwrap_or(DIRECTORY);
+    let usage = meta.get("usage").cloned().unwrap_or_else(|| json!({}));
+    let title = meta
+        .get("first_user_message")
+        .and_then(|v| v.as_str())
+        .map(|text| short(&text.replace(['\n', '\r'], " "), 60))
+        .unwrap_or_else(|| "Ante session".into());
+    Some(json!({
+        "id": id,
+        "projectID": "prj_shim",
+        "agent": "build",
+        "model": {
+            "id": meta.get("model").and_then(|v| v.as_str()).unwrap_or(MODEL),
+            "providerID": meta.get("provider").and_then(|v| v.as_str()).unwrap_or(PROVIDER),
+        },
+        "cost": 0,
+        "tokens": tokens_json(
+            usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        ),
+        "time": { "created": created, "updated": created },
+        "title": title,
+        "location": { "directory": directory },
+    }))
 }
 
-async fn session_messages(State(store): State<Store>, Path(id): Path<String>) -> Json<Value> {
-    let data = store
+async fn session_get(State(store): State<Store>, Path(id): Path<String>) -> Json<Value> {
+    let info = store
+        .session(&id)
+        .or_else(|| ante_session_info(&id))
+        .unwrap_or_else(|| session_info(&id, "Ante session"));
+    Json(info)
+}
+
+/// Ante persists every session event to `events.jsonl`; replaying it rebuilds
+/// the transcript opencode asks for when a session is opened.
+///
+/// Each line is `{timestamp, id, event: {<variant>: <payload>}, parent}`, and the
+/// `event` field is exactly Ante's `Evt` in serde form, so the fold is the same
+/// shape as the live pump. v1 covers user turns and assistant text.
+fn replay_session(id: &str) -> Vec<Value> {
+    let home = std::env::var_os("ANTE_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+            home.join(".ante")
+        });
+    let Ok(raw) = std::fs::read_to_string(home.join("sessions").join(id).join("events.jsonl")) else {
+        return Vec::new();
+    };
+
+    let mut messages: Vec<Value> = Vec::new();
+    let mut ordinal = 0u64;
+    for line in raw.lines() {
+        let Ok(wrapper) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(event) = wrapper.get("event") else {
+            continue;
+        };
+        let Ok(event) = serde_json::from_value::<Evt>(event.clone()) else {
+            continue;
+        };
+        let created = wrapper
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+            .map(|when| when.timestamp_millis())
+            .unwrap_or_else(now_ms);
+        ordinal += 1;
+        let id = format!("msg_{:016x}{:04x}", created as u64, ordinal);
+        match event {
+            Evt::UserInput(text) => messages.push(json!({
+                "id": id,
+                "type": "user",
+                "text": text,
+                "files": [],
+                "agents": [],
+                "skills": [],
+                "time": { "created": created },
+            })),
+            Evt::TurnStart { .. } => messages.push(json!({
+                "id": id,
+                "type": "assistant",
+                "agent": "build",
+                "model": { "id": MODEL, "providerID": PROVIDER },
+                "content": [],
+                "time": { "created": created },
+            })),
+            Evt::AgentMessage(text) => {
+                if let Some(last) = messages.last_mut() {
+                    if last["type"] == "assistant" {
+                        last["content"] = json!([{ "type": "text", "text": text }]);
+                        last["time"]["completed"] = json!(created);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    messages
+}
+
+async fn session_messages(
+    State(store): State<Store>,
+    Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<Value> {
+    // A session this process is driving comes from the live store; anything else
+    // is read back from Ante's event log.
+    let live = store
         .messages
         .lock()
         .ok()
         .and_then(|m| m.get(&id).cloned())
         .unwrap_or_default();
+    let mut data = if live.is_empty() { replay_session(&id) } else { live };
+    // The transcript is read newest-first with a limit; honour both.
+    if params.get("order").map(|value| value == "desc").unwrap_or(false) {
+        data.reverse();
+    }
+    if let Some(limit) = params.get("limit").and_then(|value| value.parse::<usize>().ok()) {
+        data.truncate(limit);
+    }
     Json(json!({ "data": data, "cursor": {} }))
 }
 
@@ -899,6 +1037,8 @@ async fn main() {
         .route("/api/session/{id}/permission", get(session_permissions))
         .route("/api/session/{id}/permission/{request_id}/reply", post(permission_reply))
         .route("/api/permission/request", get(permission_request))
+        .route("/api/session/{id}/inbox", get(bare_empty))
+        .route("/api/session/{id}/form", get(bare_empty))
         .route("/api/session/{id}/model", post(no_content))
         .route("/api/session/{id}/agent", post(no_content))
         .route("/api/session/{id}/view", post(no_content))
