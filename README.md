@@ -85,6 +85,7 @@ opencode2 --server http://127.0.0.1:41999     # 终端 B
 ```
 
 - `antex PORT` 指定端口（默认 41999）；`antex -h` 看用法。
+- **可以多开**：一体化模式下端口被占会**自动往后顺延**（并打印改用哪个），所以第二个、第三个 `antex` 直接跑就行。`serve` 模式相反——按你给的端口，被占就明确报错（换端口会让人连错服务）。
 - 环境变量：`ANTE_BIN` 指定 `ante` 可执行文件（默认 `$PATH`，再退到 `~/.ante/bin/ante`）；`OANTE_CLIENT` 指定客户端（默认 `opencode2` → `opencode`）。**所以不必先 export PATH。**
 - **一体化模式下请求日志写 `/tmp/antex.log`**——写 stdout 会糊在 TUI 上（踩过）；`serve` 模式仍打在 stdout。
 

@@ -1823,22 +1823,37 @@ async fn main() {
         .layer(axum::middleware::from_fn(log_request))
         .with_state(store);
 
-    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", args.port)).await {
-        Ok(listener) => listener,
-        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
-            eprintln!(
-                "端口 {} 已被占用。换一个端口，或先停掉占用它的进程：\n  fuser -k {}/tcp",
-                args.port, args.port
-            );
-            std::process::exit(1);
+    // 一体化模式可以多开：端口被占就往后找，不是错误。`serve` 模式按你给的端口，
+    // 占了就明确报错（那是「我只起服务」的意思，换端口会让人连错）。
+    let mut listener = None;
+    let mut bound_port = args.port;
+    for offset in 0..20u16 {
+        let candidate = args.port.saturating_add(offset);
+        match tokio::net::TcpListener::bind(("127.0.0.1", candidate)).await {
+            Ok(l) => {
+                listener = Some(l);
+                bound_port = candidate;
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse && !args.serve_only => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+                eprintln!(
+                    "端口 {candidate} 已被占用。换一个端口，或先停掉占用它的进程：\n  fuser -k {candidate}/tcp"
+                );
+                std::process::exit(1);
+            }
+            Err(err) => {
+                eprintln!("监听 127.0.0.1:{candidate} 失败：{err}");
+                std::process::exit(1);
+            }
         }
-        Err(err) => {
-            eprintln!("监听 127.0.0.1:{} 失败：{err}", args.port);
-            std::process::exit(1);
-        }
+    }
+    let Some(listener) = listener else {
+        eprintln!("从 {} 起连续 20 个端口都被占用，换个起点：antex {}", args.port, args.port + 50);
+        std::process::exit(1);
     };
 
-    let port = args.port;
+    let port = bound_port;
     let _ = LOG_FILE.set(if args.serve_only {
         None
     } else {
@@ -1858,6 +1873,9 @@ async fn main() {
             eprintln!("antex: 服务结束：{err}");
         }
     });
+    if port != args.port {
+        println!("端口 {} 被占，本实例改用 {port}", args.port);
+    }
     let directory =
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(DIRECTORY));
     let client = client_executable();
