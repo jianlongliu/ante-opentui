@@ -14,7 +14,7 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 
 ## 实现清单
 
-**未实现（按优先级；每条验证法见 `TODO.md`）**
+**未实现（按优先级；每条验证法见下方「未完成项的验证法」）**
 
 - [ ] **恢复后继续对话** —— 历史能看，但选中后直接打字发不出去（探针实测垫片收到 **0 个 POST**，疑为选择器焦点未交还输入框，待真人复核）
 - [ ] **`@` 文件补全** —— `/api/fs/list` 返回空
@@ -42,6 +42,17 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 - [x] **`shift+tab` 切权限模式** —— 三项**直接用 Ante 自己的说法**（`auto`/`strict`/`yolo`，不经过 opencode 的 build/plan 再翻译），实测 composer 循环 `Auto → Strict → Yolo`，且**以 `settings.json` 里配的那个打头**；切换是真差别（`strict` 下危险命令弹审批）。**agent 是在「建会话」的 body 里传的**（`{agent, id, model, location}`），不是发消息时
 - [x] **boot 接口全套** —— `health` `location` `fs/list` `agent` `provider` `model` `config` `vcs` `project` `plugin` `migration` …
 - [x] **事件流（SSE）** —— `{id, type, created, data}` 帧，首帧 `server.connected`
+
+### 未完成项的验证法
+
+| 项 | 怎么验 | 备注 |
+| --- | --- | --- |
+| **恢复后继续对话** | `/sessions` 选中旧会话后**直接打字回车**；看垫片终端有没有刷出 `POST …/prompt` | 探针实测 **0 POST**（底部渲染成了 `Subagents/Shell/Terminals` dock，输入框没出来），客户端无报错，待真人复核 |
+| **`@` 文件补全** | 输入框敲 `@`，看有没有文件列表 | `/api/fs/list` 目前返回空；Ante 侧没有对应接口，得垫片自己读文件系统 |
+| **diff / LSP / formatter / MCP / VCS** | 敲 `/diff`、开 MCP 面板看是否空 | **Ante 根本没有这些概念**，只能显示为空，别指望填上 |
+| **`/compact`、撤销回滚、贴图、PTY、分享** | 敲 `/compact`、试贴图 | `auto_compact` 是 Ante 的开关；撤销回滚对应 Ante 的 revert；贴图/PTY/分享 Ante 无对应 |
+| **次要事件** | 无所谓，缺了不致命 | `session.step.streamed`、`instructions.updated`、`renamed`、`model.selected` 未发 |
+| **垫片命令行参数** | `./opencode-shim abc` 看是否落到 41999；端口占用看是否 panic | 现状：非数字参数被忽略、端口被占直接 panic（`AddrInUse`） |
 
 
 ## 怎么跑
@@ -82,7 +93,7 @@ Cargo 依赖（`Cargo.lock` 实际解析值，非 `Cargo.toml` 的约束范围�
 | --- | --- |
 | 网络 | 编译时 **必须走代理**，crates.io 直连被 TLS 拦（`export http_proxy=https_proxy=http://127.0.0.1:7890`） |
 | opencode 客户端 | **2.0.18**，官方脚本装在 `~/.opencode/bin`（`opencode`/`opencode2` 均指向它） |
-| Ante | 接后端时用 **`ante-sdk` 0.2.5**——**已发布 crates.io**，直接写 `ante-sdk = "0.2.5"` 即可。本机另有 clone 在 `~/Documents/ante`（同版本），需要魔改上游时才改走 path 引用 |
+| Ante | 接后端时用 **`ante-sdk` 0.2.5**——**已发布 crates.io**，直接写 `ante-sdk = "0.2.5"` 即可。本机另有 clone 在 `~/Projects/ante`（同版本），需要魔改上游时才改走 path 引用 |
 
 ## 客户端现状（本机）
 
@@ -151,7 +162,7 @@ session.step.started → session.text.started → session.text.delta ×N → ses
 
 ## 下一步
 
-见上面的**实现清单 · 未实现**，按那份优先级做；每条的具体验证法在 `TODO.md`。
+见上面的**实现清单 · 未实现**，按那份优先级做；每条的具体验证法见同节的「未完成项的验证法」。
 其中「中断收尾」和「多轮消息落位」是当前功能的直接缺陷，先修；「会话列表」「agent 切换」是缺口；LSP/formatter/git 那类 Ante 没有的概念，只打桩。
 
 ## 魔改上游 TUI
