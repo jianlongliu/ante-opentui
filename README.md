@@ -7,6 +7,19 @@
 做法是**实现 opencode v2 要求的 server API**，让 `opencode --server <url>` 分辨不出真假；
 opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同「改接口，不改消费者」。
 
+## 它在你系统里的位置
+
+```
+opencode 的 TUI（本仓库自己编的，改了 logo）      ← 界面
+        ↕  opencode 协议（本仓库实现的「垫片」）
+antex（垫片，本仓库，一个二进制）
+        ↕  ante-sdk / `ante serve --stdio`
+Ante（**你自己装的**：官方脚本装、`ante update` 升级）
+```
+
+**Ante 不在本仓库里，也不用管它**——你装你的、它更它的，垫片按它的协议趴在上面。
+唯一耦合点就是协议：若 Ante 升级改了协议，改垫片即可（通常只动 `Cargo.toml` 里的 `ante-sdk` 版本 + `cargo build`）。
+
 ## 为什么走这条路
 
 手写复刻 opencode 的 TUI 到不了它的完成度（它有 17k 行的界面层）。反过来做，垫片是**可丢弃**的一层：

@@ -32,8 +32,15 @@ use futures::stream::{self, Stream, StreamExt};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
-/// Where the shim settles a request when the client does not say.
-const DIRECTORY: &str = "/home/user";
+/// Where the shim settles a request when the client does not say. The client
+/// normally passes `location[directory]` on every call, so this is only a
+/// fallback — and it is derived at runtime, not baked in.
+fn default_directory() -> String {
+    std::env::var("HOME")
+        .ok()
+        .or_else(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| ".".to_string())
+}
 const VERSION: &str = "2.0.18";
 /// The model Ante is configured with, so the composer shows something real.
 const MODEL: &str = "deepseek-v4.1-flash";
@@ -165,8 +172,8 @@ fn now_ms() -> i64 {
 
 fn location() -> Value {
     json!({
-        "directory": DIRECTORY,
-        "project": { "id": "prj_shim", "directory": DIRECTORY, "canonical": DIRECTORY },
+        "directory": default_directory(),
+        "project": { "id": "prj_shim", "directory": default_directory(), "canonical": default_directory() },
     })
 }
 
@@ -288,7 +295,7 @@ impl Store {
 }
 
 fn loc_plain() -> Value {
-    json!({ "directory": DIRECTORY })
+    json!({ "directory": default_directory() })
 }
 
 fn session_info(id: &str, title: &str) -> Value {
@@ -1149,7 +1156,7 @@ async fn fs_list(
         .get("path")
         .filter(|value| !value.is_empty())
         .cloned()
-        .unwrap_or_else(|| DIRECTORY.to_string());
+        .unwrap_or_else(|| default_directory().to_string());
     envelope(json!(fs_entries(std::path::Path::new(&base), 500)))
 }
 
@@ -1163,7 +1170,7 @@ async fn fs_find(
         .get("path")
         .filter(|value| !value.is_empty())
         .cloned()
-        .unwrap_or_else(|| DIRECTORY.to_string());
+        .unwrap_or_else(|| default_directory().to_string());
     let mut found: Vec<Value> = Vec::new();
     let root = std::path::PathBuf::from(root);
     let mut queue = std::collections::VecDeque::from([(root, 0usize)]);
@@ -1460,7 +1467,8 @@ fn ante_session_info(id: &str) -> Option<Value> {
         .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
         .map(|when| when.timestamp_millis())
         .unwrap_or_else(now_ms);
-    let directory = meta.get("dir").and_then(|v| v.as_str()).unwrap_or(DIRECTORY);
+    let fallback_dir = default_directory();
+    let directory = meta.get("dir").and_then(|v| v.as_str()).unwrap_or(&fallback_dir);
     let usage = meta.get("usage").cloned().unwrap_or_else(|| json!({}));
     let title = meta
         .get("first_user_message")
@@ -1885,7 +1893,7 @@ async fn main() {
         println!("端口 {} 被占，本实例改用 {port}", args.port);
     }
     let directory =
-        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(DIRECTORY));
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(default_directory()));
     let client = client_executable();
     match std::process::Command::new(&client)
         .arg("--server")
