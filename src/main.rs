@@ -1054,6 +1054,30 @@ fn fs_entries(dir: &std::path::Path, limit: usize) -> Vec<Value> {
     entries
 }
 
+/// Landing points for panels Ante has nothing to fill: the shape still has to
+/// match the schema, or the client validates the response away and the panel
+/// degrades silently instead of showing up empty.
+async fn empty_object() -> Json<Value> {
+    envelope(json!({}))
+}
+
+async fn bare_empty_array() -> Json<Value> {
+    // `/api/project` answers a bare array, like `/api/config`.
+    Json(json!([]))
+}
+
+async fn vcs_base_empty() -> Json<Value> {
+    envelope(json!(null))
+}
+
+async fn mcp_resources_empty() -> Json<Value> {
+    envelope(json!({ "resources": [], "templates": [] }))
+}
+
+async fn session_terminals_empty() -> Json<Value> {
+    Json(json!({ "data": [] }))
+}
+
 async fn fs_list(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Json<Value> {
@@ -1686,6 +1710,18 @@ async fn main() {
         .route("/api/info", get(health))
         .route("/health", get(health))
         .route("/api/location", get(location_get))
+        .route("/api/form", get(empty_reads))
+        .route("/api/shell", get(empty_reads).post(empty_reads))
+        .route("/api/reference", get(empty_reads))
+        .route("/api/integration", get(empty_reads))
+        .route("/api/project", get(bare_empty_array))
+        .route("/api/mcp/resource", get(mcp_resources_empty))
+        .route("/api/vcs/base", get(vcs_base_empty))
+        .route("/api/vcs/diff", get(empty_reads))
+        .route(
+            "/api/experimental/session/{id}/terminal",
+            get(session_terminals_empty).post(session_terminals_empty),
+        )
         .route("/api/fs/list", get(fs_list))
         .route("/api/fs/find", get(fs_find))
         .route("/api/agent", get(agents))
