@@ -429,10 +429,18 @@ fn ante_executable() -> Option<std::path::PathBuf> {
     fallback.is_file().then_some(fallback)
 }
 
-/// Which opencode client to hand the terminal to.
+/// Which opencode client to hand the terminal to. `~/.local/bin/antex-tui` is
+/// **our** build (vendored source + the Ante logo) and wins when present; the
+/// stock binary is the fallback.
 fn client_executable() -> std::path::PathBuf {
     if let Some(path) = std::env::var_os("ANTEX_CLIENT") {
         return std::path::PathBuf::from(path);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let patched = std::path::PathBuf::from(home).join(".local/bin/antex-tui");
+        if patched.is_file() {
+            return patched;
+        }
     }
     for name in ["opencode2", "opencode"] {
         if let Some(path) = std::env::var_os("PATH").and_then(|paths| {

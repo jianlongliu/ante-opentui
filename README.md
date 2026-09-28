@@ -89,6 +89,19 @@ opencode2 --server http://127.0.0.1:41999     # 终端 B
 - 环境变量：`ANTE_BIN` 指定 `ante` 可执行文件（默认 `$PATH`，再退到 `~/.ante/bin/ante`）；`OANTE_CLIENT` 指定客户端（默认 `opencode2` → `opencode`）。**所以不必先 export PATH。**
 - **一体化模式下请求日志写 `/tmp/antex.log`**——写 stdout 会糊在 TUI 上（踩过）；`serve` 模式仍打在 stdout。
 
+## 首页 logo（改过客户端）
+
+首页那个大字 logo 是**客户端里写死的常量**（`packages/tui/src/logo.ts`）——不是服务端给的，**垫片喂不进去**；而官方二进制（203MB）**内容是压缩的**，也没法做字节替换。所以这一处只能**改源码、自己编客户端**：
+
+```sh
+./script/build-tui.sh        # 编本机平台，产物 ~177MB，约 1 分钟
+```
+
+- 补丁只有一处：`vendor/opencode/packages/tui/src/logo.ts`（Ante 面具 + `ANTEX`）。
+- 编出来的客户端装在 `~/.local/bin/antex-tui`，**`antex` 默认就用它**（源码模式启动不慢，且底部没有 dev 模式的 `✓ Server ○ UI…` 那行）。
+- **上游更新后**（`git subtree pull`）跑一次 `script/build-tui.sh` 即可。
+- 想临时切回官方二进制：`ANTEX_CLIENT=opencode2 antex`。
+
 ## 依赖与版本
 
 工具链（本机实测，pacman 的 `rust` 包）：
