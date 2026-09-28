@@ -850,8 +850,81 @@ async fn location_get() -> Json<Value> {
     Json(location())
 }
 
-async fn fs_list() -> Json<Value> {
-    envelope(json!([]))
+/// `@` completion walks the working tree, so this reads the real filesystem —
+/// Ante has no file API of its own to proxy.
+fn fs_entries(dir: &std::path::Path, limit: usize) -> Vec<Value> {
+    let mut entries: Vec<Value> = Vec::new();
+    if let Ok(read) = std::fs::read_dir(dir) {
+        for entry in read.flatten() {
+            let path = entry.path();
+            let kind = if path.is_dir() { "directory" } else { "file" };
+            entries.push(json!({
+                "path": path.to_string_lossy(),
+                "type": kind,
+            }));
+            if entries.len() >= limit {
+                break;
+            }
+        }
+    }
+    entries.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+    entries
+}
+
+async fn fs_list(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<Value> {
+    let base = params
+        .get("path")
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .unwrap_or_else(|| DIRECTORY.to_string());
+    envelope(json!(fs_entries(std::path::Path::new(&base), 500)))
+}
+
+/// Depth-limited search so a stray `@` does not walk the whole disk.
+async fn fs_find(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<Value> {
+    let query = params.get("query").cloned().unwrap_or_default().to_lowercase();
+    let limit: usize = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50);
+    let root = params
+        .get("path")
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .unwrap_or_else(|| DIRECTORY.to_string());
+    let mut found: Vec<Value> = Vec::new();
+    let root = std::path::PathBuf::from(root);
+    let mut queue = std::collections::VecDeque::from([(root, 0usize)]);
+    while let Some((dir, depth)) = queue.pop_front() {
+        if depth > 6 || found.len() >= limit {
+            break;
+        }
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == "node_modules" || name == ".git" {
+                continue;
+            }
+            let is_dir = path.is_dir();
+            if name.to_lowercase().contains(&query) {
+                found.push(json!({
+                    "path": path.to_string_lossy(),
+                    "type": if is_dir { "directory" } else { "file" },
+                }));
+                if found.len() >= limit {
+                    break;
+                }
+            }
+            if is_dir {
+                queue.push_back((path, depth + 1));
+            }
+        }
+    }
+    envelope(json!(found))
 }
 
 /// Agents, providers and models are not Ante concepts, but the composer needs
@@ -1374,6 +1447,7 @@ async fn main() {
         .route("/health", get(health))
         .route("/api/location", get(location_get))
         .route("/api/fs/list", get(fs_list))
+        .route("/api/fs/find", get(fs_find))
         .route("/api/agent", get(agents))
         .route("/api/config", get(config))
         .route("/api/config/providers", get(config_providers))

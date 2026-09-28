@@ -19,7 +19,6 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 - [ ] **恢复后继续对话（暂搁）** —— **人眼可用**（用户实测：选旧会话 → 发消息 → Ante 回话 ✅）；**探针复现不出**：字进得了输入框，回车**静默无 POST、无报错**。
   已排除：终端尺寸（150×45）、点击输入框、命令（`/sessions` 与 `/resume` 都试过）、会话新老、agent/model 解析（已修）、Mod+Enter。
   **唯一未验的线索**：真终端走 kitty 键盘协议（Enter = `\x1b[13u`），探针一直发裸 `\r`——下次先试发 `\x1b[13u`。
-- [ ] **`@` 文件补全** —— `/api/fs/list` 返回空
 - [ ] **diff / LSP / formatter / MCP / VCS** —— 打桩。**这些是 Ante 根本没有的概念，只能显示为空，别指望填上**
 - [ ] **`/compact` 压缩、撤销回滚、贴图、PTY、分享**
 - [ ] **次要事件** —— `session.step.streamed`、`instructions.updated`、`renamed`、`model.selected` 未发（缺了不致命）
@@ -43,6 +42,7 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 - [x] **模型选择** —— `/api/model`、`/api/provider` 由 **Ante 的 `~/.ante/catalog.json` 驱动**（实测 81 个模型 / 9 个 provider），默认项取 `settings.json` 的 `provider`+`provider_model` 并排在首位；客户端选的模型在建会话与 `POST …/model` 两条路径都会下发 Ante（对应 `StartSession` / `UpdateSession`）
 - [x] **`shift+tab` 切权限模式** —— 三项**直接用 Ante 自己的说法**（`auto`/`strict`/`yolo`，不经过 opencode 的 build/plan 再翻译），实测 composer 循环 `Auto → Strict → Yolo`，且**以 `settings.json` 里配的那个打头**；切换是真差别（`strict` 下危险命令弹审批）。**agent 是在「建会话」的 body 里传的**（`{agent, id, model, location}`），不是发消息时
 - [x] **boot 接口全套** —— `health` `location` `fs/list` `agent` `provider` `model` `config` `vcs` `project` `plugin` `migration` …
+- [x] **`@` 文件补全** —— 垫片**自己读文件系统**（Ante 无文件 API）：`/api/fs/list` 列目录、`/api/fs/find` 递归搜索（跳过 `.git`/`node_modules`，深度≤6、limit≤50）。实测敲 `@` 列出家目录、输入 `main.rs` 命中真文件
 - [x] **事件流（SSE）** —— `{id, type, created, data}` 帧，首帧 `server.connected`
 
 ### 未完成项的验证法
@@ -50,7 +50,6 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 | 项 | 怎么验 | 备注 |
 | --- | --- | --- |
 | **恢复后继续对话** | `/sessions` 选中旧会话后**直接打字回车**；看垫片终端有没有刷出 `POST …/prompt` | **人眼：部分会话可用**；**探针：始终不行**——文字确实进了输入框（底部可见），回车后**静默无 POST、无报错**。已排除：终端尺寸（150×45 同样）、点击输入框、会话新老（本次运行建的和上轮建的都不行）、agent/model 解析（已修，仍不提交）。`submit.ts` 的 `submit.available()` 与 `readSubmission` 的 `!model||!agent` 两处守卫都会**静默 return**，尚未定位是哪一处 |
-| **`@` 文件补全** | 输入框敲 `@`，看有没有文件列表 | `/api/fs/list` 目前返回空；Ante 侧没有对应接口，得垫片自己读文件系统 |
 | **diff / LSP / formatter / MCP / VCS** | 敲 `/diff`、开 MCP 面板看是否空 | **Ante 根本没有这些概念**，只能显示为空，别指望填上 |
 | **`/compact`、撤销回滚、贴图、PTY、分享** | 敲 `/compact`、试贴图 | `auto_compact` 是 Ante 的开关；撤销回滚对应 Ante 的 revert；贴图/PTY/分享 Ante 无对应 |
 | **次要事件** | 无所谓，缺了不致命 | `session.step.streamed`、`instructions.updated`、`renamed`、`model.selected` 未发 |
