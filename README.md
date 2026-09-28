@@ -16,7 +16,6 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 
 **未实现（按优先级；每条验证法见 `TODO.md`）**
 
-- [ ] **中断收尾** —— `POST …/interrupt` 已通、Ante 也收到了，但**中断后界面卡转轮**；缺收尾事件（`step.ended` / `execution.interrupted`）
 - [ ] **多轮消息落位** —— 单轮正常；连发多条时用户消息成组堆在底部、没进对话流（疑 `inbox.delivered` 的 `admitted` 条件不满足）
 - [ ] **会话列表 / `/sessions` / `/resume`** —— 接口返回空，选择器打开是空的。Ante 侧数据现成：`~/.ante/sessions/*/meta.json` + `ResumeSession`
 - [ ] **`shift+tab` 切 agent、模型选择** —— 垫片只提供一个 agent（`build`），未实现 `POST …/agent`
@@ -27,6 +26,8 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 - [ ] **垫片命令行参数** —— 不解析；非数字参数被忽略、端口被占直接 panic（`AddrInUse`）
 
 **已实现（均已实测）**
+
+- [x] **中断收尾** —— Esc 两下（第一下上膛、第二下中断）后 Ante 正常收尾：工具单元格变 `✗`、转轮停止
 
 - [x] **真 v2 TUI 起界** —— 顶栏、块字 logo、composer、页脚全部由垫片喂出
 - [x] **提示词送达** —— `POST /api/session` → `POST …/model` → `POST …/prompt`

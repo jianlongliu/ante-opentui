@@ -222,6 +222,21 @@ fn result_text(result: &Value) -> String {
     }
 }
 
+/// With `ANTE_SHIM_TRACE=<file>`, record every Ante event variant. It sits above
+/// the active-session check on purpose: events that arrive with no open
+/// opencode session are exactly the ones worth seeing.
+fn trace_ante(event: &Evt) {
+    let Some(path) = std::env::var_os("ANTE_SHIM_TRACE") else {
+        return;
+    };
+    use std::io::Write as _;
+    let debug = format!("{event:?}");
+    let name = debug.split(['(', ' ', '{']).next().unwrap_or("?");
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = file.write_all(format!("{name}\n").as_bytes());
+    }
+}
+
 fn tokens_json(input: u32, output: u32) -> Value {
     json!({ "input": input, "output": output, "reasoning": 0,
             "cache": { "read": 0, "write": 0 } })
@@ -262,6 +277,7 @@ async fn spawn_ante(store: Store) {
     let mut tokens_out = 0u32;
 
     while let Some(msg) = rx.recv().await {
+        trace_ante(&msg.event);
         let Some(session) = store.ante.active.lock().ok().and_then(|s| s.clone()) else {
             continue;
         };
@@ -397,7 +413,10 @@ async fn spawn_ante(store: Store) {
                         "sessionID": session,
                         "assistantMessageID": message_id,
                         "id": end.tool_use_id,
-                        "error": text,
+                        // SessionError.Error is a struct, not a string; a bare
+                        // string fails the codec and the whole event is dropped,
+                        // which leaves the tool cell spinning forever.
+                        "error": { "type": "tool_error", "message": text },
                         "metadata": {},
                         "content": [],
                         "executed": true,
