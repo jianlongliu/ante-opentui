@@ -953,7 +953,7 @@ async fn bare_empty() -> Json<Value> {
 /// `/api/session/active` and friends: the client's submit path reads
 /// `.info.project.id`, so a bare empty envelope makes it throw.
 async fn active_session() -> Json<Value> {
-    Json(json!({ "info": { "project": { "id": "prj_shim" }, "id": null }, "location": location(), "data": null }))
+    Json(json!({ "data": {} }))
 }
 
 /// Ante keeps its session metadata on disk; opencode wants a session list, so
@@ -1117,7 +1117,9 @@ async fn session_get(State(store): State<Store>, Path(id): Path<String>) -> Json
         .session(&id)
         .or_else(|| ante_session_info(&id))
         .unwrap_or_else(|| session_info(&id, "Ante session"));
-    Json(info)
+    // The route's schema is `{data: Session.Info}` with additionalProperties:false;
+    // a bare object makes the client read `.id` off undefined.
+    Json(json!({ "data": info }))
 }
 
 /// Ante persists every session event to `events.jsonl`; replaying it rebuilds
