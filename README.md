@@ -132,14 +132,15 @@ Cargo 依赖（`Cargo.lock` 实际解析值，非 `Cargo.toml` 的约束范围�
 
 ## 客户端现状（本机）
 
-官方脚本安装，`opencode` 与 `opencode2` 都指向它：
+**日常用的是我们自己编的那份**（源码在 `vendor/opencode/`，改了 logo）：
 
-| 命令 | 解析到 | 版本 |
+| 命令 | 解析到 | 说明 |
 | --- | --- | --- |
-| `opencode` | `~/.opencode/bin/opencode` | 2.0.18 |
-| `opencode2` | `~/.opencode/bin/opencode2` | 2.0.18 |
+| `~/.local/bin/antex-tui` | `vendor/opencode/packages/cli/dist/cli-linux-x64/bin/opencode` | **我们的构建**，`antex` 默认用它；版本显示 `0.0.0-master-<日期>`；随时可用 `./script/build-tui.sh` 重建 |
+| `opencode` / `opencode2` | `~/.opencode/bin/…` | 官方 2.0.18，**留作兜底**：`ANTEX_CLIENT=opencode2 antex`，或删掉 `antex-tui` 软链即回退 |
 
-升级用 `opencode upgrade`（自带），与 pacman 无关。
+- **官方那份别删**：`~/.opencode/bin` 是官方脚本的安装位置（删过，害得用户的 v2 消失）。
+- 升级官方用 `opencode upgrade`（自带）；我们那份随 `git subtree pull` + `./script/build-tui.sh` 跟上。
 注意：omarchy 的 `stable-mirror` 冻结在 2026-09-08，pacman 看不到 v2。
 
 ## v2 API 约定（实测）
