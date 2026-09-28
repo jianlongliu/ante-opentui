@@ -21,7 +21,8 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
   已试并排除：① 按 `order=desc`+`limit` 返回（反转+截断）② `/inbox`、`/form` 改成 `{data:[]}`（它们的 schema 是 `additionalProperties:false`，带 `location` 会整条校验失败）③ `/api/session/{id}` 改回真实元数据（含真 `dir`）④ 补 `/api/info`（客户端版本检查走 `server.info`，不是 `/api/health`；此前一直报 `version undefined`）。
   复现时开 `--print-logs --log-level debug` **没有留下任何错误**，只有那条已修的版本警告——说明退回首页是「静默」的。
   **下一步**：拿真 server 跑同一个「选中会话」流程（`OPENCODE_PASSWORD=$(… serve 打印的密码) opencode --server …`）抓响应，逐条对照——大概率是某个我没对齐的字段或没实现的接口导致路由退回首页。
-- [ ] **`shift+tab` 切 agent、模型选择** —— 垫片只提供一个 agent（`build`），未实现 `POST …/agent`
+- [x] **`shift+tab` 切 agent** —— 提供 `build`/`plan`/`yolo` 三个 agent，**映射到 Ante 的权限模式**（`build`→auto、`plan`→strict、`yolo`→yolo），实测：切到 `Plan` 后危险命令弹审批。**agent 是在「建会话」的 body 里传的**（`{agent, id, model, location}`），不是发消息时
+- [ ] **模型选择** —— 客户端建会话时会带 `model`（`{id, providerID}`），垫片目前忽略；应按它下发 `UpdateSession`
 - [ ] **`@` 文件补全** —— `/api/fs/list` 返回空
 - [ ] **diff / LSP / formatter / MCP / VCS** —— 打桩。**这些是 Ante 根本没有的概念，只能显示为空，别指望填上**
 - [ ] **`/compact` 压缩、撤销回滚、贴图、PTY、分享**

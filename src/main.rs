@@ -76,6 +76,9 @@ struct Ante {
     /// A pause waiting for a decision: the Ante turn and tools, keyed by the
     /// request id the TUI will reply with.
     pending: Arc<Mutex<Option<PendingApproval>>>,
+    /// The agent the client last created a session with. opencode's agents are
+    /// permission configs, so this decides Ante's permission mode.
+    agent: Arc<Mutex<String>>,
 }
 
 /// An Ante turn paused for approval, held until the TUI answers.
@@ -92,6 +95,7 @@ impl Ante {
             started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             active: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(None)),
+            agent: Arc::new(Mutex::new("build".to_string())),
         }
     }
 }
@@ -594,6 +598,26 @@ async fn permission_reply(
 }
 
 /// Esc in the TUI. The client owns the gesture; this just relays it to Ante.
+/// `shift+tab` lands here; the agent picks Ante's permission mode.
+async fn session_agent(
+    State(store): State<Store>,
+    Path(_id): Path<String>,
+    Json(body): Json<Value>,
+) -> axum::http::StatusCode {
+    let agent = body.get("agent").and_then(|v| v.as_str()).unwrap_or("build").to_string();
+    let mode = permission_mode_for(&agent);
+    if let Some(ops) = store.ante.ops.lock().await.clone() {
+        let update = ante_sdk::protocol::SessionUpdate {
+            permission_mode: Some(mode),
+            ..Default::default()
+        };
+        if let Err(err) = ops.send(ante_sdk::protocol::op_msg(Op::UpdateSession(update))).await {
+            eprintln!("agent: send failed: {err}");
+        }
+    }
+    axum::http::StatusCode::NO_CONTENT
+}
+
 async fn session_interrupt(State(store): State<Store>, Path(_id): Path<String>) -> Json<Value> {
     let mut interrupted = false;
     if let Some(ops) = store.ante.ops.lock().await.clone() {
@@ -620,16 +644,40 @@ async fn fs_list() -> Json<Value> {
 /// Agents, providers and models are not Ante concepts, but the composer needs
 /// one of each before it will send: without them the prompt has no model and
 /// the client silently refuses to submit.
+/// opencode's agents are configs with permissions; Ante's nearest equivalent is
+/// the permission mode, so each agent here *is* one — switching is real, not
+/// cosmetic. `shift+tab` cycles them.
+const AGENTS: [(&str, &str); 3] = [
+    ("build", "Auto — act unless provably dangerous"),
+    ("plan", "Strict — ask unless provably safe"),
+    ("yolo", "Yolo — never ask"),
+];
+
+fn permission_mode_for(agent: &str) -> ante_sdk::protocol::PermissionMode {
+    match agent {
+        "plan" => ante_sdk::protocol::PermissionMode::Strict,
+        "yolo" => ante_sdk::protocol::PermissionMode::Yolo,
+        _ => ante_sdk::protocol::PermissionMode::Auto,
+    }
+}
+
 async fn agents() -> Json<Value> {
-    envelope(json!([{
-        "id": "build",
-        "name": "build",
-        "mode": "primary",
-        "hidden": false,
-        "request": { "settings": {}, "headers": {}, "body": {} },
-        "permissions": [{ "action": "*", "resource": "*", "effect": "allow" }],
-        "model": { "id": MODEL, "providerID": PROVIDER },
-    }]))
+    let list: Vec<Value> = AGENTS
+        .iter()
+        .map(|(id, description)| {
+            json!({
+                "id": id,
+                "name": id,
+                "description": description,
+                "mode": "primary",
+                "hidden": false,
+                "request": { "settings": {}, "headers": {}, "body": {} },
+                "permissions": [{ "action": "*", "resource": "*", "effect": "allow" }],
+                "model": { "id": MODEL, "providerID": PROVIDER },
+            })
+        })
+        .collect();
+    envelope(json!(list))
 }
 
 async fn models() -> Json<Value> {
@@ -756,8 +804,34 @@ async fn sessions_list() -> Json<Value> {
     Json(json!({ "data": ante_sessions(), "cursor": {} }))
 }
 
-async fn session_create(State(store): State<Store>) -> Json<Value> {
-    let id = uid("ses");
+async fn session_create(
+    State(store): State<Store>,
+    body: Option<Json<Value>>,
+) -> Json<Value> {
+    if let Some(path) = std::env::var_os("ANTE_SHIM_TRACE") {
+        use std::io::Write as _;
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = file.write_all(
+                format!("CREATE {:?}\n", body.as_ref().map(|Json(v)| v)).as_bytes(),
+            );
+        }
+    }
+    // The client picks the session id and the agent; honour both. Ignoring the
+    // id made the two sides disagree about which session was open.
+    let id = body
+        .as_ref()
+        .and_then(|Json(value)| value.get("id"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| uid("ses"));
+    if let Some(agent) = body
+        .as_ref()
+        .and_then(|Json(value)| value.get("agent"))
+        .and_then(|value| value.as_str())
+        && let Ok(mut slot) = store.ante.agent.lock()
+    {
+        *slot = agent.to_string();
+    }
     let info = session_info(&id, "Ante session");
     if let Ok(mut sessions) = store.sessions.lock() {
         sessions.push(info.clone());
@@ -960,19 +1034,35 @@ async fn session_prompt(
     if let Ok(mut active) = store.ante.active.lock() {
         *active = Some(id.clone());
     }
+    // The client carries the chosen agent in the prompt body (it does not call
+    // the switch route for a plain `shift+tab`), so the agent is applied here.
+    // An explicit SHIM_PERMISSION_MODE wins when set.
+    let agent = store
+        .ante
+        .agent
+        .lock()
+        .map(|slot| slot.clone())
+        .unwrap_or_else(|_| "build".to_string());
+    let mode = match std::env::var("SHIM_PERMISSION_MODE").as_deref() {
+        Ok("strict") => ante_sdk::protocol::PermissionMode::Strict,
+        Ok("yolo") => ante_sdk::protocol::PermissionMode::Yolo,
+        Ok("auto") => ante_sdk::protocol::PermissionMode::Auto,
+        _ => permission_mode_for(&agent),
+    };
+
     let ops = store.ante.ops.lock().await.clone();
     match ops {
         Some(ops) => {
             if !store.ante.started.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                // `SHIM_PERMISSION_MODE=strict|auto|yolo` decides whether Ante
-                // asks before acting; default follows the usual auto setting.
-                let mode = match std::env::var("SHIM_PERMISSION_MODE").as_deref() {
-                    Ok("strict") => Some(ante_sdk::protocol::PermissionMode::Strict),
-                    Ok("yolo") => Some(ante_sdk::protocol::PermissionMode::Yolo),
-                    Ok("auto") | _ => Some(ante_sdk::protocol::PermissionMode::Auto),
-                };
-                let request = SessionRequest { permission_mode: mode, ..Default::default() };
+                let request = SessionRequest { permission_mode: Some(mode), ..Default::default() };
                 let _ = ops.send(ante_sdk::protocol::op_msg(Op::StartSession(request))).await;
+            } else {
+                // Later prompts may arrive with a different agent.
+                let update = ante_sdk::protocol::SessionUpdate {
+                    permission_mode: Some(mode),
+                    ..Default::default()
+                };
+                let _ = ops.send(ante_sdk::protocol::op_msg(Op::UpdateSession(update))).await;
             }
             if let Err(err) = ops.send(ante_sdk::protocol::op_msg(Op::UserInput(text.clone()))).await {
                 eprintln!("ante: send failed: {err}");
@@ -1042,7 +1132,7 @@ async fn main() {
         .route("/api/session/{id}/inbox", get(bare_empty))
         .route("/api/session/{id}/form", get(bare_empty))
         .route("/api/session/{id}/model", post(no_content))
-        .route("/api/session/{id}/agent", post(no_content))
+        .route("/api/session/{id}/agent", post(session_agent))
         .route("/api/session/{id}/view", post(no_content))
         .route("/api/event", get(events))
         .fallback(fallback)
