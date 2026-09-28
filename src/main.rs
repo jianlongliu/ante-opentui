@@ -60,6 +60,11 @@ fn catalog() -> Value {
         .unwrap_or_else(|| json!({ "providers": {} }))
 }
 
+/// The pair a session reports before one is picked; always a catalog entry.
+fn model_for_session() -> (String, String) {
+    active_model()
+}
+
 fn settings() -> Value {
     std::fs::read_to_string(ante_home().join("settings.json"))
         .ok()
@@ -212,7 +217,7 @@ impl Ante {
             started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             active: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(None)),
-            agent: Arc::new(Mutex::new("build".to_string())),
+            agent: Arc::new(Mutex::new(reported_agent().to_string())),
             model: Arc::new(Mutex::new(None)),
         }
     }
@@ -290,8 +295,8 @@ fn session_info(id: &str, title: &str) -> Value {
         "project": { "id": "prj_shim" },
         "cost": 0,
         "tokens": { "input": 0, "output": 0, "reasoning": 0, "cache": { "read": 0, "write": 0 } },
-        "agent": "build",
-        "model": { "id": MODEL, "providerID": PROVIDER, "variant": "default" },
+        "agent": reported_agent(),
+        "model": { "id": model_for_session().1, "providerID": model_for_session().0, "variant": "default" },
         "time": { "created": now_ms(), "updated": now_ms(), "idle": now_ms(), "viewed": now_ms() },
         "location": loc_plain(),
         "title": title,
@@ -440,7 +445,7 @@ async fn spawn_ante(store: Store) {
                         json!({
                             "sessionID": session,
                             "assistantMessageID": message_id,
-                            "agent": "build",
+                            "agent": reported_agent(),
                             "model": { "id": model, "providerID": provider },
                             "started": now_ms(),
                         }),
@@ -810,7 +815,7 @@ async fn session_agent(
     Path(_id): Path<String>,
     Json(body): Json<Value>,
 ) -> axum::http::StatusCode {
-    let agent = body.get("agent").and_then(|v| v.as_str()).unwrap_or("build").to_string();
+    let agent = body.get("agent").and_then(|v| v.as_str()).unwrap_or_else(|| reported_agent()).to_string();
     let mode = permission_mode_for(&agent);
     if store.ante.started.load(std::sync::atomic::Ordering::SeqCst)
         && let Some(ops) = store.ante.ops.lock().await.clone()
@@ -864,6 +869,13 @@ fn agent_description(agent: &str) -> &'static str {
         "yolo" => "Never ask（跳过全部检查）",
         _ => "Act unless provably dangerous",
     }
+}
+
+/// The agent a session reports. It **must** be one of `AGENTS`: the client looks
+/// it up, and `submit.ts` silently returns when it cannot resolve one.
+fn reported_agent() -> &'static str {
+    let configured = configured_permission_mode();
+    AGENTS.iter().find(|id| **id == configured).copied().unwrap_or("auto")
 }
 
 fn permission_mode_for(agent: &str) -> ante_sdk::protocol::PermissionMode {
@@ -1019,7 +1031,7 @@ fn ante_sessions() -> Vec<Value> {
             let info = json!({
                 "id": id,
                 "projectID": "prj_shim",
-                "agent": "build",
+                "agent": reported_agent(),
                 "model": { "id": model, "providerID": provider },
                 "cost": 0,
                 "tokens": tokens,
@@ -1114,7 +1126,7 @@ fn ante_session_info(id: &str) -> Option<Value> {
     Some(json!({
         "id": id,
         "projectID": "prj_shim",
-        "agent": "build",
+        "agent": reported_agent(),
         "model": {
             "id": meta.get("model").and_then(|v| v.as_str()).unwrap_or(MODEL),
             "providerID": meta.get("provider").and_then(|v| v.as_str()).unwrap_or(PROVIDER),
@@ -1190,8 +1202,8 @@ fn replay_session(id: &str) -> Vec<Value> {
             Evt::TurnStart { .. } => messages.push(json!({
                 "id": id,
                 "type": "assistant",
-                "agent": "build",
-                "model": { "id": MODEL, "providerID": PROVIDER },
+                "agent": reported_agent(),
+                "model": { "id": model_for_session().1, "providerID": model_for_session().0 },
                 "content": [],
                 "time": { "created": created },
             })),
@@ -1289,7 +1301,7 @@ async fn session_prompt(
         .agent
         .lock()
         .map(|slot| slot.clone())
-        .unwrap_or_else(|_| "build".to_string());
+        .unwrap_or_else(|_| reported_agent().to_string());
     let mode = match std::env::var("SHIM_PERMISSION_MODE").as_deref() {
         Ok("strict") => ante_sdk::protocol::PermissionMode::Strict,
         Ok("yolo") => ante_sdk::protocol::PermissionMode::Yolo,

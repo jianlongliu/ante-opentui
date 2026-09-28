@@ -47,7 +47,7 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 
 | 项 | 怎么验 | 备注 |
 | --- | --- | --- |
-| **恢复后继续对话** | `/sessions` 选中旧会话后**直接打字回车**；看垫片终端有没有刷出 `POST …/prompt` | 探针实测 **0 POST**（底部渲染成了 `Subagents/Shell/Terminals` dock，输入框没出来），客户端无报错，待真人复核 |
+| **恢复后继续对话** | `/sessions` 选中旧会话后**直接打字回车**；看垫片终端有没有刷出 `POST …/prompt` | **人眼：部分会话可用**；**探针：始终不行**——文字确实进了输入框（底部可见），回车后**静默无 POST、无报错**。已排除：终端尺寸（150×45 同样）、点击输入框、会话新老（本次运行建的和上轮建的都不行）、agent/model 解析（已修，仍不提交）。`submit.ts` 的 `submit.available()` 与 `readSubmission` 的 `!model||!agent` 两处守卫都会**静默 return**，尚未定位是哪一处 |
 | **`@` 文件补全** | 输入框敲 `@`，看有没有文件列表 | `/api/fs/list` 目前返回空；Ante 侧没有对应接口，得垫片自己读文件系统 |
 | **diff / LSP / formatter / MCP / VCS** | 敲 `/diff`、开 MCP 面板看是否空 | **Ante 根本没有这些概念**，只能显示为空，别指望填上 |
 | **`/compact`、撤销回滚、贴图、PTY、分享** | 敲 `/compact`、试贴图 | `auto_compact` 是 Ante 的开关；撤销回滚对应 Ante 的 revert；贴图/PTY/分享 Ante 无对应 |
