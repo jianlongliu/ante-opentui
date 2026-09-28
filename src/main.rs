@@ -311,11 +311,26 @@ fn assistant_content(text: &str) -> Value {
 }
 
 /// Every request, so the client's own behaviour is the specification.
+/// One-command mode hands the terminal to the TUI, so request logs must not go to
+/// stdout — they would scribble over the interface. `None` (serve mode) keeps
+/// them on stdout, which is what a server-only run wants.
+static LOG_FILE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+
 async fn log_request(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
-    {
-        use std::io::Write;
-        println!("{} {}", req.method(), req.uri());
-        let _ = std::io::stdout().flush();
+    use std::io::Write as _;
+    let line = format!("{} {}", req.method(), req.uri());
+    match LOG_FILE.get().and_then(|slot| slot.as_ref()) {
+        Some(path) => {
+            if let Ok(mut file) =
+                std::fs::OpenOptions::new().create(true).append(true).open(path)
+            {
+                let _ = writeln!(file, "{line}");
+            }
+        }
+        None => {
+            println!("{line}");
+            let _ = std::io::stdout().flush();
+        }
     }
     next.run(req).await
 }
@@ -392,6 +407,45 @@ fn tokens_json(input: u32, output: u32) -> Value {
 ///
 /// One Ante session is mirrored into whichever opencode session the TUI most
 /// recently opened. The reply is not faked: this is Ante's own output.
+/// The `ante` host to spawn: `$ANTE_BIN`, else `ante` on `PATH`, else Ante's own
+/// install location. Without this the shim only worked if the caller had already
+/// put `~/.ante/bin` on `PATH`.
+fn ante_executable() -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("ANTE_BIN") {
+        let path = std::path::PathBuf::from(path);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join("ante"))
+            .find(|candidate| candidate.is_file())
+    }) {
+        return Some(path);
+    }
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+    let fallback = home.join(".ante/bin/ante");
+    fallback.is_file().then_some(fallback)
+}
+
+/// Which opencode client to hand the terminal to.
+fn client_executable() -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os("OANTE_CLIENT") {
+        return std::path::PathBuf::from(path);
+    }
+    for name in ["opencode2", "opencode"] {
+        if let Some(path) = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join(name))
+                .find(|candidate| candidate.is_file())
+        }) {
+            return path;
+        }
+    }
+    std::path::PathBuf::from("opencode2")
+}
+
 async fn spawn_ante(store: Store) {
     let endpoint: ante_sdk::Endpoint = match "stdio".parse() {
         Ok(endpoint) => endpoint,
@@ -400,7 +454,9 @@ async fn spawn_ante(store: Store) {
             return;
         }
     };
-    let client = match connect(endpoint, ConnectOptions::default()).await {
+    let mut options = ConnectOptions::default();
+    options.executable = ante_executable();
+    let client = match connect(endpoint, options).await {
         Ok(client) => client,
         Err(err) => {
             eprintln!("ante: connect failed: {err}");
@@ -1655,21 +1711,31 @@ fn frame(event: &Value) -> Event {
 }
 
 const USAGE: &str = "\
-opencode-shim — 用 opencode v2 的 TUI 驱动 Ante
+oante — 用 opencode 的 TUI 驱动 Ante
 
 用法:
-  opencode-shim [PORT]          监听端口（默认 41999）
-  opencode-shim --port PORT
-  opencode-shim -h | --help     显示本帮助
+  oante                  起服务并直接进 TUI（一条命令，退出时服务一起停）
+  oante PORT             同上，指定端口（默认 41999）
+  oante serve [PORT]     只起服务，留在前台；另开终端连它
+  oante -h | --help      显示本帮助
 
-跑法:
-  opencode-shim 41999                     # 终端 A
-  opencode2 --server http://127.0.0.1:41999   # 终端 B
+只起服务时，客户端这样连：
+  opencode2 --server http://127.0.0.1:41999
+
+环境变量:
+  ANTE_BIN       指定 ante 可执行文件（默认 $PATH，再退到 ~/.ante/bin/ante）
+  OANTE_CLIENT   指定 opencode 客户端（默认 $PATH 上的 opencode2，再退到 opencode）
 ";
 
-/// `Ok(Some(port))` 正常，`Ok(None)` 已打印帮助并应退出，`Err` 是用法错误。
-fn parse_port(args: Vec<String>) -> Result<Option<u16>, String> {
-    let mut port = 41999u16;
+struct Args {
+    port: u16,
+    /// `serve` 子命令：只起服务，不接管终端。
+    serve_only: bool,
+}
+
+/// `Ok(Some(args))` 正常，`Ok(None)` 已打印帮助并应退出，`Err` 是用法错误。
+fn parse_args(args: Vec<String>) -> Result<Option<Args>, String> {
+    let mut parsed = Args { port: 41999, serve_only: false };
     let mut rest = args.into_iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -1677,23 +1743,24 @@ fn parse_port(args: Vec<String>) -> Result<Option<u16>, String> {
                 print!("{USAGE}");
                 return Ok(None);
             }
+            "serve" => parsed.serve_only = true,
             "--port" => {
                 let value = rest.next().ok_or("--port 后面要跟端口号")?;
-                port = value.parse().map_err(|_| format!("端口不是数字: {value}"))?;
+                parsed.port = value.parse().map_err(|_| format!("端口不是数字: {value}"))?;
             }
             other => match other.parse::<u16>() {
-                Ok(value) => port = value,
+                Ok(value) => parsed.port = value,
                 Err(_) => return Err(format!("不认识的参数: {other}")),
             },
         }
     }
-    Ok(Some(port))
+    Ok(Some(parsed))
 }
 
 #[tokio::main]
 async fn main() {
-    let port = match parse_port(std::env::args().skip(1).collect()) {
-        Ok(Some(port)) => port,
+    let args = match parse_args(std::env::args().skip(1).collect()) {
+        Ok(Some(args)) => args,
         Ok(None) => return,
         Err(err) => {
             eprintln!("错误：{err}\n\n{USAGE}");
@@ -1756,21 +1823,58 @@ async fn main() {
         .layer(axum::middleware::from_fn(log_request))
         .with_state(store);
 
-    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", args.port)).await {
         Ok(listener) => listener,
         Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
             eprintln!(
-                "端口 {port} 已被占用。换一个端口，或先停掉占用它的进程：\n  fuser -k {port}/tcp"
+                "端口 {} 已被占用。换一个端口，或先停掉占用它的进程：\n  fuser -k {}/tcp",
+                args.port, args.port
             );
             std::process::exit(1);
         }
         Err(err) => {
-            eprintln!("监听 127.0.0.1:{port} 失败：{err}");
+            eprintln!("监听 127.0.0.1:{} 失败：{err}", args.port);
             std::process::exit(1);
         }
     };
-    println!("opencode-shim listening on http://127.0.0.1:{port}");
-    axum::serve(listener, app).await.expect("serve");
+
+    let port = args.port;
+    let _ = LOG_FILE.set(if args.serve_only {
+        None
+    } else {
+        Some(std::env::temp_dir().join("oante.log"))
+    });
+    if args.serve_only {
+        println!("oante 服务已起在 http://127.0.0.1:{port}");
+        println!("客户端这样连：opencode2 --server http://127.0.0.1:{port}");
+        axum::serve(listener, app).await.expect("serve");
+        return;
+    }
+
+    // Default mode: serve in the background, then hand the terminal to the real
+    // opencode TUI — one command instead of two.
+    tokio::spawn(async move {
+        if let Err(err) = axum::serve(listener, app).await {
+            eprintln!("oante: 服务结束：{err}");
+        }
+    });
+    let directory =
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(DIRECTORY));
+    let client = client_executable();
+    match std::process::Command::new(&client)
+        .arg("--server")
+        .arg(format!("http://127.0.0.1:{port}"))
+        .arg(&directory)
+        .status()
+    {
+        // The TUI owns the terminal; when it exits, so do we.
+        Ok(status) => std::process::exit(status.code().unwrap_or(0)),
+        Err(err) => {
+            eprintln!("起不了 opencode 客户端（{}）：{err}", client.display());
+            eprintln!("用 OANTE_CLIENT 指定它的路径；或只起服务：oante serve {port}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Unknown reads answer with the envelope so list-shaped reads do not blow up;

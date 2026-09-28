@@ -1,5 +1,5 @@
 [package]
-name = "opencode-shim"
+name = "oante"
 version = "0.1.0"
 edition = "2024"
 description = "Opencode v2 server API on top of the Ante agent, so opencode's own TUI can drive Ante"
