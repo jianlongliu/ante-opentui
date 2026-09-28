@@ -201,6 +201,8 @@ struct Ante {
     agent: Arc<Mutex<String>>,
     /// Provider and model the client last picked, as Ante names them.
     model: Arc<Mutex<Option<(String, String)>>>,
+    /// Last prompt, used as the `recent` field compaction events require.
+    last_user: Arc<Mutex<String>>,
 }
 
 /// An Ante turn paused for approval, held until the TUI answers.
@@ -219,6 +221,7 @@ impl Ante {
             pending: Arc::new(Mutex::new(None)),
             agent: Arc::new(Mutex::new(reported_agent().to_string())),
             model: Arc::new(Mutex::new(None)),
+            last_user: Arc::new(Mutex::new(String::new())),
         }
     }
 }
@@ -419,6 +422,8 @@ async fn spawn_ante(store: Store) {
     let mut ordinal = 0u32;
     let mut tokens_in = 0u32;
     let mut tokens_out = 0u32;
+    let mut compact_block: Option<String> = None;
+    let mut compact_text = String::new();
 
     while let Some(msg) = rx.recv().await {
         trace_ante(&msg.event);
@@ -602,6 +607,101 @@ async fn spawn_ante(store: Store) {
                 store.publish_durable(name, payload, &session);
                 // The next content begins a fresh step (and message).
                 step_open = false;
+            }
+            // Ante reports a compaction as an info block (`compact-op_…`), not
+            // through CompactStart/CompactEnd — those only fire for a real
+            // reduction, and the no-op path ("nothing to compact") sends just the
+            // block. Both are mirrored so the client never sits on "queued".
+            Evt::InfoBlockStart { id: block, header, .. } => {
+                if block.starts_with("compact") {
+                    compact_block = Some(block.clone());
+                    compact_text.clear();
+                    let recent = store.ante.last_user.lock().map(|s| s.clone()).unwrap_or_default();
+                    store.publish_durable(
+                        "session.compaction.started",
+                        json!({ "sessionID": session, "reason": "manual", "recent": recent }),
+                        &session,
+                    );
+                    compact_text = header;
+                }
+            }
+            Evt::InfoBlockAppend { id: block, detail } => {
+                if compact_block.as_deref() == Some(block.as_str()) {
+                    store.publish_durable(
+                        "session.compaction.delta",
+                        json!({ "sessionID": session, "text": detail }),
+                        &session,
+                    );
+                    // Ante has no end event: the first detail means the block is
+                    // no longer loading, so this is where the client's item settles.
+                    let text = if compact_text.is_empty() {
+                        detail.clone()
+                    } else {
+                        format!("{compact_text} — {detail}")
+                    };
+                    let model_now = store
+                        .ante
+                        .model
+                        .lock()
+                        .ok()
+                        .and_then(|slot| slot.clone())
+                        .unwrap_or_else(active_model);
+                    let recent = store.ante.last_user.lock().map(|s| s.clone()).unwrap_or_default();
+                    store.publish_durable(
+                        "session.compaction.ended",
+                        json!({
+                            "sessionID": session,
+                            "reason": "manual",
+                            "text": text,
+                            "recent": recent,
+                            "model": { "id": model_now.1, "providerID": model_now.0 },
+                        }),
+                        &session,
+                    );
+                    compact_block = None;
+                }
+            }
+            // Ante compacts for real; mirror it as opencode's compaction events.
+            Evt::CompactStart => {
+                let recent = store.ante.last_user.lock().map(|s| s.clone()).unwrap_or_default();
+                store.publish_durable(
+                    "session.compaction.started",
+                    json!({ "sessionID": session, "reason": "manual", "recent": recent }),
+                    &session,
+                );
+            }
+            Evt::CompactEnd { summary } => {
+                let recent = store.ante.last_user.lock().map(|s| s.clone()).unwrap_or_default();
+                let model_now = store
+                    .ante
+                    .model
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.clone())
+                    .unwrap_or_else(active_model);
+                match summary {
+                    Some(text) => store.publish_durable(
+                        "session.compaction.ended",
+                        json!({
+                            "sessionID": session,
+                            "reason": "manual",
+                            "text": text,
+                            "recent": recent,
+                            "model": { "id": model_now.1, "providerID": model_now.0 },
+                        }),
+                        &session,
+                    ),
+                    None => store.publish_durable(
+                        "session.compaction.failed",
+                        json!({
+                            "sessionID": session,
+                            "reason": "manual",
+                            "recent": recent,
+                            "error": { "type": "compaction_failed", "message": "Ante did not produce a summary" },
+                        }),
+                        &session,
+                    ),
+                }
             }
             Evt::UsageUpdate { usage, .. } => {
                 tokens_in = usage.input_tokens;
@@ -792,6 +892,53 @@ async fn permission_reply(
 }
 
 /// Esc in the TUI. The client owns the gesture; this just relays it to Ante.
+/// `/compact` — Ante has a real compaction op, so this forwards rather than fakes
+/// it. The response shape is the inbox item the client expects to get back.
+async fn session_compact(
+    State(store): State<Store>,
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Json<Value> {
+    if let Some(ops) = store.ante.ops.lock().await.clone() {
+        let op = Op::Compact { instructions: None };
+        if let Err(err) = ops.send(ante_sdk::protocol::op_msg(op)).await {
+            eprintln!("compact: send failed: {err}");
+        }
+    } else {
+        eprintln!("compact: not connected; request dropped");
+    }
+    let input_id = body
+        .as_ref()
+        .and_then(|Json(value)| value.get("id"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| uid("msg"));
+    // Point the event pump here, then run the inbox handshake the client needs to
+    // move the item out of "queued" and into the transcript.
+    if let Ok(mut active) = store.ante.active.lock() {
+        *active = Some(id.clone());
+    }
+    let item = json!({
+        "id": input_id,
+        "sessionID": id,
+        "time": { "created": now_ms() },
+        "type": "compaction",
+        "payload": {},
+        "delivery": {},
+    });
+    store.publish_durable(
+        "session.inbox.enqueued",
+        json!({ "inboxID": input_id, "sessionID": id, "item": item }),
+        &id,
+    );
+    store.publish_durable(
+        "session.inbox.delivered",
+        json!({ "inboxID": input_id, "sessionID": id }),
+        &id,
+    );
+    Json(json!({ "data": item }))
+}
+
 /// The model picker lands here (`{model:{id,providerID}}`); Ante takes the pair
 /// directly, so the switch is real.
 async fn session_model(
@@ -1450,6 +1597,9 @@ async fn session_prompt(
                 };
                 let _ = ops.send(ante_sdk::protocol::op_msg(Op::UpdateSession(update))).await;
             }
+            if let Ok(mut slot) = store.ante.last_user.lock() {
+                *slot = text.clone();
+            }
             if let Err(err) = ops.send(ante_sdk::protocol::op_msg(Op::UserInput(text.clone()))).await {
                 eprintln!("ante: send failed: {err}");
             }
@@ -1562,6 +1712,7 @@ async fn main() {
         .route("/api/session/{id}/inbox", get(bare_empty))
         .route("/api/session/{id}/form", get(bare_empty))
         .route("/api/session/{id}/model", post(session_model))
+        .route("/api/session/{id}/compact", post(session_compact))
         .route("/api/session/{id}/agent", post(session_agent))
         .route("/api/session/{id}/view", post(no_content))
         .route("/api/event", get(events))
