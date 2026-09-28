@@ -222,6 +222,15 @@ fn result_text(result: &Value) -> String {
     }
 }
 
+/// Clip to a character budget, for session titles.
+fn short(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(width.saturating_sub(1)).collect();
+    format!("{head}…")
+}
+
 /// With `ANTE_SHIM_TRACE=<file>`, record every Ante event variant. It sits above
 /// the active-session check on purpose: events that arrive with no open
 /// opencode session are exactly the ones worth seeing.
@@ -674,9 +683,70 @@ async fn active_session() -> Json<Value> {
     Json(json!({ "info": { "project": { "id": "prj_shim" }, "id": null }, "location": location(), "data": null }))
 }
 
-async fn sessions_list(State(store): State<Store>) -> Json<Value> {
-    let data = store.sessions.lock().map(|s| s.clone()).unwrap_or_default();
-    Json(json!({ "data": data, "cursor": {} }))
+/// Ante keeps its session metadata on disk; opencode wants a session list, so
+/// this reads that directory and maps it into `Session.Info`.
+fn ante_sessions() -> Vec<Value> {
+    let home = std::env::var_os("ANTE_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+            home.join(".ante")
+        });
+    let Ok(entries) = std::fs::read_dir(home.join("sessions")) else {
+        return Vec::new();
+    };
+
+    let mut sessions: Vec<(i64, Value)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let raw = std::fs::read_to_string(entry.path().join("meta.json")).ok()?;
+            let meta: Value = serde_json::from_str(&raw).ok()?;
+            let id = meta.get("id")?.as_str()?.to_string();
+            let created = meta
+                .get("started_time")
+                .and_then(|v| v.as_str())
+                .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+                .map(|when| when.timestamp_millis())
+                .unwrap_or_else(now_ms);
+            let directory = meta
+                .get("dir")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let title = meta
+                .get("first_user_message")
+                .and_then(|v| v.as_str())
+                .map(|text| short(&text.replace(['\n', '\r'], " "), 60))
+                .unwrap_or_else(|| "untitled".into());
+            let usage = meta.get("usage").cloned().unwrap_or_else(|| json!({}));
+            let tokens = tokens_json(
+                usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            );
+            let model = meta.get("model").and_then(|v| v.as_str()).unwrap_or(MODEL);
+            let provider = meta.get("provider").and_then(|v| v.as_str()).unwrap_or(PROVIDER);
+            let info = json!({
+                "id": id,
+                "projectID": "prj_shim",
+                "agent": "build",
+                "model": { "id": model, "providerID": provider },
+                "cost": 0,
+                "tokens": tokens,
+                "time": { "created": created, "updated": created },
+                "title": title,
+                "location": { "directory": directory },
+            });
+            Some((created, info))
+        })
+        .collect();
+
+    // Newest first, which is the order the picker shows.
+    sessions.sort_by(|a, b| b.0.cmp(&a.0));
+    sessions.into_iter().map(|(_, info)| info).collect()
+}
+
+async fn sessions_list() -> Json<Value> {
+    Json(json!({ "data": ante_sessions(), "cursor": {} }))
 }
 
 async fn session_create(State(store): State<Store>) -> Json<Value> {
