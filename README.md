@@ -16,7 +16,8 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 
 **未实现（按优先级；每条验证法见 `TODO.md`）**
 
-- [ ] **`/sessions` / `/resume` 选择器** —— 服务端已能返回会话列表（`GET /api/session`，实测 225 条、按时间倒序、标题取 `first_user_message`），但**选择器仍不弹出**：`/sessions` 的实现在客户端 `packages/tui/src/app.tsx`，它打开 `DialogSessionList` 并读**客户端本地 store**（`data.session.list()`），且 `suggested` 判据是该 store 非空。下一步要确认客户端有没有真的把服务端列表收进 store。
+- [x] **会话列表 / `/sessions` / `/resume`** —— `GET /api/session` 读 `~/.ante/sessions/*/meta.json`（实测 225 条、时间倒序、标题=首条用户消息），**选择器实测已列出真 Ante 会话**
+- [ ] **恢复会话** —— 从列表里选一条会把历史载入：需把 Ante 的 `events.jsonl` 回放成 `message.part.*`，并让 `ResumeSession` 接上
 - [ ] **`shift+tab` 切 agent、模型选择** —— 垫片只提供一个 agent（`build`），未实现 `POST …/agent`
 - [ ] **`@` 文件补全** —— `/api/fs/list` 返回空
 - [ ] **diff / LSP / formatter / MCP / VCS** —— 打桩。**这些是 Ante 根本没有的概念，只能显示为空，别指望填上**
