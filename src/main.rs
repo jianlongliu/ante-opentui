@@ -1433,9 +1433,52 @@ fn frame(event: &Value) -> Event {
     Event::default().id(id.to_string()).event(name.to_string()).data(event.to_string())
 }
 
+const USAGE: &str = "\
+opencode-shim — 用 opencode v2 的 TUI 驱动 Ante
+
+用法:
+  opencode-shim [PORT]          监听端口（默认 41999）
+  opencode-shim --port PORT
+  opencode-shim -h | --help     显示本帮助
+
+跑法:
+  opencode-shim 41999                     # 终端 A
+  opencode2 --server http://127.0.0.1:41999   # 终端 B
+";
+
+/// `Ok(Some(port))` 正常，`Ok(None)` 已打印帮助并应退出，`Err` 是用法错误。
+fn parse_port(args: Vec<String>) -> Result<Option<u16>, String> {
+    let mut port = 41999u16;
+    let mut rest = args.into_iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                return Ok(None);
+            }
+            "--port" => {
+                let value = rest.next().ok_or("--port 后面要跟端口号")?;
+                port = value.parse().map_err(|_| format!("端口不是数字: {value}"))?;
+            }
+            other => match other.parse::<u16>() {
+                Ok(value) => port = value,
+                Err(_) => return Err(format!("不认识的参数: {other}")),
+            },
+        }
+    }
+    Ok(Some(port))
+}
+
 #[tokio::main]
 async fn main() {
-    let port: u16 = std::env::args().nth(1).and_then(|p| p.parse().ok()).unwrap_or(41999);
+    let port = match parse_port(std::env::args().skip(1).collect()) {
+        Ok(Some(port)) => port,
+        Ok(None) => return,
+        Err(err) => {
+            eprintln!("错误：{err}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
     let store = Store::new();
     // Ante is connected lazily at startup; its events feed every opencode
     // session this shim serves.
@@ -1479,7 +1522,19 @@ async fn main() {
         .layer(axum::middleware::from_fn(log_request))
         .with_state(store);
 
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.expect("bind");
+    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+            eprintln!(
+                "端口 {port} 已被占用。换一个端口，或先停掉占用它的进程：\n  fuser -k {port}/tcp"
+            );
+            std::process::exit(1);
+        }
+        Err(err) => {
+            eprintln!("监听 127.0.0.1:{port} 失败：{err}");
+            std::process::exit(1);
+        }
+    };
     println!("opencode-shim listening on http://127.0.0.1:{port}");
     axum::serve(listener, app).await.expect("serve");
 }

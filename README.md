@@ -22,7 +22,6 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 - [ ] **diff / LSP / formatter / MCP / VCS** —— 打桩。**这些是 Ante 根本没有的概念，只能显示为空，别指望填上**
 - [ ] **`/compact` 压缩、撤销回滚、贴图、PTY、分享**
 - [ ] **次要事件** —— `session.step.streamed`、`instructions.updated`、`renamed`、`model.selected` 未发（缺了不致命）
-- [ ] **垫片命令行参数** —— 不解析；非数字参数被忽略、端口被占直接 panic（`AddrInUse`）
 
 **已实现（均已实测）**
 
@@ -43,6 +42,7 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 - [x] **`shift+tab` 切权限模式** —— 三项**直接用 Ante 自己的说法**（`auto`/`strict`/`yolo`，不经过 opencode 的 build/plan 再翻译），实测 composer 循环 `Auto → Strict → Yolo`，且**以 `settings.json` 里配的那个打头**；切换是真差别（`strict` 下危险命令弹审批）。**agent 是在「建会话」的 body 里传的**（`{agent, id, model, location}`），不是发消息时
 - [x] **boot 接口全套** —— `health` `location` `fs/list` `agent` `provider` `model` `config` `vcs` `project` `plugin` `migration` …
 - [x] **`@` 文件补全** —— 垫片**自己读文件系统**（Ante 无文件 API）：`/api/fs/list` 列目录、`/api/fs/find` 递归搜索（跳过 `.git`/`node_modules`，深度≤6、limit≤50）。实测敲 `@` 列出家目录、输入 `main.rs` 命中真文件
+- [x] **命令行参数** —— `[PORT]` / `--port PORT` / `-h|--help`；不认识的参数打印用法并以 2 退出；**端口被占给明确提示、不再 panic**
 - [x] **事件流（SSE）** —— `{id, type, created, data}` 帧，首帧 `server.connected`
 
 ### 未完成项的验证法
@@ -53,7 +53,6 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 | **diff / LSP / formatter / MCP / VCS** | 敲 `/diff`、开 MCP 面板看是否空 | **Ante 根本没有这些概念**，只能显示为空，别指望填上 |
 | **`/compact`、撤销回滚、贴图、PTY、分享** | 敲 `/compact`、试贴图 | `auto_compact` 是 Ante 的开关；撤销回滚对应 Ante 的 revert；贴图/PTY/分享 Ante 无对应 |
 | **次要事件** | 无所谓，缺了不致命 | `session.step.streamed`、`instructions.updated`、`renamed`、`model.selected` 未发 |
-| **垫片命令行参数** | `./opencode-shim abc` 看是否落到 41999；端口占用看是否 panic | 现状：非数字参数被忽略、端口被占直接 panic（`AddrInUse`） |
 
 
 ## 怎么跑
