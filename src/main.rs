@@ -414,6 +414,7 @@ async fn spawn_ante(store: Store) {
     let mut message_id = String::new();
     let mut step_open = false;
     let mut text_started = false;
+    let mut streamed = false;
     let mut reasoning_open = false;
     let mut ordinal = 0u32;
     let mut tokens_in = 0u32;
@@ -430,6 +431,7 @@ async fn spawn_ante(store: Store) {
                 if !step_open {
                     step_open = true;
                     text_started = false;
+                    streamed = false;
                     reasoning_open = false;
                     ordinal = 0;
                     message_id = uid("msg");
@@ -454,6 +456,19 @@ async fn spawn_ante(store: Store) {
                 }
             };
         }
+        // The real server marks each step once it starts streaming.
+        macro_rules! ensure_streamed {
+            () => {
+                if step_open && !streamed {
+                    streamed = true;
+                    store.publish_durable(
+                        "session.step.streamed",
+                        json!({ "sessionID": session, "assistantMessageID": message_id }),
+                        &session,
+                    );
+                }
+            };
+        }
         match msg.event {
             Evt::TurnStart { .. } => {
                 step_open = false;
@@ -464,6 +479,7 @@ async fn spawn_ante(store: Store) {
                 );
             }
             Evt::ThinkingDelta(delta) => {
+                ensure_streamed!();
                 ensure_step!();
                 if !reasoning_open {
                     reasoning_open = true;
@@ -487,6 +503,7 @@ async fn spawn_ante(store: Store) {
                 );
             }
             Evt::MessageDelta(delta) => {
+                ensure_streamed!();
                 ensure_step!();
                 if !text_started {
                     text_started = true;
@@ -789,8 +806,27 @@ async fn session_model(
         .and_then(|v| v.as_str())
         .unwrap_or(PROVIDER)
         .to_string();
+    // Read the outgoing pair before overwriting it, or `previous` ends up
+    // reporting the new model.
+    let previous = store
+        .ante
+        .model
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .map(|(provider, id)| json!({ "id": id, "providerID": provider }));
     if let Ok(mut slot) = store.ante.model.lock() {
         *slot = Some((provider.clone(), id.clone()));
+    }
+    if let Some(session) = store.ante.active.lock().ok().and_then(|s| s.clone()) {
+        let mut payload = json!({
+            "sessionID": session,
+            "model": { "id": id.clone(), "providerID": provider.clone() },
+        });
+        if let Some(previous) = previous {
+            payload["previous"] = previous;
+        }
+        store.publish_durable("session.model.selected", payload, &session);
     }
     // Only meaningful once a session exists; the stored pair is applied when the
     // session starts, and Ante answers "session not initialized" before that.
@@ -1395,6 +1431,17 @@ async fn session_prompt(
                     ..Default::default()
                 };
                 let _ = ops.send(ante_sdk::protocol::op_msg(Op::StartSession(request))).await;
+                // The real server announces the title once; Ante titles from the
+                // first message too, so mirror it here.
+                let title: String = text.chars().take(60).collect();
+                let title = title.trim().to_string();
+                if !title.is_empty() {
+                    store.publish_durable(
+                        "session.renamed",
+                        json!({ "sessionID": id, "title": title }),
+                        &id,
+                    );
+                }
             } else {
                 // Later prompts may arrive with a different agent.
                 let update = ante_sdk::protocol::SessionUpdate {

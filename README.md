@@ -21,7 +21,6 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
   **唯一未验的线索**：真终端走 kitty 键盘协议（Enter = `\x1b[13u`），探针一直发裸 `\r`——下次先试发 `\x1b[13u`。
 - [ ] **diff / LSP / formatter / MCP / VCS** —— 打桩。**这些是 Ante 根本没有的概念，只能显示为空，别指望填上**
 - [ ] **`/compact` 压缩、撤销回滚、贴图、PTY、分享**
-- [ ] **次要事件** —— `session.step.streamed`、`instructions.updated`、`renamed`、`model.selected` 未发（缺了不致命）
 
 **已实现（均已实测）**
 
@@ -42,6 +41,7 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 - [x] **`shift+tab` 切权限模式** —— 三项**直接用 Ante 自己的说法**（`auto`/`strict`/`yolo`，不经过 opencode 的 build/plan 再翻译），实测 composer 循环 `Auto → Strict → Yolo`，且**以 `settings.json` 里配的那个打头**；切换是真差别（`strict` 下危险命令弹审批）。**agent 是在「建会话」的 body 里传的**（`{agent, id, model, location}`），不是发消息时
 - [x] **boot 接口全套** —— `health` `location` `fs/list` `agent` `provider` `model` `config` `vcs` `project` `plugin` `migration` …
 - [x] **`@` 文件补全** —— 垫片**自己读文件系统**（Ante 无文件 API）：`/api/fs/list` 列目录、`/api/fs/find` 递归搜索（跳过 `.git`/`node_modules`，深度≤6、limit≤50）。实测敲 `@` 列出家目录、输入 `main.rs` 命中真文件
+- [x] **次要事件** —— `session.step.streamed`（每个 step 一次，`ensure_streamed!`）、`session.renamed`（新会话首条消息定标题）、`session.model.selected`（切模型，带 `previous`，读旧值在覆写之前）。`instructions.updated` 不适用（Ante 无此概念）
 - [x] **命令行参数** —— `[PORT]` / `--port PORT` / `-h|--help`；不认识的参数打印用法并以 2 退出；**端口被占给明确提示、不再 panic**
 - [x] **事件流（SSE）** —— `{id, type, created, data}` 帧，首帧 `server.connected`
 
@@ -52,7 +52,6 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 | **恢复后继续对话** | `/sessions` 选中旧会话后**直接打字回车**；看垫片终端有没有刷出 `POST …/prompt` | **人眼：部分会话可用**；**探针：始终不行**——文字确实进了输入框（底部可见），回车后**静默无 POST、无报错**。已排除：终端尺寸（150×45 同样）、点击输入框、会话新老（本次运行建的和上轮建的都不行）、agent/model 解析（已修，仍不提交）。`submit.ts` 的 `submit.available()` 与 `readSubmission` 的 `!model||!agent` 两处守卫都会**静默 return**，尚未定位是哪一处 |
 | **diff / LSP / formatter / MCP / VCS** | 敲 `/diff`、开 MCP 面板看是否空 | **Ante 根本没有这些概念**，只能显示为空，别指望填上 |
 | **`/compact`、撤销回滚、贴图、PTY、分享** | 敲 `/compact`、试贴图 | `auto_compact` 是 Ante 的开关；撤销回滚对应 Ante 的 revert；贴图/PTY/分享 Ante 无对应 |
-| **次要事件** | 无所谓，缺了不致命 | `session.step.streamed`、`instructions.updated`、`renamed`、`model.selected` 未发 |
 
 
 ## 怎么跑
