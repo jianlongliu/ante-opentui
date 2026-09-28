@@ -18,7 +18,8 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 
 - [ ] **恢复后继续对话（暂搁）** —— **人眼可用**（用户实测：选旧会话 → 发消息 → Ante 回话 ✅）；**探针复现不出**：字进得了输入框，回车**静默无 POST、无报错**。
   已排除：终端尺寸（150×45）、点击输入框、命令（`/sessions` 与 `/resume` 都试过）、会话新老、agent/model 解析（已修）、Mod+Enter。
-  **唯一未验的线索**：真终端走 kitty 键盘协议（Enter = `\x1b[13u`），探针一直发裸 `\r`——下次先试发 `\x1b[13u`。
+  **已排除（每条都实测过，别再重复）**：终端尺寸（110×30 / 140×40 / 150×45）、点击输入框、Tab 切焦点、`/sessions` 与 `/resume` 两条命令、会话新老（本轮建的与上轮建的）、agent/model 解析（已修）、Mod+Enter、**kitty 键盘协议**（探针改成「回应 `\x1b[?u` 查询 + 全部按键按 `CSI <cp> u` 编码」后，**首轮仍能提交、恢复后依旧 0 POST**——所以与回车编码无关）。
+  **观察到的确凿事实**：文字确实进了输入框（底部可见），回车**什么都不发生**——没有 POST、没有报错、没有 toast。客户端 `submit.ts` 里两处守卫（`submit.available()`、`readSubmission` 的 `!model||!agent`）都会**静默 return**，但探针无法定位是哪一处，因为**复现不出「能用的那次」**。
 - [ ] **diff / LSP / formatter / MCP / VCS** —— 打桩。**这些是 Ante 根本没有的概念，只能显示为空，别指望填上**
 - [ ] **撤销回滚、贴图、PTY、分享** —— **登记为「Ante 无对应能力」，不再尝试**。撤销回滚查证过：Ante 协议全部 18 个 op（`StartSession`…`Shutdown`）**没有 revert/undo/rewind**，`~/Projects/ante` 全仓 grep 同样零命中；opencode 那边是 `revert/stage` → `revert/commit` / `DELETE revert` 三步 + `staged/committed/cleared` 事件。硬做只剩「重写 `events.jsonl` 截断历史」——只对以后 resume 生效、对当前会话无效、还可能被 Ante 覆写，故不采用
 
