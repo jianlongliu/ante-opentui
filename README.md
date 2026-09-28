@@ -22,7 +22,7 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
   复现时开 `--print-logs --log-level debug` **没有留下任何错误**，只有那条已修的版本警告——说明退回首页是「静默」的。
   **下一步**：拿真 server 跑同一个「选中会话」流程（`OPENCODE_PASSWORD=$(… serve 打印的密码) opencode --server …`）抓响应，逐条对照——大概率是某个我没对齐的字段或没实现的接口导致路由退回首页。
 - [x] **`shift+tab` 切 agent** —— 提供 `build`/`plan`/`yolo` 三个 agent，**映射到 Ante 的权限模式**（`build`→auto、`plan`→strict、`yolo`→yolo），实测：切到 `Plan` 后危险命令弹审批。**agent 是在「建会话」的 body 里传的**（`{agent, id, model, location}`），不是发消息时
-- [ ] **模型选择** —— 客户端建会话时会带 `model`（`{id, providerID}`），垫片目前忽略；应按它下发 `UpdateSession`
+- [x] **模型选择** —— `/api/model`、`/api/provider` 由 **Ante 的 `~/.ante/catalog.json` 驱动**（实测 81 个模型 / 9 个 provider），默认项取 `settings.json` 的 `provider`+`provider_model` 并排在首位；客户端选的模型在建会话与 `POST …/model` 两条路径都会下发 Ante（对应 `StartSession` / `UpdateSession`）
 - [ ] **`@` 文件补全** —— `/api/fs/list` 返回空
 - [ ] **diff / LSP / formatter / MCP / VCS** —— 打桩。**这些是 Ante 根本没有的概念，只能显示为空，别指望填上**
 - [ ] **`/compact` 压缩、撤销回滚、贴图、PTY、分享**

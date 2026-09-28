@@ -39,6 +39,121 @@ const VERSION: &str = "2.0.18";
 const MODEL: &str = "deepseek-v4.1-flash";
 const PROVIDER: &str = "example";
 
+fn ante_home() -> std::path::PathBuf {
+    std::env::var_os("ANTE_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default()
+                .join(".ante")
+        })
+}
+
+/// Ante's catalog is the source of truth for what can actually be run, so the
+/// picker is fed from it: every provider and model configured in Ante shows up,
+/// instead of the one the shim used to hard-code.
+fn catalog() -> Value {
+    std::fs::read_to_string(ante_home().join("catalog.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or_else(|| json!({ "providers": {} }))
+}
+
+fn settings() -> Value {
+    std::fs::read_to_string(ante_home().join("settings.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or_else(|| json!({}))
+}
+
+/// The pair Ante itself is configured on: `provider` plus that provider's entry
+/// in `provider_model`. The picker is ordered to lead with it, so the client's
+/// default matches what Ante will actually run.
+fn active_model() -> (String, String) {
+    let settings = settings();
+    let provider = settings
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or(PROVIDER)
+        .to_string();
+    let model = settings
+        .get("provider_model")
+        .and_then(|v| v.get(&provider))
+        .and_then(|v| v.as_str())
+        .or_else(|| settings.get("model").and_then(|v| v.as_str()))
+        .unwrap_or(MODEL)
+        .to_string();
+    (provider, model)
+}
+
+fn catalog_models() -> Vec<Value> {
+    let catalog = catalog();
+    let Some(providers) = catalog.get("providers").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    let (active_provider, active_model) = active_model();
+    let mut out = Vec::new();
+    let mut providers: Vec<(&String, &Value)> = providers.iter().collect();
+    // Active provider's models lead, and the active model leads among them.
+    providers.sort_by_key(|(id, _)| if **id == active_provider { 0 } else { 1 });
+    for (provider, spec) in providers {
+        let Some(models) = spec.get("preferred_models").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for model in models {
+            let Some(id) = model.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let name = model.get("description").and_then(|v| v.as_str()).unwrap_or(id);
+            let context = model.get("context_limit").and_then(|v| v.as_u64()).unwrap_or(0);
+            let limit = if context > 0 { json!({ "context": context }) } else { json!({}) };
+            out.push(json!({
+                "id": id,
+                "modelID": id,
+                "providerID": provider,
+                "preferred": provider == &active_provider && id == active_model,
+                "name": name,
+                "capabilities": {},
+                "variants": [],
+                "time": { "created": now_ms() },
+                "cost": [],
+                "status": "active",
+                "enabled": true,
+                "limit": limit,
+            }));
+        }
+    }
+    // Stable, deterministic order for the picker; the active model first.
+    out.sort_by_key(|model| {
+        let is_active = model.get("preferred").and_then(|v| v.as_bool()).unwrap_or(false);
+        let id = model.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        (if is_active { 0 } else { 1 }, id)
+    });
+    out
+}
+
+fn catalog_providers() -> Vec<Value> {
+    let catalog = catalog();
+    let Some(providers) = catalog.get("providers").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    let (active_provider, _) = active_model();
+    let mut providers: Vec<(&String, &Value)> = providers.iter().collect();
+    providers.sort_by_key(|(id, _)| if **id == active_provider { 0 } else { 1 });
+    providers
+        .into_iter()
+        .map(|(id, spec)| {
+            let name = spec
+                .get("display_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(id)
+                .to_string();
+            json!({ "id": id, "name": name, "activation": "auto", "package": id })
+        })
+        .collect()
+}
+
 fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
@@ -79,6 +194,8 @@ struct Ante {
     /// The agent the client last created a session with. opencode's agents are
     /// permission configs, so this decides Ante's permission mode.
     agent: Arc<Mutex<String>>,
+    /// Provider and model the client last picked, as Ante names them.
+    model: Arc<Mutex<Option<(String, String)>>>,
 }
 
 /// An Ante turn paused for approval, held until the TUI answers.
@@ -96,6 +213,7 @@ impl Ante {
             active: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(None)),
             agent: Arc::new(Mutex::new("build".to_string())),
+            model: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -145,6 +263,13 @@ impl Store {
                 "seq": SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 "version": 1,
             });
+        }
+        if let Some(path) = std::env::var_os("ANTE_SHIM_TRACE") {
+            use std::io::Write as _;
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path)
+            {
+                let _ = file.write_all(format!("PUB {name} {data}\n").as_bytes());
+            }
         }
         let _ = self.events.send(event);
     }
@@ -244,9 +369,9 @@ fn trace_ante(event: &Evt) {
     };
     use std::io::Write as _;
     let debug = format!("{event:?}");
-    let name = debug.split(['(', ' ', '{']).next().unwrap_or("?");
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = file.write_all(format!("{name}\n").as_bytes());
+        // The payload matters when diagnosing a silent turn, so keep it whole.
+        let _ = file.write_all(format!("{debug}\n").as_bytes());
     }
 }
 
@@ -303,13 +428,20 @@ async fn spawn_ante(store: Store) {
                     reasoning_open = false;
                     ordinal = 0;
                     message_id = uid("msg");
+                    let (provider, model) = store
+                        .ante
+                        .model
+                        .lock()
+                        .ok()
+                        .and_then(|slot| slot.clone())
+                        .unwrap_or_else(|| active_model());
                     store.publish_durable(
                         "session.step.started",
                         json!({
                             "sessionID": session,
                             "assistantMessageID": message_id,
                             "agent": "build",
-                            "model": { "id": MODEL, "providerID": PROVIDER },
+                            "model": { "id": model, "providerID": provider },
                             "started": now_ms(),
                         }),
                         &session,
@@ -469,9 +601,49 @@ async fn spawn_ante(store: Store) {
                     );
                     step_open = false;
                 }
+                let mut failure = None;
+                if let ante_sdk::protocol::TurnEndStatus::Error { kind, headline, details } = &status {
+                    // Without this the failure is invisible: the turn ends with no
+                    // text, so the TUI just sits there looking idle.
+                    ensure_step!();
+                    let message = if details.is_empty() {
+                        headline.clone()
+                    } else {
+                        format!("{headline} — {}", details.join("; "))
+                    };
+                    let http_status = details
+                        .iter()
+                        .find_map(|detail| detail.strip_prefix("HTTP "))
+                        .and_then(|rest| rest.split_whitespace().next())
+                        .and_then(|code| code.parse::<i64>().ok())
+                        .filter(|code| (100..=599).contains(code));
+                    let mut error = json!({
+                        "type": kind.clone().unwrap_or_else(|| "error".to_string()),
+                        "message": message,
+                    });
+                    if let Some(code) = http_status {
+                        error["status"] = json!(code);
+                    }
+                    store.publish_durable(
+                        "session.step.failed",
+                        json!({
+                            "sessionID": session,
+                            "assistantMessageID": message_id,
+                            "error": error.clone(),
+                            "executed": false,
+                        }),
+                        &session,
+                    );
+                    failure = Some(error);
+                }
+                // `session.execution.failed` carries the error too — its schema
+                // requires it, and the client reads `error.message` off it.
                 store.publish_durable(
                     if failed { "session.execution.failed" } else { "session.execution.succeeded" },
-                    json!({ "sessionID": session }),
+                    match &failure {
+                        Some(error) => json!({ "sessionID": session, "error": error }),
+                        None => json!({ "sessionID": session }),
+                    },
                     &session,
                 );
             }
@@ -598,6 +770,40 @@ async fn permission_reply(
 }
 
 /// Esc in the TUI. The client owns the gesture; this just relays it to Ante.
+/// The model picker lands here (`{model:{id,providerID}}`); Ante takes the pair
+/// directly, so the switch is real.
+async fn session_model(
+    State(store): State<Store>,
+    Path(_id): Path<String>,
+    Json(body): Json<Value>,
+) -> axum::http::StatusCode {
+    let model = body.get("model").cloned().unwrap_or_default();
+    let id = model.get("id").and_then(|v| v.as_str()).unwrap_or(MODEL).to_string();
+    let provider = model
+        .get("providerID")
+        .and_then(|v| v.as_str())
+        .unwrap_or(PROVIDER)
+        .to_string();
+    if let Ok(mut slot) = store.ante.model.lock() {
+        *slot = Some((provider.clone(), id.clone()));
+    }
+    // Only meaningful once a session exists; the stored pair is applied when the
+    // session starts, and Ante answers "session not initialized" before that.
+    if store.ante.started.load(std::sync::atomic::Ordering::SeqCst)
+        && let Some(ops) = store.ante.ops.lock().await.clone()
+    {
+        let update = ante_sdk::protocol::SessionUpdate {
+            provider: Some(provider),
+            model: Some(ante_sdk::protocol::ModelSpec { id, ..Default::default() }),
+            ..Default::default()
+        };
+        if let Err(err) = ops.send(ante_sdk::protocol::op_msg(Op::UpdateSession(update))).await {
+            eprintln!("model: send failed: {err}");
+        }
+    }
+    axum::http::StatusCode::NO_CONTENT
+}
+
 /// `shift+tab` lands here; the agent picks Ante's permission mode.
 async fn session_agent(
     State(store): State<Store>,
@@ -606,7 +812,9 @@ async fn session_agent(
 ) -> axum::http::StatusCode {
     let agent = body.get("agent").and_then(|v| v.as_str()).unwrap_or("build").to_string();
     let mode = permission_mode_for(&agent);
-    if let Some(ops) = store.ante.ops.lock().await.clone() {
+    if store.ante.started.load(std::sync::atomic::Ordering::SeqCst)
+        && let Some(ops) = store.ante.ops.lock().await.clone()
+    {
         let update = ante_sdk::protocol::SessionUpdate {
             permission_mode: Some(mode),
             ..Default::default()
@@ -681,17 +889,23 @@ async fn agents() -> Json<Value> {
 }
 
 async fn models() -> Json<Value> {
-    envelope(json!([{
-        "id": MODEL, "modelID": MODEL, "providerID": PROVIDER,
-        "name": "Example Model",
-        "capabilities": {},
-        "variants": [],
-        "time": { "created": now_ms() },
-        "cost": [],
-        "status": "active",
-        "enabled": true,
-        "limit": {},
-    }]))
+    let mut list = catalog_models();
+    if list.is_empty() {
+        // No readable catalog: still show the model Ante is actually on.
+        let (provider, model) = active_model();
+        list.push(json!({
+            "id": model, "modelID": model, "providerID": provider,
+            "name": "Example Model",
+            "capabilities": {},
+            "variants": [],
+            "time": { "created": now_ms() },
+            "cost": [],
+            "status": "active",
+            "enabled": true,
+            "limit": {},
+        }));
+    }
+    envelope(json!(list))
 }
 
 async fn config() -> Json<Value> {
@@ -704,9 +918,13 @@ async fn config_providers() -> Json<Value> {
 }
 
 async fn providers() -> Json<Value> {
-    envelope(json!([{
-        "id": PROVIDER, "name": "Example AI", "activation": "auto", "package": "example",
-    }]))
+    let mut list = catalog_providers();
+    if list.is_empty() {
+        list.push(json!({
+            "id": PROVIDER, "name": "Example AI", "activation": "auto", "package": "example",
+        }));
+    }
+    envelope(json!(list))
 }
 
 async fn vcs() -> Json<Value> {
@@ -831,6 +1049,15 @@ async fn session_create(
         && let Ok(mut slot) = store.ante.agent.lock()
     {
         *slot = agent.to_string();
+    }
+    if let Some(model) = body.as_ref().and_then(|Json(value)| value.get("model"))
+        && let (Some(id), Some(provider)) = (
+            model.get("id").and_then(|value| value.as_str()),
+            model.get("providerID").and_then(|value| value.as_str()),
+        )
+        && let Ok(mut slot) = store.ante.model.lock()
+    {
+        *slot = Some((provider.to_string(), id.to_string()));
     }
     let info = session_info(&id, "Ante session");
     if let Ok(mut sessions) = store.sessions.lock() {
@@ -1054,7 +1281,14 @@ async fn session_prompt(
     match ops {
         Some(ops) => {
             if !store.ante.started.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                let request = SessionRequest { permission_mode: Some(mode), ..Default::default() };
+                let chosen = store.ante.model.lock().ok().and_then(|slot| slot.clone());
+                let (provider, model) = chosen.unwrap_or_else(|| (PROVIDER.into(), MODEL.into()));
+                let request = SessionRequest {
+                    permission_mode: Some(mode),
+                    provider: Some(provider),
+                    model: Some(model),
+                    ..Default::default()
+                };
                 let _ = ops.send(ante_sdk::protocol::op_msg(Op::StartSession(request))).await;
             } else {
                 // Later prompts may arrive with a different agent.
@@ -1131,7 +1365,7 @@ async fn main() {
         .route("/api/permission/request", get(permission_request))
         .route("/api/session/{id}/inbox", get(bare_empty))
         .route("/api/session/{id}/form", get(bare_empty))
-        .route("/api/session/{id}/model", post(no_content))
+        .route("/api/session/{id}/model", post(session_model))
         .route("/api/session/{id}/agent", post(session_agent))
         .route("/api/session/{id}/view", post(no_content))
         .route("/api/event", get(events))
