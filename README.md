@@ -20,7 +20,7 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
   已排除：终端尺寸（150×45）、点击输入框、命令（`/sessions` 与 `/resume` 都试过）、会话新老、agent/model 解析（已修）、Mod+Enter。
   **唯一未验的线索**：真终端走 kitty 键盘协议（Enter = `\x1b[13u`），探针一直发裸 `\r`——下次先试发 `\x1b[13u`。
 - [ ] **diff / LSP / formatter / MCP / VCS** —— 打桩。**这些是 Ante 根本没有的概念，只能显示为空，别指望填上**
-- [ ] **撤销回滚、贴图、PTY、分享** —— 未做。撤销回滚在 Ante 有 revert 操作可映射；贴图/PTY/分享 Ante 没有对应
+- [ ] **撤销回滚、贴图、PTY、分享** —— **登记为「Ante 无对应能力」，不再尝试**。撤销回滚查证过：Ante 协议全部 18 个 op（`StartSession`…`Shutdown`）**没有 revert/undo/rewind**，`~/Projects/ante` 全仓 grep 同样零命中；opencode 那边是 `revert/stage` → `revert/commit` / `DELETE revert` 三步 + `staged/committed/cleared` 事件。硬做只剩「重写 `events.jsonl` 截断历史」——只对以后 resume 生效、对当前会话无效、还可能被 Ante 覆写，故不采用
 
 **已实现（均已实测）**
 
@@ -52,7 +52,7 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 | --- | --- | --- |
 | **恢复后继续对话** | `/sessions` 选中旧会话后**直接打字回车**；看垫片终端有没有刷出 `POST …/prompt` | **人眼：部分会话可用**；**探针：始终不行**——文字确实进了输入框（底部可见），回车后**静默无 POST、无报错**。已排除：终端尺寸（150×45 同样）、点击输入框、会话新老（本次运行建的和上轮建的都不行）、agent/model 解析（已修，仍不提交）。`submit.ts` 的 `submit.available()` 与 `readSubmission` 的 `!model||!agent` 两处守卫都会**静默 return**，尚未定位是哪一处 |
 | **diff / LSP / formatter / MCP / VCS** | 敲 `/diff`、开 MCP 面板看是否空 | **Ante 根本没有这些概念**，只能显示为空，别指望填上 |
-| **撤销回滚、贴图、PTY、分享** | 看对话里有没有「撤销」入口；试贴一张图 | 撤销回滚能对上 Ante 的 revert；贴图/PTY/分享 **Ante 没有对应**，做不了 |
+| **撤销回滚、贴图、PTY、分享** | 不用验了 | **Ante 无此能力**（详见实现清单该条的查证记录）；不要再提议硬做 |
 
 
 ## 怎么跑
