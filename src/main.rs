@@ -1013,6 +1013,8 @@ async fn main() {
     tokio::spawn(spawn_ante(store.clone()));
     let app = Router::new()
         .route("/api/health", get(health))
+        // `server.info` is what the client's version check calls.
+        .route("/api/info", get(health))
         .route("/health", get(health))
         .route("/api/location", get(location_get))
         .route("/api/fs/list", get(fs_list))

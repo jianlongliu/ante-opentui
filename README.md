@@ -18,7 +18,8 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 
 - [x] **会话列表 / `/sessions` / `/resume`** —— `GET /api/session` 读 `~/.ante/sessions/*/meta.json`（实测 225 条、时间倒序、标题=首条用户消息），**选择器实测已列出真 Ante 会话**
 - [ ] **恢复会话：历史不渲染** —— 服务端侧已就绪：`GET /api/session/{id}/message` 会回放 Ante 的 `events.jsonl`（`event` 字段就是 `Evt` 的 serde 形式，直接反序列化复用折叠逻辑），curl 验证返回合法消息。**但 TUI 里选中会话后仍停在首页**（客户端确实请求了 `/message`、`/inbox`、`/form`、`/permission`、`/session/{id}`）。
-  已试并排除：① 按 `order=desc`+`limit` 返回（反转+截断）② `/inbox`、`/form` 改成 `{data:[]}`（它们的 schema 是 `additionalProperties:false`，带 `location` 会整条校验失败）③ `/api/session/{id}` 改回真实元数据（含真 `dir`）。
+  已试并排除：① 按 `order=desc`+`limit` 返回（反转+截断）② `/inbox`、`/form` 改成 `{data:[]}`（它们的 schema 是 `additionalProperties:false`，带 `location` 会整条校验失败）③ `/api/session/{id}` 改回真实元数据（含真 `dir`）④ 补 `/api/info`（客户端版本检查走 `server.info`，不是 `/api/health`；此前一直报 `version undefined`）。
+  复现时开 `--print-logs --log-level debug` **没有留下任何错误**，只有那条已修的版本警告——说明退回首页是「静默」的。
   **下一步**：拿真 server 跑同一个「选中会话」流程（`OPENCODE_PASSWORD=$(… serve 打印的密码) opencode --server …`）抓响应，逐条对照——大概率是某个我没对齐的字段或没实现的接口导致路由退回首页。
 - [ ] **`shift+tab` 切 agent、模型选择** —— 垫片只提供一个 agent（`build`），未实现 `POST …/agent`
 - [ ] **`@` 文件补全** —— `/api/fs/list` 返回空
