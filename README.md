@@ -39,7 +39,7 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 - [x] **会话列表 / `/sessions`** —— `GET /api/session` 读 `~/.ante/sessions/*/meta.json`（实测 225 条、时间倒序、标题=首条用户消息），**选择器实测已列出真 Ante 会话**
 - [x] **恢复会话：历史渲染** —— `/sessions` 选中一条即加载历史（用户消息 + 助手回复 + 工具块）。**病根：`GET /api/session/{id}` 少了 `data` 信封**（该路由 schema 是 `{data: Session.Info}` 且 `additionalProperties:false`），客户端读 `response.data.id` 得 undefined，抛 `undefined is not an object (evaluating 'Ae.id')`，**只在界面上弹个小 toast、不换视图**——所以看着像「点了没反应」
 - [x] **模型选择** —— `/api/model`、`/api/provider` 由 **Ante 的 `~/.ante/catalog.json` 驱动**（实测 81 个模型 / 9 个 provider），默认项取 `settings.json` 的 `provider`+`provider_model` 并排在首位；客户端选的模型在建会话与 `POST …/model` 两条路径都会下发 Ante（对应 `StartSession` / `UpdateSession`）
-- [x] **`shift+tab` 切 agent** —— 提供 `build`/`plan`/`yolo` 三个 agent，**映射到 Ante 的权限模式**（`build`→auto、`plan`→strict、`yolo`→yolo），实测：切到 `Plan` 后危险命令弹审批。**agent 是在「建会话」的 body 里传的**（`{agent, id, model, location}`），不是发消息时
+- [x] **`shift+tab` 切权限模式** —— 三项**直接用 Ante 自己的说法**（`auto`/`strict`/`yolo`，不经过 opencode 的 build/plan 再翻译），实测 composer 循环 `Auto → Strict → Yolo`，且**以 `settings.json` 里配的那个打头**；切换是真差别（`strict` 下危险命令弹审批）。**agent 是在「建会话」的 body 里传的**（`{agent, id, model, location}`），不是发消息时
 - [x] **boot 接口全套** —— `health` `location` `fs/list` `agent` `provider` `model` `config` `vcs` `project` `plugin` `migration` …
 - [x] **事件流（SSE）** —— `{id, type, created, data}` 帧，首帧 `server.connected`
 

@@ -854,25 +854,43 @@ async fn fs_list() -> Json<Value> {
 /// the client silently refuses to submit.
 /// opencode's agents are configs with permissions; Ante's nearest equivalent is
 /// the permission mode, so each agent here *is* one — switching is real, not
-/// cosmetic. `shift+tab` cycles them.
-const AGENTS: [(&str, &str); 3] = [
-    ("build", "Auto — act unless provably dangerous"),
-    ("plan", "Strict — ask unless provably safe"),
-    ("yolo", "Yolo — never ask"),
-];
+/// cosmetic. Names are Ante's own (`strict`/`auto`/`yolo`) so the label needs no
+/// translation. `shift+tab` cycles them.
+const AGENTS: [&str; 3] = ["strict", "auto", "yolo"];
+
+fn agent_description(agent: &str) -> &'static str {
+    match agent {
+        "strict" => "Ask unless provably safe（Ante 的默认）",
+        "yolo" => "Never ask（跳过全部检查）",
+        _ => "Act unless provably dangerous",
+    }
+}
 
 fn permission_mode_for(agent: &str) -> ante_sdk::protocol::PermissionMode {
     match agent {
-        "plan" => ante_sdk::protocol::PermissionMode::Strict,
+        "strict" => ante_sdk::protocol::PermissionMode::Strict,
         "yolo" => ante_sdk::protocol::PermissionMode::Yolo,
         _ => ante_sdk::protocol::PermissionMode::Auto,
     }
 }
 
+/// The mode Ante is configured with leads, so a bare `shift+tab` first lands on
+/// what the user already expects.
+fn configured_permission_mode() -> String {
+    match settings().get("permission_mode").and_then(|v| v.as_str()) {
+        Some(name) => name.to_string(),
+        None => "auto".to_string(),
+    }
+}
+
 async fn agents() -> Json<Value> {
-    let list: Vec<Value> = AGENTS
+    let configured = configured_permission_mode();
+    let mut order: Vec<&str> = AGENTS.iter().copied().collect();
+    order.sort_by_key(|id| if *id == configured { 0 } else { 1 });
+    let list: Vec<Value> = order
         .iter()
-        .map(|(id, description)| {
+        .map(|id| {
+            let description = agent_description(id);
             json!({
                 "id": id,
                 "name": id,
