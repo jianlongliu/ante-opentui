@@ -11,6 +11,9 @@
 #                                                                 （对齐 Ante 自己的 Ctrl+S；上游 v2 没这个键位）
 #   vendor/opencode/packages/tui/src/routes/session/index.tsx  —— 会话在跑、却还没有任何内容时补一行
 #                                                                 「Thinking」占位（首个 token 前那段空窗）
+#   vendor/opencode/packages/tui/src/feature-plugins/home/footer.tsx
+#                                                              —— 首页右下角的版本号改成 `ante <后端版本> · antex <构建日期>`
+#                                                                 （上游画的是客户端自己的版本，跟两端都不相干）
 #
 # 上游更新（git subtree pull ... v2）之后跑一次这个脚本，然后 antex 用的就是新的。
 set -eu

@@ -48,6 +48,9 @@ const ANTEX_VERSION: &str = env!("ANTEX_VERSION");
 /// reports *this* as `version`: the shim stands in for Ante, so the client's
 /// own version number (what it used to answer) said nothing about either end.
 static ANTE_VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// The URL this instance listens on, set once the port is known (`ServerInfo`
+/// declares `urls`, and the client builds its display address from it).
+static SERVER_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// The model Ante is configured with, so the composer shows something real.
 /// This is the fallback for a client that never picked one — it has to be the
 /// catalog's name (provider-scoped), or the first turn comes back as an HTTP
@@ -1391,9 +1394,13 @@ async fn session_interrupt(State(store): State<Store>, Path(_id): Path<String>) 
 async fn health() -> Json<Value> {
     Json(json!({
         "healthy": true,
+        // `version` is the Ante backend's — the shim stands in for Ante, so the
+        // client's own version here told the user nothing about either end.
         "version": ANTE_VERSION.get().map(String::as_str).unwrap_or("unknown"),
         "antex": ANTEX_VERSION,
         "pid": std::process::id(),
+        "urls": [SERVER_URL.get().map(String::as_str).unwrap_or("")],
+        "paths": { "tmp": std::env::temp_dir().to_string_lossy() },
     }))
 }
 
@@ -2352,6 +2359,7 @@ async fn main() {
     };
 
     let port = bound_port;
+    let _ = SERVER_URL.set(format!("http://127.0.0.1:{port}"));
     if args.serve_only {
         println!("antex 服务已起在 http://127.0.0.1:{port}");
         println!("客户端这样连：opencode2 --server http://127.0.0.1:{port}");
