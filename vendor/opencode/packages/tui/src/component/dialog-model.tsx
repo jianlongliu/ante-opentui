@@ -78,7 +78,10 @@ export function DialogModel(props: { providerID?: string }) {
             title: model.name,
             releaseDate: model.time.released,
             description: favorite ? "(Favorite)" : undefined,
-            category: connected() ? (provider?.name ?? model.providerID) : undefined,
+            // Always name the provider: antex serves no integrations, so the
+            // connected() gate above would leave every row anonymous and the
+            // same model name from two providers indistinguishable.
+            category: provider?.name ?? model.providerID,
             footer: free(model) ? "Free" : undefined,
             onSelect() {
               onSelect(model.providerID, model.id)

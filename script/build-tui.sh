@@ -1,9 +1,16 @@
 #!/bin/sh
 # 重建「带 Ante logo 的客户端」。
 #
-# 为什么需要它：首页那个大字 logo 是客户端里**写死的常量**（不是服务端给的，垫片喂不进去），
-# 所以改 logo 只能改源码、再用源码编一个自己的二进制。补丁只有一处：
-#   vendor/opencode/packages/tui/src/logo.ts
+# 为什么需要它：两处界面改动垫片喂不进去，只能在源码里改、再用源码编一个自己的二进制：
+#   vendor/opencode/packages/tui/src/logo.ts            —— 首页大字 logo 换 Ante 面具 + ANTEX
+#   vendor/opencode/packages/tui/src/component/dialog-model.tsx —— 模型选择器永远显示供应商
+#                                                                 （antex 不提供 integration，connected() 恒假，
+#                                                                  上游会因此把分组和供应商名全隐掉）
+#   vendor/opencode/packages/tui/src/config/keybind.ts + routes/session/index.tsx
+#                                                              —— ctrl+s 把排队的那条插进正在跑的回合
+#                                                                 （对齐 Ante 自己的 Ctrl+S；上游 v2 没这个键位）
+#   vendor/opencode/packages/tui/src/routes/session/index.tsx  —— 会话在跑、却还没有任何内容时补一行
+#                                                                 「Thinking」占位（首个 token 前那段空窗）
 #
 # 上游更新（git subtree pull ... v2）之后跑一次这个脚本，然后 antex 用的就是新的。
 set -eu

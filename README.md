@@ -1,6 +1,6 @@
 # antex（项目 ante-opentui）
 
-> 最后核对：2026-09-28 · 目标客户端 opencode 2.0.18 · Rust 1.98
+> 最后核对：2026-09-29 · 目标客户端 opencode 2.0.18 · Rust 1.98.1
 
 把 **opencode v2 自带的 TUI** 接到 **Ante** 后端上运行。
 
@@ -24,18 +24,19 @@ Ante（**你自己装的**：官方脚本装、`ante update` 升级）
 
 手写复刻 opencode 的 TUI 到不了它的完成度（它有 17k 行的界面层）。反过来做，垫片是**可丢弃**的一层：
 上游界面升级时，重新拉 TUI 即可，只需跟着修垫片。代价是 Ante 没有的概念（LSP、MCP、formatter、OAuth、git 操作）必须打桩。
+思路同「改接口，不改消费者」（参照 `onarchi`——把 Omarchy 真移植到 niri 的那个仓，原名 omarchy-on-niri）。
+
+几条定下来的选择：
+
+- **Rust 写垫片**：它是长驻进程，要稳、要单文件产物。
+- **上游进同一个仓**（`vendor/opencode/`，git subtree，分支 `v2`）：升级即拉上游，本质就是打补丁。
+- **只做垫片、不 fork 界面**：日常使用不必依赖自建前端（源码模式要 3.1G `node_modules`），**只有要改界面本身才必须 fork**。
+- **映射原则**：Ante 真有对应概念的才做成真差别（`shift+tab`→权限模式、模型选择→provider/model）；没有的（LSP/formatter/VCS）打桩显示为空，不假装。
 
 ## 实现清单
 
 **未实现（按优先级；每条验证法见下方「未完成项的验证法」）**
 
-- [ ] **恢复后继续对话（已决定不修，用新会话代替）** —— **结论：新建会话一切正常**（发消息/工具/审批/压缩/切模型/`@` 都通），只有「**恢复旧会话后继续发**」在某些会话上无效，**用户已选择直接用新会话**，不再投入。以下是排查记录，供以后万一要碰时省得重走：
-
-  人眼可用（用户实测：选旧会话 → 发消息 → Ante 回话 ✅）；**探针复现不出**：字进得了输入框，回车**静默无 POST、无报错**。
-**人眼可用**（用户实测：选旧会话 → 发消息 → Ante 回话 ✅）；**探针复现不出**：字进得了输入框，回车**静默无 POST、无报错**。
-  已排除：终端尺寸（150×45）、点击输入框、命令（`/sessions` 与 `/resume` 都试过）、会话新老、agent/model 解析（已修）、Mod+Enter。
-  **已排除（每条都实测过，别再重复）**：终端尺寸（110×30 / 140×40 / 150×45）、点击输入框、Tab 切焦点、`/sessions` 与 `/resume` 两条命令、会话新老（本轮建的与上轮建的）、agent/model 解析（已修）、Mod+Enter、**kitty 键盘协议**（探针改成「回应 `\x1b[?u` 查询 + 全部按键按 `CSI <cp> u` 编码」后，**首轮仍能提交、恢复后依旧 0 POST**——所以与回车编码无关）。
-  **观察到的确凿事实**：文字确实进了输入框（底部可见），回车**什么都不发生**——没有 POST、没有报错、没有 toast。客户端 `submit.ts` 里两处守卫（`submit.available()`、`readSubmission` 的 `!model||!agent`）都会**静默 return**，但探针无法定位是哪一处，因为**复现不出「能用的那次」**。
 - [ ] **diff / LSP / formatter / MCP / VCS** —— 打桩。**这些是 Ante 根本没有的概念，只能显示为空，别指望填上**
 - [ ] **撤销回滚、贴图、PTY、分享** —— **登记为「Ante 无对应能力」，不再尝试**。撤销回滚查证过：Ante 协议全部 18 个 op（`StartSession`…`Shutdown`）**没有 revert/undo/rewind**，`~/Projects/ante` 全仓 grep 同样零命中；opencode 那边是 `revert/stage` → `revert/commit` / `DELETE revert` 三步 + `staged/committed/cleared` 事件。硬做只剩「重写 `events.jsonl` 截断历史」——只对以后 resume 生效、对当前会话无效、还可能被 Ante 覆写，故不采用
 
@@ -52,9 +53,13 @@ Ante（**你自己装的**：官方脚本装、`ante update` 升级）
 - [x] **多轮消息落位** —— 三条连发实测：用户与回复正确交错（前两条因排队相邻属正常）
 - [x] **中断收尾** —— Esc 两下（第一下上膛、第二下中断）后 Ante 正常收尾：工具单元格变 `✗`、转轮停止
 - [x] **失败可见** —— Ante 那轮失败时补发 `session.step.failed` + `session.execution.failed`（两者都必带 `error`），TUI 显示 `Error: …` 而不是空转
-- [x] **会话列表 / `/sessions`** —— `GET /api/session` 读 `~/.ante/sessions/*/meta.json`（实测 225 条、时间倒序、标题=首条用户消息），**选择器实测已列出真 Ante 会话**
+- [x] **会话列表 / `/sessions`** —— `GET /api/session` 读 `~/.ante/sessions/*/meta.json`（实测 209 条 = `ls ~/.ante/sessions | wc -l`、时间倒序、标题=首条用户消息），**选择器实测已列出真 Ante 会话**；**每条都报垫片自己的 location**（`prj_shim` @ `default_directory()`）——报 Ante 的真实 `dir` 会让选择器去 sync 一个 `/api/location` 答不出的目录，于是第二次打开变成 "Could not load sessions."
 - [x] **恢复会话：历史渲染** —— `/sessions` 选中一条即加载历史（用户消息 + 助手回复 + 工具块）。**病根：`GET /api/session/{id}` 少了 `data` 信封**（该路由 schema 是 `{data: Session.Info}` 且 `additionalProperties:false`），客户端读 `response.data.id` 得 undefined，抛 `undefined is not an object (evaluating 'Ae.id')`，**只在界面上弹个小 toast、不换视图**——所以看着像「点了没反应」
-- [x] **模型选择** —— `/api/model`、`/api/provider` 由 **Ante 的 `~/.ante/catalog.json` 驱动**（实测 81 个模型 / 9 个 provider），默认项取 `settings.json` 的 `provider`+`provider_model` 并排在首位；客户端选的模型在建会话与 `POST …/model` 两条路径都会下发 Ante（对应 `StartSession` / `UpdateSession`）
+- [x] **恢复旧会话后继续对话** —— 从前垫片只认「本进程第一个 prompt」建的那一个 Ante 会话（进程级 `started` 标志），此后的 prompt 一律 `UpdateSession`+`UserInput`，**从不看 URL 里的会话 id，也从不发 `Op::ResumeSession`**——消息因此进了当时那个新会话，只是事件按 `active` 路由，**看着**留在旧会话里（磁盘上则是另一条会话）。现在 `Ante.live` 记住当前连接驱动的会话：prompt 指向别的会话、且 `~/.ante/sessions/<id>/` 有存档就 `ResumeSession`（真续写，Ante 把新内容写回该 id 的日志），没有存档才 `StartSession`。**顺带处理 ResumeSession 自带的整份历史重放**：`Ante.replay_turn` 守卫把它丢掉，直到我们自己那条 `UserInput` op 触发的 `TurnStart.turn_id` 出现（该值就是那条 op 的 id）；被拒或 20s 超时则放行并清掉绑定，下一条消息重新定位。**验证法（不必进 TUI）**：`antex serve PORT` 起服务 → `POST /api/session` 建会话并 prompt 一次（Ante 那边落一条新目录 `ses_A`）→ 再 prompt `ses_A`、以及另一个已有目录的会话 → 核对各自的 `.ante/sessions/<id>/events.jsonl` 有没有收到新 `UserInput`（判据：消息落进**被指向的那条**）；同时本轮 SSE 里 `session.step.started` 只能出现一次，多于一次就是重放没挡住。垫片日志出现 `ante: 切到旧会话 <id>（ResumeSession）` 即走了恢复路径——一体化模式看 `/tmp/antex.log`
+- [x] **插嘴 / 排队（`Ctrl+S`）** —— opencode 的提交带 `delivery`：`steer`（回车，默认）走 Ante 的 **`Op::Steer`**，插进正在跑的那一轮；`queue`（`<leader>return`）**由垫片自己持有**（`Store::pending`），到回合边界（`TurnEnd`）才作为 `Op::UserInput` 交给 Ante——Ante 撤不回已提交的输入，放在垫片手里「插嘴 / 删除」才都算数。补齐 inbox 三件套：`GET …/inbox`（列出持有的条目，字段含 `delivery`/`payload.text`）、`PATCH …/inbox/{id}`（`{"delivery":"steer"}` 插嘴、`"queue"` 保持；该条已投递时回 **409**）、`DELETE …/inbox/{id}`（丢弃）。**客户端侧补了上游没有的键位**：`ctrl+s`（见「首页 logo」那节的三处补丁）
+- [x] **思考块按时收尾** —— 真 server 的推理是「一次性 `reasoning.ended` + 全文」，Ante 是流式 delta、而聚合的 `Thinking` 要等整步结束才到（实测比正文晚 1 秒以上，期间那行 `Thought` 一直转圈）。垫片自己缓存 delta，遇到首个正文 delta / 工具调用 / 回合结束就把 `reasoning.ended`（带缓存全文）补在正文前面，顺序回到标准的 `reasoning.ended` → `text.started`
+- [x] **首 token 那几秒不空屏** —— 实测「提交 → 模型吐第一个字」有 **2.3 秒**（思考型模型预填期间不产出任何内容），那段的转录区**一片空白**，只有页脚在动；垫片造不出不存在的 part（硬塞会留下假 `Thought` 行）。改成客户端补一行占位（`routes/session/index.tsx`：会话在跑、且没有任何未完成的助手消息时画 `⠦ Thinking`），实测空窗 **2341ms → 169ms**，真推理行一到即接管（见「首页 logo」那节的第四处补丁）
+- [x] **模型选择** —— `/api/model`、`/api/provider` 由 **Ante 的 `~/.ante/catalog.json` 驱动**（实测 81 个模型 / 9 个 provider），默认项取 `settings.json` 的 `provider`+`provider_model` 并排在首位；客户端选的模型在建会话与 `POST …/model` 两条路径都会下发 Ante（对应 `StartSession` / `UpdateSession`）。**会话对外报的模型**跟客户端走：建会话时记下 body 里的那对、切模型时就地更新，`GET /session/{id}` / 会话列表 / 历史回放各读各的（内存副本或 Ante 自己的 `meta.json`）；只有客户端一次都没选过才回落到 `settings.json`——之前这几处一律报 `settings.json` 那对，于是列表里显示着一个该会话从没跑过的模型。
 - [x] **`shift+tab` 切权限模式** —— 三项**直接用 Ante 自己的说法**（`auto`/`strict`/`yolo`，不经过 opencode 的 build/plan 再翻译），实测 composer 循环 `Auto → Strict → Yolo`，且**以 `settings.json` 里配的那个打头**；切换是真差别（`strict` 下危险命令弹审批）。**agent 是在「建会话」的 body 里传的**（`{agent, id, model, location}`），不是发消息时
 - [x] **boot 接口全套** —— `health` `location` `fs/list` `agent` `provider` `model` `config` `vcs` `project` `plugin` `migration` …
 - [x] **`@` 文件补全** —— 垫片**自己读文件系统**（Ante 无文件 API）：`/api/fs/list` 列目录、`/api/fs/find` 递归搜索（跳过 `.git`/`node_modules`，深度≤6、limit≤50）。实测敲 `@` 列出家目录、输入 `main.rs` 命中真文件
@@ -68,7 +73,6 @@ Ante（**你自己装的**：官方脚本装、`ante update` 升级）
 
 | 项 | 怎么验 | 备注 |
 | --- | --- | --- |
-| **恢复后继续对话** | `/sessions` 选中旧会话后**直接打字回车**；看垫片终端有没有刷出 `POST …/prompt` | **人眼：部分会话可用**；**探针：始终不行**——文字确实进了输入框（底部可见），回车后**静默无 POST、无报错**。已排除：终端尺寸（150×45 同样）、点击输入框、会话新老（本次运行建的和上轮建的都不行）、agent/model 解析（已修，仍不提交）。`submit.ts` 的 `submit.available()` 与 `readSubmission` 的 `!model||!agent` 两处守卫都会**静默 return**，尚未定位是哪一处 |
 | **diff / LSP / formatter / MCP / VCS** | 敲 `/diff`、开 MCP 面板看是否空 | **Ante 根本没有这些概念**，只能显示为空，别指望填上 |
 | **撤销回滚、贴图、PTY、分享** | 不用验了 | **Ante 无此能力**（详见实现清单该条的查证记录）；不要再提议硬做 |
 
@@ -99,8 +103,9 @@ opencode2 --server http://127.0.0.1:41999     # 终端 B
 
 - `antex PORT` 指定端口（默认 41999）；`antex -h` 看用法。
 - **可以多开**：一体化模式下端口被占会**自动往后顺延**（并打印改用哪个），所以第二个、第三个 `antex` 直接跑就行。`serve` 模式相反——按你给的端口，被占就明确报错（换端口会让人连错服务）。
-- 环境变量：`ANTE_BIN` 指定 `ante` 可执行文件（默认 `$PATH`，再退到 `~/.ante/bin/ante`）；`OANTE_CLIENT` 指定客户端（默认 `opencode2` → `opencode`）。**所以不必先 export PATH。**
+- 环境变量：`ANTE_BIN` 指定 `ante` 可执行文件（默认 `$PATH`，再退到 `~/.ante/bin/ante`）；`ANTEX_CLIENT` 指定客户端（默认 `~/.local/bin/antex-tui`，再退到 `opencode2` → `opencode`）。**所以不必先 export PATH。**
 - **一体化模式下请求日志写 `/tmp/antex.log`**——写 stdout 会糊在 TUI 上（踩过）；`serve` 模式仍打在 stdout。
+- **启动自检**：`antex` 起来时先核对 Ante —— 找不到 `ante` 就直接报错退出（否则 TUI 能开、消息全石沉大海）；`ante --version` 与二进制里编进去的 `ante-sdk` 版本对不上就**警告**（这正是「界面在跑但没反应」最常见的成因）。运行期连不上、事件流断掉、消息被丢弃也都写同一处日志（`/tmp/antex.log`），不留哑谜。想看是否通过：`tail /tmp/antex.log`。
 
 ## 首页 logo（改过客户端）
 
@@ -110,9 +115,13 @@ opencode2 --server http://127.0.0.1:41999     # 终端 B
 ./script/build-tui.sh        # 编本机平台，产物 ~177MB，约 1 分钟
 ```
 
-- 补丁只有一处：`vendor/opencode/packages/tui/src/logo.ts`（Ante 面具 + `ANTEX`）。
+- 补丁四处，都在 `vendor/opencode/packages/tui/src/`：
+  - `logo.ts` —— 首页大字 logo 换成 Ante 面具 + `ANTEX`；
+  - `component/dialog-model.tsx` —— 模型选择器的条目**永远带供应商**（分组标题 + 过滤时行尾的供应商名）。上游把这一栏压在 `connected()` 后面，而那个判断看的是 integration 连接数；antex 没有 integration 概念、恒假，于是 81 个模型的列表里同名条目完全分不出来。
+  - `config/keybind.ts` + `routes/session/index.tsx` —— 加 `queued_prompt.steer` = **`ctrl+s`**（对齐 Ante 自己的「把排队消息插进正在跑的回合」；上游 v2 没这个键位），命令体复用客户端的 `mutatePending("steer", queuedPrompts()[0].id)`。
+  - `routes/session/index.tsx` —— 首 token 前那段空窗补一行 `⠦ Thinking` 占位（会话 running 且没有任何未完成的助手消息时显示；有内容即撤）。
 - 编出来的客户端装在 `~/.local/bin/antex-tui`，**`antex` 默认就用它**（源码模式启动不慢，且底部没有 dev 模式的 `✓ Server ○ UI…` 那行）。
-- **上游更新后**（`git subtree pull`）跑一次 `script/build-tui.sh` 即可。
+- **上游更新后**（`git subtree pull`）跑一次 `script/build-tui.sh` 即可；两步合一就是下面那条 `./script/upgrade-upstream.sh`。
 - 想临时切回官方二进制：`ANTEX_CLIENT=opencode2 antex`。
 
 ## 依赖与版本
@@ -199,7 +208,20 @@ session.step.started → session.text.started → session.text.delta ×N → ses
 | 回车毫无反应 | `/api/agent`、`/api/provider`、`/api/model` 为空 → composer 没有模型，拒绝提交 |
 | `Failed to switch model: UnexpectedStatus` | `POST …/model` 必须回 204 |
 | 助手回复不渲染（事件照发，界面不动也不报错） | 两层原因：① 事件名用了上一代的 `message.part.updated`；② **即使名字对了，还缺 `session.step.started`**——助手消息没被追加进列表，后续 `editAssistant` 全是空操作 |
+| 整轮空白（不是少一个块，是整段没了） | 帧**解码失败会静默丢弃该事件，并连带丢掉它之后的整轮**；先看客户端的 `--print-logs --log-level debug` |
 | 事件流 `Connection lost` | SSE 帧必须是 `{id,type,data}` 形式且**首帧 `server.connected`**，并且走 chunked |
+| 第一轮就 `Error: … invalid_request` / `HTTP 400 Bad Request`（`Model "…" is not supported on …`） | 垫片顶部的 `MODEL`/`PROVIDER` 兜底常量必须是 **catalog 里的 provider-scoped 名**（如 `example` 上是 `example/example-model`）；名字错了只有 provider 会告诉你，Ante 侧不报错 |
+| 恢复旧会话后消息记在别的会话里（界面看着正常） | 垫片没把会话 id 交给 Ante：`StartSession` 建的那条会话从此吸收所有 prompt，而事件按 `active` 路由，所以 UI 不露馅。**已修**（`Ante.live` + `ResumeSession` + `Ante.replay_turn`，见实现清单）；要判断落点只能看 `.ante/sessions/<id>/events.jsonl` |
+| 长回答越流越卡、正文行「定位不到」却**不报错** | `ordinal` 不是 delta 序号，而是**同类型 part 在消息里的第几个**：客户端 `rows.ts` 用 `text:{ordinal}`/`reasoning:{ordinal}` 当 part 键，`resolvePart` 取 `content.filter(type)[ordinal]`，而 `appendPart` 对每个没见过的键都会**插一行**。垫片从前按 delta 递增 → 每个 token 建一行、再解析成空；现在每个 part 一个恒定序号 |
+| `/sessions` 第二次打开只显示 **Could not load sessions.** | 会话选择器按「当前会话的 `location.directory`」先 `location.sync`，再拿该目录的 project 去过滤。垫片从前把 Ante `meta.dir`（会话真实目录）当 location 报出去，可 `/api/location` 只会答 `default_directory()` → 客户端永远解析不到那个目录、整个列表报错。**规则**：垫片只有一个 `prj_shim`（家目录），所有会话 info 的 location 都必须用它 |
+
+## 验收与排错开关
+
+- **改完垫片必须重启进程**：`target/release/antex` 是产物，旧进程不会自更新（曾因此把已修好的功能当成没修）。
+- **肉眼验收要加 `--print-logs --log-level debug`**——客户端抛异常只弹一个小 toast，正文里什么都不显示，「没反应」多半是它。
+- **TUI 自动化验收用 PTY + pyte 探针**：`~/antecode-scratch/tuiprobe/`；本机**没装 tmux**，所以用 `~/antecode-scratch/tuiprobe/tui_drive.py` 驱动——`--send '6:文本\r'` 按时间发键（`\x13`=ctrl+s、`\x18`=leader），`--every` 抓屏写 `--out`（「思考→正文」与 `Ctrl+S` 就是这么验的）。
+- **接口级验证不必进 TUI**：`antex serve PORT` 后直接 `curl`，逐条对着「实现清单」的验证法做。
+- 垫片自己的开关：`ANTE_SHIM_TRACE=<文件>`（记 Ante 事件全文 + 垫片发布的事件）、`SHIM_PERMISSION_MODE=strict|auto|yolo`、`SHIM_SKIP_EVENTS=`、`SHIM_TOOL_EVENTS=`。
 
 ## 权威出处
 
@@ -207,12 +229,18 @@ session.step.started → session.text.started → session.text.delta ×N → ses
 | --- | --- |
 | HTTP 规格（136 端点） | opencode 仓库 `v2` 分支 `packages/protocol/openapi.json` |
 | 事件定义 | 同分支 `packages/schema/src/event.ts`、`session-event.ts` |
-| 真 server 形状对照 | 真 server 用 HTTP Basic 认证（用户名 `opencode`，密码见启动日志），可 `curl -u` 直接抄 |
+| 真 server 形状对照 | 起一个真 server 当 oracle：`opencode2 serve --hostname 127.0.0.1 --port 41998`（日志打印 `server password <PW>`；API 用 HTTP Basic，用户名 `opencode`），再订阅 `/api/event` 抓权威事件序列 |
 
 ## 下一步
 
-见上面的**实现清单 · 未实现**，按那份优先级做；每条的具体验证法见同节的「未完成项的验证法」。
-其中「中断收尾」和「多轮消息落位」是当前功能的直接缺陷，先修；「会话列表」「agent 切换」是缺口；LSP/formatter/git 那类 Ante 没有的概念，只打桩。
+**日常使用路径上没有已知缺陷**：过去列在缺口里的中断收尾、多轮消息落位、会话列表、agent 切换、`/compact`、恢复旧会话后继续对话都已实现并实测。
+
+剩下的两类，见上面的**实现清单 · 未实现**：
+
+- **打桩项**：diff / LSP / formatter / MCP / VCS —— Ante 没有这些概念，只能显示为空（验证法见「未完成项的验证法」）。
+- **无对应能力项**：撤销回滚 / 贴图 / PTY / 分享 —— Ante 协议里就没有，别再提议硬做。
+
+**已知瑕疵（不影响使用）**：TUI 新建会话时 id 是**客户端本地发号**的（`packages/tui/src/component/prompt/index.tsx` 的乐观创建），Ante 那边则按自己的 id 另建一条同格式目录。于是刚建的会话在重启前只以客户端 id 存在于内存里（本进程内就按它跟踪），重启后要从列表里按 Ante 的 id 恢复——内容一直在 Ante 那条目录里，不会丢，两个 id 也不会互相冒充。
 
 ## 魔改上游 TUI
 
@@ -234,11 +262,18 @@ bun run dev -- --server http://127.0.0.1:41999
 **跟上游的例行步骤**（上游源码在仓库里，就等于有了契约测试）：
 
 ```sh
-git subtree pull --prefix=vendor/opencode https://github.com/anomalyco/opencode v2 --squash
-cd vendor/opencode && bun install        # 依赖有变时才需要
-cd - && cargo build --release            # 垫片
+./script/upgrade-upstream.sh             # 一条命令：拉 v2 子树 + 重建客户端
+cargo build --release                    # 垫片（源码有改动才需要）
 ./target/release/antex serve 41999 &
 cd vendor/opencode && bun run dev -- --server http://127.0.0.1:41999
+```
+
+`script/upgrade-upstream.sh` 干的就是下面两件事，只是省得你记得第二步（忘了它的症状是「上游明明更新了、界面还是旧的」）：
+
+```sh
+git subtree pull --prefix=vendor/opencode https://github.com/anomalyco/opencode v2 --squash
+cd vendor/opencode && bun install        # 依赖有变时才需要
+cd - && ./script/build-tui.sh
 ```
 
 跑起来看界面有没有坏——**垫片假装的是接口，上游改了接口既不会有合并冲突、也不会有类型检查**，
@@ -262,6 +297,8 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 
 ```
 src/                 垫片本体：路由、信封、SSE、会话/消息存储
+build.rs             把编译用的 ante-sdk 版本写进二进制（启动自检要用）
+script/              build-tui.sh（重建客户端）、upgrade-upstream.sh（拉上游 + 重建，一条命令）
 vendor/opencode/     上游 opencode（subtree，v2 分支）——魔改对象
 Cargo.toml           axum + tokio + serde
 ```

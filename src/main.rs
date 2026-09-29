@@ -26,7 +26,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{get, post},
+    routing::{get, patch, post},
 };
 use futures::stream::{self, Stream, StreamExt};
 use serde_json::{Value, json};
@@ -43,7 +43,10 @@ fn default_directory() -> String {
 }
 const VERSION: &str = "2.0.18";
 /// The model Ante is configured with, so the composer shows something real.
-const MODEL: &str = "deepseek-v4.1-flash";
+/// This is the fallback for a client that never picked one — it has to be the
+/// catalog's name (provider-scoped), or the first turn comes back as an HTTP
+/// 400 from the provider.
+const MODEL: &str = "example/example-model";
 const PROVIDER: &str = "example";
 
 fn ante_home() -> std::path::PathBuf {
@@ -65,11 +68,6 @@ fn catalog() -> Value {
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .unwrap_or_else(|| json!({ "providers": {} }))
-}
-
-/// The pair a session reports before one is picked; always a catalog entry.
-fn model_for_session() -> (String, String) {
-    active_model()
 }
 
 fn settings() -> Value {
@@ -195,8 +193,15 @@ fn uid(prefix: &str) -> String {
 struct Ante {
     /// Present once connected; ops reach Ante through it.
     ops: Arc<tokio::sync::Mutex<Option<OpSender>>>,
-    /// The Ante session has been opened.
-    started: Arc<std::sync::atomic::AtomicBool>,
+    /// The session the live connection is driving, as the *client* names it.
+    /// Ante drives exactly one session per connection, so a prompt for any
+    /// other id has to switch it over first.
+    live: Arc<Mutex<Option<String>>>,
+    /// While a resume is in flight: the op id of the `UserInput` that will
+    /// start the turn we are actually waiting for, plus when the guard was
+    /// armed. Everything the pump sees until then is the replay. See
+    /// [`Ante::dropping`].
+    replay_turn: Arc<Mutex<Option<(String, std::time::Instant)>>>,
     /// Which opencode session the events belong to. One Ante session is
     /// mirrored, so this is the most recent one the TUI opened.
     active: Arc<Mutex<Option<String>>>,
@@ -210,6 +215,9 @@ struct Ante {
     model: Arc<Mutex<Option<(String, String)>>>,
     /// Last prompt, used as the `recent` field compaction events require.
     last_user: Arc<Mutex<String>>,
+    /// A turn is running. Decides between handing text to Ante as a queued input
+    /// and steering it into the turn already in flight.
+    busy: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// An Ante turn paused for approval, held until the TUI answers.
@@ -219,17 +227,77 @@ struct PendingApproval {
     tools: Vec<ToolUse>,
 }
 
+/// How long the replay guard waits for its own turn to appear. Ante replays a
+/// resumed conversation in one burst, so a longer wait means the switch never
+/// took effect.
+const REPLAY_GUARD: std::time::Duration = std::time::Duration::from_secs(20);
+
 impl Ante {
     fn new() -> Self {
         Self {
             ops: Arc::new(tokio::sync::Mutex::new(None)),
-            started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            live: Arc::new(Mutex::new(None)),
+            replay_turn: Arc::new(Mutex::new(None)),
             active: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(None)),
             agent: Arc::new(Mutex::new(reported_agent().to_string())),
             model: Arc::new(Mutex::new(None)),
             last_user: Arc::new(Mutex::new(String::new())),
+            busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Whether a turn is in flight, so `steer` can mean what Ante means by it.
+    fn busy(&self) -> bool {
+        self.busy.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn set_busy(&self, value: bool) {
+        self.busy.store(value, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The session the live connection drives, as the client names it.
+    fn live_id(&self) -> Option<String> {
+        self.live.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// Arm the replay guard for a resume: the next turn this op id starts is
+    /// ours, everything before it is history coming back.
+    fn expect_turn(&self, turn_id: String) {
+        if let Ok(mut slot) = self.replay_turn.lock() {
+            *slot = Some((turn_id, std::time::Instant::now()));
+        }
+    }
+
+    /// Whether this event is part of a resume's replay and must not reach the
+    /// client — it already has that history from `/message`. The guard lifts on
+    /// the turn it was armed for; a refusal or a timeout lifts it too, and
+    /// drops the session binding so the next prompt resolves again rather than
+    /// talking into the wrong session.
+    fn dropping(&self, event: &Evt) -> bool {
+        let Ok(mut slot) = self.replay_turn.lock() else {
+            return false;
+        };
+        let Some((expected, armed)) = slot.as_ref() else {
+            return false;
+        };
+        let ours = matches!(event, Evt::TurnStart { turn_id } if turn_id.to_string() == *expected);
+        if ours {
+            *slot = None;
+            return false;
+        }
+        let refused = matches!(event, Evt::Error(_));
+        if refused || armed.elapsed() > REPLAY_GUARD {
+            *slot = None;
+            if let Ok(mut live) = self.live.lock() {
+                *live = None;
+            }
+            log_line(&format!(
+                "ante: 恢复会话没生效（{}），这次重放已放行——下一条消息会重新定位会话",
+                if refused { "Ante 拒绝了这个 id" } else { "等不到它自己的 turn" }
+            ));
+        }
+        true
     }
 }
 
@@ -238,6 +306,12 @@ struct Store {
     ante: Ante,
     sessions: Arc<Mutex<Vec<Value>>>,
     messages: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    /// Prompts the client queued instead of steering. opencode's inbox lives on
+    /// the server, so ours does too: the shim holds them and hands each one over
+    /// at the turn boundary (or right away when the user steers it). Ante cannot
+    /// withdraw a queued input, so holding them here is also what makes the
+    /// queue's delete/steer honest.
+    pending: Arc<Mutex<HashMap<String, Vec<Value>>>>,
     /// Frames fan out to every connected `/api/event` feed.
     events: broadcast::Sender<Value>,
 }
@@ -248,8 +322,42 @@ impl Store {
         Self {
             sessions: Arc::new(Mutex::new(Vec::new())),
             messages: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(Mutex::new(HashMap::new())),
             events,
             ante: Ante::new(),
+        }
+    }
+
+    /// The queued prompt with this inbox id, removed from the queue.
+    fn take_queued(&self, session: &str, inbox_id: &str) -> Option<Value> {
+        let mut queues = self.pending.lock().ok()?;
+        let queue = queues.get_mut(session)?;
+        let position = queue.iter().position(|item| item["id"] == inbox_id)?;
+        Some(queue.remove(position))
+    }
+
+    fn queued(&self, session: &str) -> Vec<Value> {
+        self.pending
+            .lock()
+            .ok()
+            .and_then(|queues| queues.get(session).cloned())
+            .unwrap_or_default()
+    }
+
+    /// The oldest queued prompt, taken off the queue. `None` when empty.
+    fn take_head(&self, session: &str) -> Option<Value> {
+        let mut queues = self.pending.lock().ok()?;
+        let queue = queues.get_mut(session)?;
+        if queue.is_empty() {
+            return None;
+        }
+        Some(queue.remove(0))
+    }
+
+    /// Put back an item that could not be handed over.
+    fn requeue_head(&self, session: &str, item: Value) {
+        if let Ok(mut queues) = self.pending.lock() {
+            queues.entry(session.to_string()).or_default().insert(0, item);
         }
     }
 
@@ -292,13 +400,26 @@ impl Store {
     fn session(&self, id: &str) -> Option<Value> {
         self.sessions.lock().ok()?.iter().find(|s| s["id"] == id).cloned()
     }
+
+    /// The pair the client last committed (session create or a model switch),
+    /// falling back to the one Ante itself is configured on. Reporting the
+    /// configured pair instead is what made a session list show a model the
+    /// session had never run.
+    fn current_model(&self) -> (String, String) {
+        self.ante
+            .model
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_else(active_model)
+    }
 }
 
 fn loc_plain() -> Value {
     json!({ "directory": default_directory() })
 }
 
-fn session_info(id: &str, title: &str) -> Value {
+fn session_info(id: &str, title: &str, model: (String, String)) -> Value {
     json!({
         "id": id,
         "projectID": "prj_shim",
@@ -306,7 +427,7 @@ fn session_info(id: &str, title: &str) -> Value {
         "cost": 0,
         "tokens": { "input": 0, "output": 0, "reasoning": 0, "cache": { "read": 0, "write": 0 } },
         "agent": reported_agent(),
-        "model": { "id": model_for_session().1, "providerID": model_for_session().0, "variant": "default" },
+        "model": { "id": model.1, "providerID": model.0, "variant": "default" },
         "time": { "created": now_ms(), "updated": now_ms(), "idle": now_ms(), "viewed": now_ms() },
         "location": loc_plain(),
         "title": title,
@@ -323,9 +444,13 @@ fn assistant_content(text: &str) -> Value {
 /// them on stdout, which is what a server-only run wants.
 static LOG_FILE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
 
-async fn log_request(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+/// Report something about the shim itself. One-command mode hands the terminal
+/// to the TUI, so a bare `eprintln!` there is scribbled over (and `pkill`-style
+/// post-mortems get nothing) — which is exactly how a dead Ante connection
+/// becomes "the interface is up but nothing happens". Everything goes through
+/// here instead: the file in one-command mode, stdout in serve mode.
+fn log_line(line: &str) {
     use std::io::Write as _;
-    let line = format!("{} {}", req.method(), req.uri());
     match LOG_FILE.get().and_then(|slot| slot.as_ref()) {
         Some(path) => {
             if let Ok(mut file) =
@@ -339,6 +464,10 @@ async fn log_request(req: axum::extract::Request, next: axum::middleware::Next) 
             let _ = std::io::stdout().flush();
         }
     }
+}
+
+async fn log_request(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    log_line(&format!("{} {}", req.method(), req.uri()));
     next.run(req).await
 }
 
@@ -436,6 +565,61 @@ fn ante_executable() -> Option<std::path::PathBuf> {
     fallback.is_file().then_some(fallback)
 }
 
+/// Startup-only reporting: the log line is the durable copy, plus stderr for
+/// when the user is watching the terminal and the TUI has not taken it over
+/// yet. In serve mode stdout already says it, so stderr would only double up.
+fn report_startup(line: &str) {
+    log_line(line);
+    if LOG_FILE.get().and_then(|slot| slot.as_ref()).is_some() {
+        eprintln!("{line}");
+    }
+}
+
+/// Start-up self-check.
+///
+/// The shim is useless without an `ante` it can speak to, and the failure the
+/// user actually sees is not an error but silence: the TUI opens fine and every
+/// prompt goes nowhere. So this runs before the TUI does and writes down what
+/// it found, including the one thing that silently breaks across Ante releases
+/// — a protocol/`ante-sdk` version mismatch.
+async fn ante_selfcheck() {
+    let Some(bin) = ante_executable() else {
+        let msg = format!(
+            "自检：找不到 `ante` 可执行文件（找过 $ANTE_BIN、$PATH、~/.ante/bin/ante）。\n\
+             没有它 TUI 照样能开，但每条消息都会石沉大海，所以这里直接退出。\n\
+             装好 Ante，或用 ANTE_BIN 指到它的路径。"
+        );
+        report_startup(&msg);
+        std::process::exit(1);
+    };
+    let built = env!("ANTE_SDK_VERSION");
+    match ante_version(&bin).await {
+        Some(found) if found != built => {
+            let msg = format!(
+                "自检：协议可能对不上——antex 是按 ante-sdk {built} 编的，本机 {} 是 ante {found}。\n\
+                 若发消息没反应，就是这个：改 Cargo.toml 的 ante-sdk 版本后 `cargo build --release`。",
+                bin.display()
+            );
+            report_startup(&msg);
+        }
+        Some(found) => log_line(&format!(
+            "自检：{} → ante {found}；antex 编译于 ante-sdk {built}，版本一致",
+            bin.display()
+        )),
+        None => log_line(&format!(
+            "自检：{} --version 没给出可用版本号，无法核对协议版本（编译用的 ante-sdk {built}）",
+            bin.display()
+        )),
+    }
+}
+
+/// `ante --version` → `ante 0.2.5` → `0.2.5`.
+async fn ante_version(bin: &std::path::Path) -> Option<String> {
+    let out = tokio::process::Command::new(bin).arg("--version").output().await.ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.split_whitespace().last().map(str::to_string)
+}
+
 /// Which opencode client to hand the terminal to. `~/.local/bin/antex-tui` is
 /// **our** build (vendored source + the Ante logo) and wins when present; the
 /// stock binary is the fallback.
@@ -465,16 +649,23 @@ async fn spawn_ante(store: Store) {
     let endpoint: ante_sdk::Endpoint = match "stdio".parse() {
         Ok(endpoint) => endpoint,
         Err(err) => {
-            eprintln!("ante: bad endpoint: {err}");
+            log_line(&format!("ante: 端点解析失败：{err}"));
             return;
         }
     };
     let mut options = ConnectOptions::default();
-    options.executable = ante_executable();
+    let bin = ante_executable();
+    options.executable = bin.clone();
     let client = match connect(endpoint, options).await {
         Ok(client) => client,
         Err(err) => {
-            eprintln!("ante: connect failed: {err}");
+            // The TUI is already on the user's screen by now, so this must land
+            // in the log — stderr alone is how "nothing happens" starts.
+            log_line(&format!(
+                "ante: 连接失败：{err}\n  ante = {}；antex 编译于 ante-sdk {}",
+                bin.map(|p| p.display().to_string()).unwrap_or_else(|| "（没找到）".into()),
+                env!("ANTE_SDK_VERSION"),
+            ));
             return;
         }
     };
@@ -490,7 +681,18 @@ async fn spawn_ante(store: Store) {
     let mut text_started = false;
     let mut streamed = false;
     let mut reasoning_open = false;
-    let mut ordinal = 0u32;
+    // The thinking seen so far, so the block can be closed the moment the
+    // answer starts. Ante's own `Thinking` aggregate only lands at the end of
+    // the step, which left the row spinning through the whole reply.
+    let mut reasoning_text = String::new();
+    // Part identity in the client's row layer: `text:{ordinal}` addresses the
+    // Nth text part of the message (`rows.ts`'s `resolvePart`), so an ordinal
+    // belongs to a *part*, never to a delta — one per delta had the client
+    // mint a row per token and then fail to resolve it.
+    let mut text_part = 0u32;
+    let mut text_ordinal = 0u32;
+    let mut reasoning_part = 0u32;
+    let mut reasoning_ordinal = 0u32;
     let mut tokens_in = 0u32;
     let mut tokens_out = 0u32;
     let mut compact_block: Option<String> = None;
@@ -498,6 +700,11 @@ async fn spawn_ante(store: Store) {
 
     while let Some(msg) = rx.recv().await {
         trace_ante(&msg.event);
+        // A resume hands the whole persisted conversation back; the client
+        // already fetched that history, so rendering it again would double it.
+        if store.ante.dropping(&msg.event) {
+            continue;
+        }
         let Some(session) = store.ante.active.lock().ok().and_then(|s| s.clone()) else {
             continue;
         };
@@ -509,7 +716,9 @@ async fn spawn_ante(store: Store) {
                     text_started = false;
                     streamed = false;
                     reasoning_open = false;
-                    ordinal = 0;
+                    reasoning_text.clear();
+                    text_part = 0;
+                    reasoning_part = 0;
                     message_id = uid("msg");
                     let (provider, model) = store
                         .ante
@@ -545,9 +754,50 @@ async fn spawn_ante(store: Store) {
                 }
             };
         }
+        // The real server sends the complete thinking block once (`reasoning.ended`
+        // carries the text); Ante streams deltas and only repeats the whole block
+        // when the step is over. Closing the block ourselves at the boundary keeps
+        // the canonical order `reasoning.ended` → `text.started`: the row settles
+        // into `Thought · Ns` as the answer starts, not seconds later.
+        macro_rules! open_reasoning {
+            () => {
+                if !reasoning_open {
+                    reasoning_open = true;
+                    reasoning_ordinal = reasoning_part;
+                    reasoning_part += 1;
+                    store.publish_durable(
+                        "session.reasoning.started",
+                        json!({
+                            "sessionID": session,
+                            "assistantMessageID": message_id,
+                            "ordinal": reasoning_ordinal,
+                        }),
+                        &session,
+                    );
+                }
+            };
+        }
+        macro_rules! close_reasoning {
+            () => {
+                if reasoning_open {
+                    reasoning_open = false;
+                    store.publish_durable(
+                        "session.reasoning.ended",
+                        json!({
+                            "sessionID": session,
+                            "assistantMessageID": message_id,
+                            "ordinal": reasoning_ordinal,
+                            "text": std::mem::take(&mut reasoning_text),
+                        }),
+                        &session,
+                    );
+                }
+            };
+        }
         match msg.event {
             Evt::TurnStart { .. } => {
                 step_open = false;
+                store.ante.set_busy(true);
                 store.publish_durable(
                     "session.execution.started",
                     json!({ "sessionID": session }),
@@ -557,35 +807,47 @@ async fn spawn_ante(store: Store) {
             Evt::ThinkingDelta(delta) => {
                 ensure_streamed!();
                 ensure_step!();
-                if !reasoning_open {
-                    reasoning_open = true;
-                    store.publish_durable(
-                        "session.reasoning.started",
-                        json!({ "sessionID": session, "assistantMessageID": message_id, "ordinal": 0 }),
-                        &session,
-                    );
-                }
+                open_reasoning!();
+                reasoning_text.push_str(&delta);
                 store.publish(
                     "session.reasoning.delta",
-                    json!({ "sessionID": session, "assistantMessageID": message_id, "delta": delta }),
+                    json!({
+                        "sessionID": session,
+                        "assistantMessageID": message_id,
+                        "ordinal": reasoning_ordinal,
+                        "delta": delta,
+                    }),
                 );
             }
             Evt::Thinking(text) => {
-                reasoning_open = false;
-                store.publish_durable(
-                    "session.reasoning.ended",
-                    json!({ "sessionID": session, "assistantMessageID": message_id, "ordinal": 0, "text": text }),
-                    &session,
-                );
+                // A non-streaming block still has to reach the client (that is the
+                // canonical shape: one `reasoning.ended` carrying the text). A
+                // streamed one was already closed above, in which case this late
+                // copy is only a duplicate — and opening a second reasoning part
+                // for it would show the same thinking twice.
+                if !text.trim().is_empty() && reasoning_part == 0 {
+                    ensure_step!();
+                    open_reasoning!();
+                    reasoning_text = text;
+                }
+                close_reasoning!();
             }
             Evt::MessageDelta(delta) => {
                 ensure_streamed!();
                 ensure_step!();
+                // Thinking is over the moment the answer starts.
+                close_reasoning!();
                 if !text_started {
                     text_started = true;
+                    text_ordinal = text_part;
+                    text_part += 1;
                     store.publish_durable(
                         "session.text.started",
-                        json!({ "sessionID": session, "assistantMessageID": message_id, "ordinal": 0 }),
+                        json!({
+                            "sessionID": session,
+                            "assistantMessageID": message_id,
+                            "ordinal": text_ordinal,
+                        }),
                         &session,
                     );
                 }
@@ -594,20 +856,20 @@ async fn spawn_ante(store: Store) {
                     json!({
                         "sessionID": session,
                         "assistantMessageID": message_id,
-                        "ordinal": ordinal,
+                        "ordinal": text_ordinal,
                         "delta": delta,
                     }),
                 );
-                ordinal += 1;
             }
             Evt::AgentMessage(text) => {
                 ensure_step!();
+                close_reasoning!();
                 store.publish_durable(
                     "session.text.ended",
                     json!({
                         "sessionID": session,
                         "assistantMessageID": message_id,
-                        "ordinal": ordinal,
+                        "ordinal": text_ordinal,
                         "text": text,
                     }),
                     &session,
@@ -615,6 +877,7 @@ async fn spawn_ante(store: Store) {
             }
             Evt::ToolStart(tool) => {
                 ensure_step!();
+                close_reasoning!();
                 let args = tool.args.to_string();
                 store.publish_durable(
                     "session.tool.input.started",
@@ -780,6 +1043,9 @@ async fn spawn_ante(store: Store) {
             }
             Evt::TurnEnd { status, .. } => {
                 let failed = matches!(status, ante_sdk::protocol::TurnEndStatus::Error { .. });
+                // A turn can end on thinking alone (interrupted, or a step that
+                // never answered); the block must not be left open.
+                close_reasoning!();
                 if step_open {
                     store.publish_durable(
                         "session.step.ended",
@@ -839,6 +1105,9 @@ async fn spawn_ante(store: Store) {
                     },
                     &session,
                 );
+                // The turn is over: a prompt the client queued belongs now.
+                store.ante.set_busy(false);
+                flush_queue(&store, &session).await;
             }
             // Ante pauses the turn for a decision; the TUI shows this as a
             // permission prompt and answers on the reply route.
@@ -866,6 +1135,10 @@ async fn spawn_ante(store: Store) {
             _ => {}
         }
     }
+    // Ante's event stream ended: it exited, or it dropped us (a version
+    // mismatch can do that mid-handshake). Later prompts will not be answered,
+    // so say so rather than let the UI go quiet.
+    log_line("ante: 事件流已结束——Ante 进程退出，或它在握手后断开了连接；后续消息不会有回复");
 }
 
 /// What the TUI polls to learn about a pending permission prompt.
@@ -1014,7 +1287,7 @@ async fn session_compact(
 /// directly, so the switch is real.
 async fn session_model(
     State(store): State<Store>,
-    Path(_id): Path<String>,
+    Path(session_id): Path<String>,
     Json(body): Json<Value>,
 ) -> axum::http::StatusCode {
     let model = body.get("model").cloned().unwrap_or_default();
@@ -1036,6 +1309,14 @@ async fn session_model(
     if let Ok(mut slot) = store.ante.model.lock() {
         *slot = Some((provider.clone(), id.clone()));
     }
+    // The session list and `GET /session/{id}` answer from the stored copy, so
+    // the switch has to land there too — otherwise they keep reporting the pair
+    // the session was created with.
+    if let Ok(mut sessions) = store.sessions.lock()
+        && let Some(info) = sessions.iter_mut().find(|s| s["id"] == session_id.as_str())
+    {
+        info["model"] = json!({ "id": id.clone(), "providerID": provider.clone(), "variant": "default" });
+    }
     if let Some(session) = store.ante.active.lock().ok().and_then(|s| s.clone()) {
         let mut payload = json!({
             "sessionID": session,
@@ -1048,7 +1329,7 @@ async fn session_model(
     }
     // Only meaningful once a session exists; the stored pair is applied when the
     // session starts, and Ante answers "session not initialized" before that.
-    if store.ante.started.load(std::sync::atomic::Ordering::SeqCst)
+    if store.ante.live_id().is_some()
         && let Some(ops) = store.ante.ops.lock().await.clone()
     {
         let update = ante_sdk::protocol::SessionUpdate {
@@ -1071,7 +1352,7 @@ async fn session_agent(
 ) -> axum::http::StatusCode {
     let agent = body.get("agent").and_then(|v| v.as_str()).unwrap_or_else(|| reported_agent()).to_string();
     let mode = permission_mode_for(&agent);
-    if store.ante.started.load(std::sync::atomic::Ordering::SeqCst)
+    if store.ante.live_id().is_some()
         && let Some(ops) = store.ante.ops.lock().await.clone()
     {
         let update = ante_sdk::protocol::SessionUpdate {
@@ -1362,11 +1643,6 @@ fn ante_sessions() -> Vec<Value> {
                 .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
                 .map(|when| when.timestamp_millis())
                 .unwrap_or_else(now_ms);
-            let directory = meta
-                .get("dir")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
             let title = meta
                 .get("first_user_message")
                 .and_then(|v| v.as_str())
@@ -1388,7 +1664,10 @@ fn ante_sessions() -> Vec<Value> {
                 "tokens": tokens,
                 "time": { "created": created, "updated": created },
                 "title": title,
-                "location": { "directory": directory },
+                // Same rule as `ante_session_info`: only the shim's own location,
+                // or the client ends up asking about a directory `/api/location`
+                // will never confirm (that is what broke the session picker).
+                "location": loc_plain(),
             });
             Some((created, info))
         })
@@ -1440,7 +1719,7 @@ async fn session_create(
     {
         *slot = Some((provider.to_string(), id.to_string()));
     }
-    let info = session_info(&id, "Ante session");
+    let info = session_info(&id, "Ante session", store.current_model());
     if let Ok(mut sessions) = store.sessions.lock() {
         sessions.push(info.clone());
     }
@@ -1449,26 +1728,35 @@ async fn session_create(
     Json(json!({ "data": info }))
 }
 
+fn session_meta(id: &str) -> Option<Value> {
+    let raw = std::fs::read_to_string(ante_home().join("sessions").join(id).join("meta.json")).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// The pair a session actually ran, as Ante recorded it — not the one Ante is
+/// configured on now, which says nothing about an old session.
+fn meta_model(meta: &Value) -> (String, String) {
+    match (
+        meta.get("provider").and_then(|v| v.as_str()),
+        meta.get("model").and_then(|v| v.as_str()),
+    ) {
+        (Some(provider), Some(model)) => (provider.to_string(), model.to_string()),
+        _ => active_model(),
+    }
+}
+
 /// The session's own metadata, read back from Ante. Returning a synthesized one
 /// loses the real directory, and the client uses that to decide whether the
 /// session belongs to the location it is showing.
 fn ante_session_info(id: &str) -> Option<Value> {
-    let home = std::env::var_os("ANTE_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
-            home.join(".ante")
-        });
-    let raw = std::fs::read_to_string(home.join("sessions").join(id).join("meta.json")).ok()?;
-    let meta: Value = serde_json::from_str(&raw).ok()?;
+    let meta = session_meta(id)?;
+    let (provider, model) = meta_model(&meta);
     let created = meta
         .get("started_time")
         .and_then(|v| v.as_str())
         .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
         .map(|when| when.timestamp_millis())
         .unwrap_or_else(now_ms);
-    let fallback_dir = default_directory();
-    let directory = meta.get("dir").and_then(|v| v.as_str()).unwrap_or(&fallback_dir);
     let usage = meta.get("usage").cloned().unwrap_or_else(|| json!({}));
     let title = meta
         .get("first_user_message")
@@ -1479,10 +1767,7 @@ fn ante_session_info(id: &str) -> Option<Value> {
         "id": id,
         "projectID": "prj_shim",
         "agent": reported_agent(),
-        "model": {
-            "id": meta.get("model").and_then(|v| v.as_str()).unwrap_or(MODEL),
-            "providerID": meta.get("provider").and_then(|v| v.as_str()).unwrap_or(PROVIDER),
-        },
+        "model": { "id": model, "providerID": provider },
         "cost": 0,
         "tokens": tokens_json(
             usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
@@ -1490,7 +1775,12 @@ fn ante_session_info(id: &str) -> Option<Value> {
         ),
         "time": { "created": created, "updated": created },
         "title": title,
-        "location": { "directory": directory },
+        // Ante's own `dir` for the session is NOT what the shim can confirm: this
+        // shim has a single location (`prj_shim` at `default_directory()`, what
+        // `/api/location` answers for every directory). Reporting the real one
+        // made the client ask about a directory it can never resolve — the
+        // session picker then failed outright with "Could not load sessions".
+        "location": loc_plain(),
     }))
 }
 
@@ -1498,7 +1788,7 @@ async fn session_get(State(store): State<Store>, Path(id): Path<String>) -> Json
     let info = store
         .session(&id)
         .or_else(|| ante_session_info(&id))
-        .unwrap_or_else(|| session_info(&id, "Ante session"));
+        .unwrap_or_else(|| session_info(&id, "Ante session", store.current_model()));
     // The route's schema is `{data: Session.Info}` with additionalProperties:false;
     // a bare object makes the client read `.id` off undefined.
     Json(json!({ "data": info }))
@@ -1511,15 +1801,10 @@ async fn session_get(State(store): State<Store>, Path(id): Path<String>) -> Json
 /// `event` field is exactly Ante's `Evt` in serde form, so the fold is the same
 /// shape as the live pump. v1 covers user turns and assistant text.
 fn replay_session(id: &str) -> Vec<Value> {
-    let home = std::env::var_os("ANTE_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
-            home.join(".ante")
-        });
-    let Ok(raw) = std::fs::read_to_string(home.join("sessions").join(id).join("events.jsonl")) else {
+    let Ok(raw) = std::fs::read_to_string(ante_home().join("sessions").join(id).join("events.jsonl")) else {
         return Vec::new();
     };
+    let model = session_meta(id).map(|meta| meta_model(&meta)).unwrap_or_else(active_model);
 
     let mut messages: Vec<Value> = Vec::new();
     let mut ordinal = 0u64;
@@ -1555,7 +1840,7 @@ fn replay_session(id: &str) -> Vec<Value> {
                 "id": id,
                 "type": "assistant",
                 "agent": reported_agent(),
-                "model": { "id": model_for_session().1, "providerID": model_for_session().0 },
+                "model": { "id": model.1, "providerID": model.0 },
                 "content": [],
                 "time": { "created": created },
             })),
@@ -1597,15 +1882,124 @@ async fn session_messages(
     Json(json!({ "data": data, "cursor": {} }))
 }
 
-/// The prompt the user typed. For now the reply is a canned stream: the goal of
-/// this step is to prove the message/event contract with the real TUI before
-/// wiring Ante in behind it.
+/// Hand the oldest queued prompt to Ante. A queued prompt belongs at the turn
+/// boundary, and only the live session can take one — anything else would land
+/// in whichever session the connection happens to be driving.
+async fn flush_queue(store: &Store, session: &str) {
+    if store.ante.busy() || store.ante.live_id().as_deref() != Some(session) {
+        return;
+    }
+    let Some(item) = store.take_head(session) else {
+        return;
+    };
+    let text = item["payload"]["text"].as_str().unwrap_or("").to_string();
+    let inbox_id = item["id"].as_str().unwrap_or("").to_string();
+    let Some(ops) = store.ante.ops.lock().await.clone() else {
+        store.requeue_head(session, item);
+        return;
+    };
+    if let Err(err) = ops.send(ante_sdk::protocol::op_msg(Op::UserInput(text))).await {
+        log_line(&format!("ante: 排队消息发送失败：{err}"));
+        store.requeue_head(session, item);
+        return;
+    }
+    log_line(&format!("ante: 排队消息 {inbox_id} 交给 Ante（回合已结束）"));
+    store.publish_durable(
+        "session.inbox.delivered",
+        json!({ "inboxID": inbox_id, "sessionID": session }),
+        session,
+    );
+}
+
+/// `GET /api/session/{id}/inbox` — what the client queued and we are holding.
+async fn session_inbox(State(store): State<Store>, Path(id): Path<String>) -> Json<Value> {
+    Json(json!({ "data": store.queued(&id) }))
+}
+
+/// `PATCH /api/session/{id}/inbox/{inbox_id}` — steer a queued prompt into the
+/// turn in flight (`{"delivery": "steer"}`) or leave it queued.
+async fn session_inbox_update(
+    State(store): State<Store>,
+    Path((id, inbox_id)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> axum::http::StatusCode {
+    let delivery = body.get("delivery").and_then(|v| v.as_str()).unwrap_or("queue").to_string();
+    let Some(item) = store.queued(&id).into_iter().find(|item| item["id"] == inbox_id.as_str()) else {
+        // Already handed over: the real server answers 409 for that.
+        return axum::http::StatusCode::CONFLICT;
+    };
+    if delivery == "queue" {
+        store.publish_durable(
+            "session.inbox.delivery.changed",
+            json!({ "sessionID": id, "inboxID": inbox_id, "delivery": "queue" }),
+            &id,
+        );
+        return axum::http::StatusCode::NO_CONTENT;
+    }
+    let text = item["payload"]["text"].as_str().unwrap_or("").to_string();
+    let _ = store.take_queued(&id, &inbox_id);
+    let live = store.ante.live_id().as_deref() == Some(id.as_str());
+    match store.ante.ops.lock().await.clone() {
+        Some(ops) => {
+            // Steering only means something in the live session's running turn.
+            let op = if live && store.ante.busy() {
+                log_line("ante: 插嘴（Steer）——把排队的那条并进正在跑的这一轮");
+                Op::Steer(text)
+            } else {
+                log_line("ante: 排队的那条现在交给 Ante（当前没有正在跑的回合）");
+                Op::UserInput(text)
+            };
+            if let Err(err) = ops.send(ante_sdk::protocol::op_msg(op)).await {
+                log_line(&format!("ante: 排队消息插嘴失败：{err}"));
+                store.requeue_head(&id, item);
+                return axum::http::StatusCode::NO_CONTENT;
+            }
+            store.publish_durable(
+                "session.inbox.delivered",
+                json!({ "inboxID": inbox_id, "sessionID": id }),
+                &id,
+            );
+        }
+        None => {
+            store.requeue_head(&id, item);
+            log_line("ante: 与 Ante 未连接，排队消息没送出去");
+        }
+    }
+    axum::http::StatusCode::NO_CONTENT
+}
+
+/// `DELETE /api/session/{id}/inbox/{inbox_id}` — drop a queued prompt. Nothing
+/// to withdraw from Ante: a held prompt was never handed over.
+async fn session_inbox_cancel(
+    State(store): State<Store>,
+    Path((id, inbox_id)): Path<(String, String)>,
+) -> axum::http::StatusCode {
+    if store.take_queued(&id, &inbox_id).is_some() {
+        store.publish_durable(
+            "session.inbox.cancelled",
+            json!({ "sessionID": id, "inboxID": inbox_id }),
+            &id,
+        );
+    }
+    axum::http::StatusCode::NO_CONTENT
+}
+
+/// The prompt the user typed. opencode has two deliveries for it — `steer` (into
+/// the turn in flight, or a new turn when idle) and `queue` (held here until the
+/// turn boundary) — and Ante has the matching ops: `Steer` and `UserInput`.
 async fn session_prompt(
     State(store): State<Store>,
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Json<Value> {
     let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    // `steer` is what the client sends by default: typed while a turn is running
+    // it goes *into* that turn (Ante's own `Ctrl+S`), otherwise it starts one.
+    // `queue` is held by the shim until the turn boundary — see `Store::pending`.
+    let delivery = match body.get("delivery").and_then(|v| v.as_str()) {
+        Some("queue") => "queue",
+        _ => "steer",
+    };
     // The client sends its own message id; reusing it keeps its optimistic copy
     // and the inbox item the same entry instead of rendering the message twice.
     let user_id = body
@@ -1628,13 +2022,22 @@ async fn session_prompt(
         "time": { "created": now_ms() },
         "type": "user",
         "payload": { "text": text, "files": [], "agents": [], "skills": [] },
-        "delivery": {},
+        "delivery": delivery,
     });
     store.publish_durable(
         "session.inbox.enqueued",
         json!({ "inboxID": user_id, "sessionID": id, "item": item }),
         &id,
     );
+    if delivery == "queue" {
+        // Held, not handed over: the client shows it in the queue (no
+        // `delivered`), and it leaves the queue by itself at the turn boundary —
+        // or because the user steered/deleted it.
+        if let Ok(mut queues) = store.pending.lock() {
+            queues.entry(id.clone()).or_default().push(item.clone());
+        }
+        return Json(json!({ "data": item }));
+    }
     store.publish_durable(
         "session.inbox.delivered",
         json!({ "inboxID": user_id, "sessionID": id }),
@@ -1662,48 +2065,95 @@ async fn session_prompt(
     };
 
     let ops = store.ante.ops.lock().await.clone();
+    // Ante drives one session per connection, so a prompt aimed at a session
+    // other than the live one switches it over first. Without this every prompt
+    // landed in whichever session this run happened to open, and the reply was
+    // merely *shown* under the session the TUI was looking at.
+    let switch = store.ante.live_id().as_deref() != Some(id.as_str());
     match ops {
         Some(ops) => {
-            if !store.ante.started.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                let chosen = store.ante.model.lock().ok().and_then(|slot| slot.clone());
-                let (provider, model) = chosen.unwrap_or_else(|| (PROVIDER.into(), MODEL.into()));
-                let request = SessionRequest {
-                    permission_mode: Some(mode),
-                    provider: Some(provider),
-                    model: Some(model),
-                    ..Default::default()
-                };
-                let _ = ops.send(ante_sdk::protocol::op_msg(Op::StartSession(request))).await;
-                // The real server announces the title once; Ante titles from the
-                // first message too, so mirror it here.
-                let title: String = text.chars().take(60).collect();
-                let title = title.trim().to_string();
-                if !title.is_empty() {
-                    store.publish_durable(
-                        "session.renamed",
-                        json!({ "sessionID": id, "title": title }),
-                        &id,
-                    );
+            if switch {
+                // What our own turn will be answered with: Ante replays a
+                // resumed conversation before it gets to this `UserInput`, and
+                // the guard drops that replay until the turn this op id starts.
+                let input = ante_sdk::protocol::op_msg(Op::UserInput(text.clone()));
+                // A session Ante has on disk is a real conversation to resume;
+                // anything else (the id the client just invented) starts fresh.
+                let saved = if session_meta(&id).is_some() { id.parse::<Id>().ok() } else { None };
+                if let Some(session_id) = saved {
+                    store.ante.expect_turn(input.id.to_string());
+                    let op = Op::ResumeSession { session_id, unattended: false };
+                    if let Err(err) = ops.send(ante_sdk::protocol::op_msg(op)).await {
+                        log_line(&format!("ante: 恢复会话 {id} 发送失败：{err}"));
+                    }
+                    // Resume resolves the permission mode from the host's own
+                    // settings, so the TUI's `shift+tab` choice has to be put
+                    // back on the session explicitly.
+                    let update = ante_sdk::protocol::SessionUpdate {
+                        permission_mode: Some(mode),
+                        ..Default::default()
+                    };
+                    let _ = ops.send(ante_sdk::protocol::op_msg(Op::UpdateSession(update))).await;
+                    log_line(&format!("ante: 切到旧会话 {id}（ResumeSession）"));
+                } else {
+                    let chosen = store.ante.model.lock().ok().and_then(|slot| slot.clone());
+                    let (provider, model) = chosen.unwrap_or_else(|| (PROVIDER.into(), MODEL.into()));
+                    let request = SessionRequest {
+                        permission_mode: Some(mode),
+                        provider: Some(provider),
+                        model: Some(model),
+                        ..Default::default()
+                    };
+                    if let Err(err) = ops.send(ante_sdk::protocol::op_msg(Op::StartSession(request))).await {
+                        log_line(&format!("ante: 新建会话发送失败：{err}"));
+                    }
+                    // The real server announces the title once; Ante titles from the
+                    // first message too, so mirror it here.
+                    let title: String = text.chars().take(60).collect();
+                    let title = title.trim().to_string();
+                    if !title.is_empty() {
+                        store.publish_durable(
+                            "session.renamed",
+                            json!({ "sessionID": id, "title": title }),
+                            &id,
+                        );
+                    }
+                }
+                if let Ok(mut live) = store.ante.live.lock() {
+                    *live = Some(id.clone());
+                }
+                if let Err(err) = ops.send(input).await {
+                    log_line(&format!("ante: 消息发送失败：{err}"));
+                }
+            } else if delivery == "steer" && store.ante.busy() {
+                // `Ctrl+S` / plain Enter while a turn is running: Ante's `Steer`
+                // folds the text into that turn instead of queueing it behind.
+                match ops.send(ante_sdk::protocol::op_msg(Op::Steer(text.clone()))).await {
+                    Ok(()) => log_line("ante: 插嘴（Steer）——并进正在跑的这一轮"),
+                    Err(err) => log_line(&format!("ante: 插嘴发送失败：{err}")),
                 }
             } else {
-                // Later prompts may arrive with a different agent.
+                // Same session, nothing to switch: the agent may still have
+                // changed, since `shift+tab` never calls the switch route.
                 let update = ante_sdk::protocol::SessionUpdate {
                     permission_mode: Some(mode),
                     ..Default::default()
                 };
                 let _ = ops.send(ante_sdk::protocol::op_msg(Op::UpdateSession(update))).await;
+                if let Err(err) = ops.send(ante_sdk::protocol::op_msg(Op::UserInput(text.clone()))).await {
+                    log_line(&format!("ante: 消息发送失败：{err}"));
+                }
             }
             if let Ok(mut slot) = store.ante.last_user.lock() {
                 *slot = text.clone();
             }
-            if let Err(err) = ops.send(ante_sdk::protocol::op_msg(Op::UserInput(text.clone()))).await {
-                eprintln!("ante: send failed: {err}");
-            }
         }
-        None => eprintln!("ante: not connected; prompt dropped"),
+        None => log_line("ante: 与 Ante 未连接，这条消息被丢弃（看日志开头的自检那行）"),
     }
+    // A session that just became live may still carry a queue from before.
+    flush_queue(&store, &id).await;
 
-    Json(json!({ "data": { "id": user_id, "sessionID": id, "type": "user", "time": { "created": now_ms() }, "payload": { "text": text }, "delivery": {} } }))
+    Json(json!({ "data": { "id": user_id, "sessionID": id, "type": "user", "time": { "created": now_ms() }, "payload": { "text": text, "files": [], "agents": [], "skills": [] }, "delivery": delivery } }))
 }
 
 /// The server-scoped feed. Frames are `{id, type, data}` and the first one must
@@ -1783,6 +2233,18 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    // Where our own messages go, decided before anything can report a problem:
+    // one-command mode hands the terminal to the TUI, so a file is the only
+    // place they survive being printed. Serve mode keeps them on stdout.
+    let _ = LOG_FILE.set(if args.serve_only {
+        None
+    } else {
+        Some(std::env::temp_dir().join("antex.log"))
+    });
+
+    // Fail loudly here instead of turning into an interface that does nothing.
+    ante_selfcheck().await;
+
     let store = Store::new();
     // Ante is connected lazily at startup; its events feed every opencode
     // session this shim serves.
@@ -1828,7 +2290,11 @@ async fn main() {
         .route("/api/session/{id}/permission", get(session_permissions))
         .route("/api/session/{id}/permission/{request_id}/reply", post(permission_reply))
         .route("/api/permission/request", get(permission_request))
-        .route("/api/session/{id}/inbox", get(bare_empty))
+        .route("/api/session/{id}/inbox", get(session_inbox))
+        .route(
+            "/api/session/{id}/inbox/{inbox_id}",
+            patch(session_inbox_update).delete(session_inbox_cancel),
+        )
         .route("/api/session/{id}/form", get(bare_empty))
         .route("/api/session/{id}/model", post(session_model))
         .route("/api/session/{id}/compact", post(session_compact))
@@ -1870,11 +2336,6 @@ async fn main() {
     };
 
     let port = bound_port;
-    let _ = LOG_FILE.set(if args.serve_only {
-        None
-    } else {
-        Some(std::env::temp_dir().join("antex.log"))
-    });
     if args.serve_only {
         println!("antex 服务已起在 http://127.0.0.1:{port}");
         println!("客户端这样连：opencode2 --server http://127.0.0.1:{port}");

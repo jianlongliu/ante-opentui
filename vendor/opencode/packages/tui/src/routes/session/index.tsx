@@ -216,6 +216,16 @@ export function Session(props: {
       item.delivery === "queue" ? [{ id: item.id, text: item.payload.text, payload: item.payload }] : [],
     ),
   )
+  // The model can spend seconds prefilling before it emits a single token, and a
+  // turn with no content yet draws nothing at all — the transcript just sits
+  // there looking stuck. Say so instead (the web app keeps a Thinking row up for
+  // the same window). Goes away the moment the assistant message exists, and on
+  // any turn that already has content.
+  const awaitingFirstChunk = createMemo(
+    () =>
+      data.session.status(route.sessionID) === "running" &&
+      !messages().some((message) => message.type === "assistant" && !message.time.completed),
+  )
   const [composer, setComposer] = createStore({
     open: false,
     tab: undefined as string | undefined,
@@ -1284,6 +1294,19 @@ export function Session(props: {
       run: openQueuedPrompts,
     },
     {
+      // Ante's own `Ctrl+S`: fold the oldest queued prompt into the running turn
+      // instead of waiting for the turn boundary.
+      title: "Steer queued prompt",
+      id: "queued_prompt.steer",
+      group: "Prompt",
+      enabled: queuedPrompts().length > 0,
+      run: () => {
+        const next = queuedPrompts()[0]
+        if (!next) return
+        void mutatePending("steer", next.id)
+      },
+    },
+    {
       title: "Go to parent session",
       id: "session.parent",
       group: "Session",
@@ -1456,6 +1479,11 @@ export function Session(props: {
               </Show>
             </box>
             <box flexShrink={0}>
+              <Show when={awaitingFirstChunk()}>
+                <box paddingLeft={3}>
+                  <Spinner color={theme.text.muted}>Thinking</Spinner>
+                </box>
+              </Show>
               <Show when={!composer.open && !disabled() && queuedPrompts().length > 0}>
                 <QueuedPromptDock prompts={queuedPrompts()} onOpen={openQueuedPrompts} />
               </Show>
