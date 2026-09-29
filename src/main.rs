@@ -41,7 +41,13 @@ fn default_directory() -> String {
         .or_else(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()))
         .unwrap_or_else(|| ".".to_string())
 }
-const VERSION: &str = "2.0.18";
+/// antex has no release cadence of its own — it follows whatever Ante and
+/// opencode are on — so its version is the day the binary was built.
+const ANTEX_VERSION: &str = env!("ANTEX_VERSION");
+/// The Ante backend's version, read once by the startup self-check. `health`
+/// reports *this* as `version`: the shim stands in for Ante, so the client's
+/// own version number (what it used to answer) said nothing about either end.
+static ANTE_VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// The model Ante is configured with, so the composer shows something real.
 /// This is the fallback for a client that never picked one — it has to be the
 /// catalog's name (provider-scoped), or the first turn comes back as an HTTP
@@ -593,7 +599,12 @@ async fn ante_selfcheck() {
         std::process::exit(1);
     };
     let built = env!("ANTE_SDK_VERSION");
-    match ante_version(&bin).await {
+    let found = ante_version(&bin).await;
+    if let Some(found) = found.as_ref() {
+        // Whatever `health` answers, it answers with this.
+        let _ = ANTE_VERSION.set(found.clone());
+    }
+    match found {
         Some(found) if found != built => {
             let msg = format!(
                 "自检：协议可能对不上——antex 是按 ante-sdk {built} 编的，本机 {} 是 ante {found}。\n\
@@ -1378,7 +1389,12 @@ async fn session_interrupt(State(store): State<Store>, Path(_id): Path<String>) 
 }
 
 async fn health() -> Json<Value> {
-    Json(json!({ "healthy": true, "version": VERSION, "pid": std::process::id() }))
+    Json(json!({
+        "healthy": true,
+        "version": ANTE_VERSION.get().map(String::as_str).unwrap_or("unknown"),
+        "antex": ANTEX_VERSION,
+        "pid": std::process::id(),
+    }))
 }
 
 async fn location_get() -> Json<Value> {

@@ -18,6 +18,24 @@ fn main() {
         "unknown".to_string()
     });
     println!("cargo:rustc-env=ANTE_SDK_VERSION={version}");
+
+    // antex has no release cadence of its own — it follows whatever Ante and
+    // opencode are on — so its version is the day it was built. Compiled in,
+    // not read at runtime: the binary should not claim a different version
+    // tomorrow than it is now.
+    println!("cargo:rustc-env=ANTEX_VERSION={}", build_date());
+}
+
+/// Local `YYYY-MM-DD`. Falls back to `unknown` rather than failing the build.
+fn build_date() -> String {
+    let out = std::process::Command::new("date").arg("+%Y-%m-%d").output();
+    match out {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        _ => {
+            println!("cargo:warning=`date` unavailable; antex version will read as unknown");
+            "unknown".to_string()
+        }
+    }
 }
 
 /// The `version` line of the named `[[package]]` entry.
