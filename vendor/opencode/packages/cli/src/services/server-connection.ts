@@ -32,7 +32,11 @@ export const resolve = Effect.fn("cli.server-connection.resolve")(function* (arg
       try: () => client.server.info({ signal: AbortSignal.timeout(5_000) }),
       catch: (cause) => connectError(endpoint, cause),
     })
-    if (health.version !== OPENCODE_VERSION)
+    // antex (the shim) answers with Ante's own version, so it can never equal
+    // this client's — and it marks itself with an `antex` field. Warning about
+    // that would print a stray line on the user's TUI at every launch.
+    const shim = (health as { antex?: string }).antex !== undefined
+    if (!shim && health.version !== OPENCODE_VERSION)
       process.stderr.write(
         `Warning: Server at ${endpoint.url} has version ${health.version}; this client is ${OPENCODE_VERSION}. Continuing anyway.\n`,
       )

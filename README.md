@@ -7,6 +7,10 @@
 做法是**实现 opencode v2 要求的 server API**，让 `opencode --server <url>` 分辨不出真假；
 opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同「改接口，不改消费者」。
 
+![antex 首页](docs/home.png)
+
+首页（本仓库自编客户端的默认界面）：顶栏是 Ante 面具 + `ANTEX`，composer 下是权限模式与模型，右下角是 `ante <后端版本> · antex <构建日期>`。**这张图由 `script/shot-home.py` 生成**（PTY + pyte 抓屏 → Pango 渲染，可复现）。
+
 ## 它在你系统里的位置
 
 ```
@@ -116,12 +120,13 @@ opencode2 --server http://127.0.0.1:41999     # 终端 B
 ./script/build-tui.sh        # 编本机平台，产物 ~177MB，约 1 分钟
 ```
 
-- 补丁五处，都在 `vendor/opencode/packages/tui/src/`：
-  - `logo.ts` —— 首页大字 logo 换成 Ante 面具 + `ANTEX`；
-  - `component/dialog-model.tsx` —— 模型选择器的条目**永远带供应商**（分组标题 + 过滤时行尾的供应商名）。上游把这一栏压在 `connected()` 后面，而那个判断看的是 integration 连接数；antex 没有 integration 概念、恒假，于是 81 个模型的列表里同名条目完全分不出来。
-  - `config/keybind.ts` + `routes/session/index.tsx` —— 加 `queued_prompt.steer` = **`ctrl+s`**（对齐 Ante 自己的「把排队消息插进正在跑的回合」；上游 v2 没这个键位），命令体复用客户端的 `mutatePending("steer", queuedPrompts()[0].id)`。
-  - `routes/session/index.tsx` —— 首 token 前那段空窗补一行 `⠦ Thinking` 占位（会话 running 且没有任何未完成的助手消息时显示；有内容即撤）。
-  - `feature-plugins/home/footer.tsx` —— 首页**右下角的版本号**改成 `ante <后端版本> · antex <构建日期>`，取自 `/api/info`（`createResource` 拉一次；拉不到才回落到客户端自己的版本）。上游那行画的是 `app.version`＝客户端二进制的版本，既不是 Ante 的也不是 antex 的，而它又是写死在界面里的，所以同样只能改源码。**验证法**：`~/antecode-scratch/tuiprobe/tui_drive.py --cmd "./target/release/antex 41990" --out /tmp/x.txt` 抓首页帧，右下角出 `ante 0.2.5 · antex 2026-09-29`。
+- 补丁六处：
+  - `packages/tui/src/logo.ts` —— 首页大字 logo 换成 Ante 面具 + `ANTEX`；
+  - `packages/tui/src/component/dialog-model.tsx` —— 模型选择器的条目**永远带供应商**（分组标题 + 过滤时行尾的供应商名）。上游把这一栏压在 `connected()` 后面，而那个判断看的是 integration 连接数；antex 没有 integration 概念、恒假，于是 81 个模型的列表里同名条目完全分不出来。
+  - `packages/tui/src/config/keybind.ts` + `routes/session/index.tsx` —— 加 `queued_prompt.steer` = **`ctrl+s`**（对齐 Ante 自己的「把排队消息插进正在跑的回合」；上游 v2 没这个键位），命令体复用客户端的 `mutatePending("steer", queuedPrompts()[0].id)`。
+  - `packages/tui/src/routes/session/index.tsx` —— 首 token 前那段空窗补一行 `⠦ Thinking` 占位（会话 running 且没有任何未完成的助手消息时显示；有内容即撤）。
+  - `packages/tui/src/feature-plugins/home/footer.tsx` —— 首页**右下角的版本号**改成 `ante <后端版本> · antex <构建日期>`，取自 `/api/info`（`createResource` 拉一次；拉不到才回落到客户端自己的版本）。上游那行画的是 `app.version`＝客户端二进制的版本，既不是 Ante 的也不是 antex 的，而它又是写死在界面里的，所以同样只能改源码。**验证法**：`~/antecode-scratch/tuiprobe/tui_drive.py --cmd "./target/release/antex 41990" --out /tmp/x.txt` 抓首页帧，右下角出 `ante 0.2.5 · antex 2026-09-29`。
+  - `packages/cli/src/services/server-connection.ts` —— `--server` 模式下**不再对垫片报版本不匹配**。垫片答的是 Ante 的版本（`0.2.5`）、还带一个 `antex` 字段，跟客户端版本永远不等；上游那行 warning 会直接打在 TUI 首行、常驻不退（截图和日常观感都被它毁掉）。判断改成「带 `antex` 字段就静默」，只有连到真 server 且版本确实不同才警告。
 - 编出来的客户端装在 `~/.local/bin/antex-tui`，**`antex` 默认就用它**（源码模式启动不慢，且底部没有 dev 模式的 `✓ Server ○ UI…` 那行）。
 - **上游更新后**（`git subtree pull`）跑一次 `script/build-tui.sh` 即可；两步合一就是下面那条 `./script/upgrade-upstream.sh`。
 - 想临时切回官方二进制：`ANTEX_CLIENT=opencode2 antex`。
@@ -241,6 +246,7 @@ session.step.started → session.text.started → session.text.delta ×N → ses
 - **肉眼验收要加 `--print-logs --log-level debug`**——客户端抛异常只弹一个小 toast，正文里什么都不显示，「没反应」多半是它。
 - **TUI 自动化验收用 PTY + pyte 探针**：`~/antecode-scratch/tuiprobe/`；本机**没装 tmux**，所以用 `~/antecode-scratch/tuiprobe/tui_drive.py` 驱动——`--send '6:文本\r'` 按时间发键（`\x13`=ctrl+s、`\x18`=leader），`--every` 抓屏写 `--out`（「思考→正文」与 `Ctrl+S` 就是这么验的）。
 - **接口级验证不必进 TUI**：`antex serve PORT` 后直接 `curl`，逐条对着「实现清单」的验证法做。
+- **重新出首页截图**（README 顶部那张）：`uv run --with pyte script/shot-home.py --cmd "./target/release/antex 41994" --out docs/home.png`。它跑 PTY、用 pyte 把屏幕（含 24 位色）还原出来，再交给 ImageMagick 的 Pango 渲染；字体取 ghostty 的 `GoogleSansCode Nerd Font Mono`，底色取 `ghostty +show-config`（TUI 把页面底色留给终端，硬编码就会跟真实观感对不上）。**方块字要贴死**：`-interline-spacing` 默认 `-4`（负值收掉行缝），否则 logo 会出现横纹。**另一个坑**：pyte 的 24 位色是**不带 `#` 的裸十六进制**（`ffffff`），当成颜色名解析会全部落空、整张图退化成单色——看着像「主题没生效」，其实是解析写错了。
 - 垫片自己的开关：`ANTE_SHIM_TRACE=<文件>`（记 Ante 事件全文 + 垫片发布的事件）、`SHIM_PERMISSION_MODE=strict|auto|yolo`、`SHIM_SKIP_EVENTS=`、`SHIM_TOOL_EVENTS=`。
 
 ## 权威出处
@@ -318,7 +324,7 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 ```
 src/                 垫片本体：路由、信封、SSE、会话/消息存储
 build.rs             把编译用的 ante-sdk 版本写进二进制（启动自检要用）
-script/              build-tui.sh（重建客户端）、upgrade-upstream.sh（拉上游 + 重建，一条命令）
+script/              build-tui.sh（重建客户端）、upgrade-upstream.sh（拉上游 + 重建，一条命令）、shot-home.py（把首页渲染成 PNG，README 那张图就是它出的）
 vendor/opencode/     上游 opencode（subtree，v2 分支）——魔改对象
 Cargo.toml           axum + tokio + serde
 ```
