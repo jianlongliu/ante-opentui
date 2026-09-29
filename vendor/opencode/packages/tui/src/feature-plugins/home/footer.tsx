@@ -1,5 +1,5 @@
 import { Plugin } from "@opencode/plugin/tui"
-import { createMemo, Match, Show, Switch } from "solid-js"
+import { createMemo, createResource, Match, Show, Switch } from "solid-js"
 import { useTerminalDimensions } from "@opentui/solid"
 import { usePlugin } from "../../plugin/context"
 import { Slot } from "../../plugin/render"
@@ -74,6 +74,38 @@ function Plugins(props: { context: Plugin.Context }) {
   )
 }
 
+function BackendVersion(props: { context: Plugin.Context }) {
+  const dimensions = useTerminalDimensions()
+  const visibility = createMemo(() => homeFooterVisibility(dimensions().width))
+  // The server behind this TUI *is* the Ante backend, so its `version` is
+  // Ante's own and `antex` is the shim's build date. Upstream prints the
+  // client's own version here, which says nothing about either end.
+  const [info] = createResource(async () => {
+    try {
+      return (await props.context.client.server.info()) as { version?: string; antex?: string }
+    } catch {
+      return undefined
+    }
+  })
+
+  return (
+    <Show when={visibility().version}>
+      <box flexShrink={0}>
+        <Show
+          when={info()}
+          fallback={<text fg={props.context.theme.text.muted}>{props.context.app.version}</text>}
+        >
+          {(value) => (
+            <text fg={props.context.theme.text.muted}>
+              {`ante ${value().version ?? "?"} · antex ${value().antex ?? "?"}`}
+            </text>
+          )}
+        </Show>
+      </box>
+    </Show>
+  )
+}
+
 function View(props: { context: Plugin.Context }) {
   const dimensions = useTerminalDimensions()
   const visibility = createMemo(() => homeFooterVisibility(dimensions().width))
@@ -94,11 +126,7 @@ function View(props: { context: Plugin.Context }) {
         <Plugins context={props.context} />
         <Slot path="home.footer.status" />
         <box flexGrow={1} />
-        <Show when={visibility().version}>
-          <box flexShrink={0}>
-            <text fg={props.context.theme.text.muted}>{props.context.app.version}</text>
-          </box>
-        </Show>
+        <BackendVersion context={props.context} />
       </box>
     </Show>
   )
