@@ -67,6 +67,7 @@ Ante（**你自己装的**：官方脚本装、`ante update` 升级）
 - [x] **命令行参数** —— `[PORT]` / `--port PORT` / `-h|--help`；不认识的参数打印用法并以 2 退出；**端口被占给明确提示、不再 panic**
 - [x] **`/compact` 压缩** —— `POST …/compact` → Ante 的 **`Op::Compact`**（真压缩，不是假动作）。**Ante 不用 `CompactStart/CompactEnd` 报进度**（那只在真做了缩减时才发），日常走 **`InfoBlockStart`/`InfoBlockAppend`（id 以 `compact` 开头）** → 映射成 `compaction.started/delta/ended`；另补 **inbox 握手**（`enqueued`+`delivered`），否则客户端把队列项一直挂在底部不落正文。实测：Ante 回「Context is already within budget; nothing to compact.」，UI 出 `Compaction` 块
 - [x] **客户端实际调用的接口全覆盖** —— 对照一次完整使用过程收集到的 **32 条请求**，补齐了原先漏掉的 9 个：`/api/form`、`/api/shell`（GET+POST）、`/api/reference`、`/api/integration`、`/api/project`（**裸数组**，同 `/api/config`）、`/api/mcp/resource`（`{resources,templates}`）、`/api/vcs/base`（`data: null`）、`/api/vcs/diff`、`/api/experimental/session/{id}/terminal`（`{data}`）。Ante 没有这些数据，**但形状严格照 schema**——原先落到通用 fallback，它多带一个 `info` 字段，恰好违反这些路由的 `additionalProperties:false`，客户端会把整个响应校验掉、面板**静默为空**
+- [x] **Herdr 上报** —— 跑在 herdr pane 里时由**垫片自己**上报 pane 状态（`idle`/`working`/`blocked`）与 Ante 会话 id，压过 herdr 内置的「把客户端认成 opencode」的检测。见「Herdr 集成」
 - [x] **事件流（SSE）** —— `{id, type, created, data}` 帧，首帧 `server.connected`
 
 ### 未完成项的验证法
@@ -165,6 +166,24 @@ Cargo 依赖（`Cargo.lock` 实际解析值，非 `Cargo.toml` 的约束范围�
 - **官方那份别删**：`~/.opencode/bin` 是官方脚本的安装位置（删过，害得用户的 v2 消失）。
 - 升级官方用 `opencode upgrade`（自带）；我们那份随 `git subtree pull` + `./script/build-tui.sh` 跟上。
 注意：omarchy 的 `stable-mirror` 冻结在 2026-09-08，pacman 看不到 v2。
+
+## Herdr 集成（本机 herdr 0.9.1）
+
+本机在 **herdr**（terminal workspace manager）里跑 antex。herdr 自带 opencode 识别，但那条路看到的是**客户端**（把 pane 报成 `opencode`），状态靠屏幕内容猜；垫片自己上报更准，也是 Herdr 官方给 agent 作者的路子——<https://herdr.dev/docs/add-herdr-support>，不用等上游发包。
+
+| 项 | 做法 |
+| --- | --- |
+| 门控 | 仅当 `HERDR_ENV=1` 且 `HERDR_PANE_ID`／`HERDR_BIN_PATH` 都在；不在 herdr 里跑则全程无操作 |
+| 上报 | `--source antex`、`--agent Ante`（用户看到的名字；客户端只是个皮） |
+| 状态映射 | Ante 连上 → `idle`；`Evt::TurnStart` → `working`；`Evt::TurnEnd` → `idle`；`TurnPause{Approval}` → `blocked`（`--message` 写「等待批准：工具名」） |
+| 会话 | 切到别的会话时补一条 `idle`，带 `--agent-session-id <Ante 会话 id>`；herdr 对「跑完一轮的 idle」显示为 `done`（它自己的完成态） |
+| `--seq` | 毫秒时间戳，且只增不减（同毫秒也严格递增）——否则 herdr 丢这条上报 |
+| 子进程 | stdout/stderr 全丢、3 秒超时、失败静默：TUI 占着终端，child 往里写会糊屏 |
+| 退出 | 默认模式下退出前发 `pane release-agent`；`serve` 模式被 Ctrl+C 杀时靠 herdr 兜底（pane 回到 shell 即清空） |
+
+**两个本版限制**（不是没写，是上游没有）：`report-agent -- <resume命令>` 要 herdr **0.10.0**（本机 0.9.1 里连这个参数都没有），且 antex 也没有「按会话 id 直接开」的入口，故不报 resume；`--message` 在 0.9.1 的 `pane get` 里不落地（发了不报错，留着待上游）。
+
+**验收（不必进 TUI）**：`herdr tab create` 造个测试 tab → `herdr pane run <pane> "antex serve 41999"` → `herdr agent list` 出现 `Ante / idle`；发一条 prompt 变 `working`、跑完变 `done`；`SHIM_PERMISSION_MODE=strict` 下拦到危险命令变 `blocked`。测完 `herdr tab close <tab>`。**旧版垫片跑的 pane 仍显示 `opencode`**（那是 herdr 内置检测），换新二进制重开即变 `Ante`。
 
 ## v2 API 约定（实测）
 

@@ -659,6 +659,125 @@ fn client_executable() -> std::path::PathBuf {
     std::path::PathBuf::from("opencode2")
 }
 
+/// Herdr integration: an agent reporting its own pane state, Herdr's official
+/// route for agents whose vendor ships the integration —
+/// <https://herdr.dev/docs/add-herdr-support>.
+///
+/// The shim is the right place for it: it already sees a turn start, end, or
+/// stop for approval, so `working` / `idle` / `blocked` needs no guessing at
+/// what the TUI happens to be drawing. Outside a Herdr pane (`HERDR_ENV`
+/// unset) every call below does nothing. Herdr's built-in detection otherwise
+/// sees the *client* — it reports the TUI as `opencode`.
+mod herdr {
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    /// What the sidebar shows. The agent is Ante; the TUI is only its face.
+    const AGENT: &str = "Ante";
+    /// Identifies this integration. Stable, and never `herdr:`-prefixed —
+    /// that prefix is Herdr's own integrations.
+    const SOURCE: &str = "antex";
+
+    struct Reporter {
+        bin: PathBuf,
+        pane: String,
+        /// Herdr drops a report whose number is not above the last it accepted,
+        /// so this only ever moves forward.
+        seq: AtomicU64,
+    }
+
+    /// `Some` only inside a Herdr pane; set once by [`init`].
+    static REPORTER: OnceLock<Option<Reporter>> = OnceLock::new();
+
+    /// `--seq` only has to grow; a wall-clock stamp keeps it ahead of anything
+    /// Herdr accepted from an earlier run of this agent in the same pane.
+    fn stamp() -> u64 {
+        super::now_ms().max(0) as u64
+    }
+
+    pub fn init() {
+        let _ = REPORTER.set(Reporter::from_env());
+    }
+
+    impl Reporter {
+        fn from_env() -> Option<Self> {
+            // The pane's process *is* this one (`antex` runs the TUI as its
+            // child), so Herdr's variables arrive here intact.
+            if std::env::var("HERDR_ENV").ok()? != "1" {
+                return None;
+            }
+            Some(Self {
+                bin: PathBuf::from(std::env::var_os("HERDR_BIN_PATH")?),
+                pane: std::env::var("HERDR_PANE_ID").ok()?,
+                seq: AtomicU64::new(stamp()),
+            })
+        }
+
+        fn next_seq(&self) -> u64 {
+            let mut last = self.seq.load(Ordering::SeqCst);
+            loop {
+                let next = last.max(stamp()) + 1;
+                match self.seq.compare_exchange(last, next, Ordering::SeqCst, Ordering::SeqCst) {
+                    Ok(_) => return next,
+                    Err(observed) => last = observed,
+                }
+            }
+        }
+
+        fn command(&self, subcommand: &str) -> tokio::process::Command {
+            let mut cmd = tokio::process::Command::new(&self.bin);
+            cmd.arg("pane")
+                .arg(subcommand)
+                .arg(&self.pane)
+                .arg("--source")
+                .arg(SOURCE)
+                .arg("--agent")
+                .arg(AGENT)
+                .arg("--seq")
+                .arg(self.next_seq().to_string());
+            // The TUI owns the terminal: a child writing to it would corrupt
+            // the screen. Nothing here is worth showing anyway.
+            cmd.stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true);
+            cmd
+        }
+    }
+
+    /// Fire-and-forget, on purpose: reporting must never slow a turn down, and
+    /// a failure is not worth surfacing — outside Herdr nobody is listening,
+    /// and inside it Herdr clears the pane on its own once the shell is back.
+    pub fn report(state: &str, message: Option<&str>, session: Option<&str>) {
+        let Some(reporter) = REPORTER.get().and_then(Option::as_ref) else {
+            return;
+        };
+        let mut cmd = reporter.command("report-agent");
+        cmd.arg("--state").arg(state);
+        if let Some(message) = message {
+            cmd.arg("--message").arg(message);
+        }
+        if let Some(session) = session {
+            cmd.arg("--agent-session-id").arg(session);
+        }
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(Duration::from_secs(3), cmd.status()).await;
+        });
+    }
+
+    /// Hand the pane back on the way out; the timeout keeps a wedged Herdr from
+    /// holding up our exit.
+    pub async fn release() {
+        let Some(reporter) = REPORTER.get().and_then(Option::as_ref) else {
+            return;
+        };
+        let mut cmd = reporter.command("release-agent");
+        let _ = tokio::time::timeout(Duration::from_secs(2), cmd.status()).await;
+    }
+}
+
 async fn spawn_ante(store: Store) {
     let endpoint: ante_sdk::Endpoint = match "stdio".parse() {
         Ok(endpoint) => endpoint,
@@ -685,6 +804,9 @@ async fn spawn_ante(store: Store) {
     };
     let (ops, mut rx) = client.into_parts();
     *store.ante.ops.lock().await = Some(ops);
+    // Ante is up and waiting for input; that is what `idle` means here. The
+    // session id lands with the first state change inside a session.
+    herdr::report("idle", None, None);
 
     // A turn is made of steps (one model call each): Ante starts a step, may
     // call tools, then starts another. opencode models each step as its own
@@ -711,6 +833,8 @@ async fn spawn_ante(store: Store) {
     let mut tokens_out = 0u32;
     let mut compact_block: Option<String> = None;
     let mut compact_text = String::new();
+    // The session Herdr was last told about, so a switch is reported once.
+    let mut herdr_session: Option<String> = None;
 
     while let Some(msg) = rx.recv().await {
         trace_ante(&msg.event);
@@ -722,6 +846,13 @@ async fn spawn_ante(store: Store) {
         let Some(session) = store.ante.active.lock().ok().and_then(|s| s.clone()) else {
             continue;
         };
+        // A switch to another session is worth telling Herdr about on its own:
+        // otherwise it only learns the id when a turn happens to run. `idle`
+        // is right, because the point of a switch is to sit ready for input.
+        if herdr_session.as_deref() != Some(session.as_str()) {
+            herdr_session = Some(session.clone());
+            herdr::report("idle", None, Some(&session));
+        }
         // Open a step (a new assistant message) on demand.
         macro_rules! ensure_step {
             () => {
@@ -812,6 +943,7 @@ async fn spawn_ante(store: Store) {
             Evt::TurnStart { .. } => {
                 step_open = false;
                 store.ante.set_busy(true);
+                herdr::report("working", None, Some(&session));
                 store.publish_durable(
                     "session.execution.started",
                     json!({ "sessionID": session }),
@@ -1057,6 +1189,8 @@ async fn spawn_ante(store: Store) {
             }
             Evt::TurnEnd { status, .. } => {
                 let failed = matches!(status, ante_sdk::protocol::TurnEndStatus::Error { .. });
+                // The turn is over either way — the TUI is taking input again.
+                herdr::report("idle", None, Some(&session));
                 // A turn can end on thinking alone (interrupted, or a step that
                 // never answered); the block must not be left open.
                 close_reasoning!();
@@ -1131,6 +1265,12 @@ async fn spawn_ante(store: Store) {
             } => {
                 let request_id = uid("per");
                 let first = tools.first();
+                // `blocked`: the turn is waiting on the user, which is exactly
+                // what Herdr wants to notify about and can wait on.
+                let waiting = format!(
+                    "等待批准：{}",
+                    tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>().join("、")
+                );
                 let payload = json!({
                     "id": request_id,
                     "sessionID": session,
@@ -1145,6 +1285,7 @@ async fn spawn_ante(store: Store) {
                     tools,
                 });
                 store.publish("permission.asked", payload);
+                herdr::report("blocked", Some(&waiting), Some(&session));
             }
             _ => {}
         }
@@ -2265,6 +2406,11 @@ async fn main() {
         Some(std::env::temp_dir().join("antex.log"))
     });
 
+    // Inside a Herdr pane, report what this pane's agent is doing; elsewhere
+    // this is inert. Read here so a later failure still shows up as the pane
+    // being `Ante` rather than the client's name.
+    herdr::init();
+
     // Fail loudly here instead of turning into an interface that does nothing.
     ante_selfcheck().await;
 
@@ -2387,10 +2533,16 @@ async fn main() {
         .status()
     {
         // The TUI owns the terminal; when it exits, so do we.
-        Ok(status) => std::process::exit(status.code().unwrap_or(0)),
+        Ok(status) => {
+            // Hand the pane back before we go. Herdr would clear it anyway once
+            // the shell is back, but that takes a second or two.
+            herdr::release().await;
+            std::process::exit(status.code().unwrap_or(0))
+        }
         Err(err) => {
             eprintln!("起不了 opencode 客户端（{}）：{err}", client.display());
             eprintln!("用 ANTEX_CLIENT 指定它的路径；或只起服务：antex serve {port}");
+            herdr::release().await;
             std::process::exit(1);
         }
     }
