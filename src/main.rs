@@ -32,6 +32,9 @@ use futures::stream::{self, Stream, StreamExt};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
+/// Pasted images: opencode's inline `data:` URL → Ante's `@path` mention.
+mod attachments;
+
 /// Where the shim settles a request when the client does not say. The client
 /// normally passes `location[directory]` on every call, so this is only a
 /// fallback — and it is derived at runtime, not baked in.
@@ -227,6 +230,12 @@ struct Ante {
     /// A turn is running. Decides between handing text to Ante as a queued input
     /// and steering it into the turn already in flight.
     busy: Arc<std::sync::atomic::AtomicBool>,
+    /// The archive name Ante gave each session, keyed by the id the *client*
+    /// used. Ante mints its own id at `StartSession` and never reports it in
+    /// response, so `Evt::SessionStart` is the only place the pair shows up —
+    /// without it a delete aimed at a session the client just created names no
+    /// directory at all.
+    archives: Arc<Mutex<HashMap<String, String>>>,
 }
 
 /// An Ante turn paused for approval, held until the TUI answers.
@@ -253,6 +262,22 @@ impl Ante {
             model: Arc::new(Mutex::new(None)),
             last_user: Arc::new(Mutex::new(String::new())),
             busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            archives: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Ante's archive name for a session the client knows under another id, or
+    /// the id itself when they agree.
+    fn archive_of(&self, id: &str) -> Option<String> {
+        if stored_session(id) {
+            return Some(id.to_string());
+        }
+        self.archives.lock().ok()?.get(id).cloned().filter(|name| stored_session(name))
+    }
+
+    fn remember_archive(&self, client_id: &str, archive: String) {
+        if let Ok(mut archives) = self.archives.lock() {
+            archives.insert(client_id.to_string(), archive);
         }
     }
 
@@ -321,6 +346,17 @@ struct Store {
     /// withdraw a queued input, so holding them here is also what makes the
     /// queue's delete/steer honest.
     pending: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    /// Prompts Ante has taken but the model has not read yet, by session.
+    /// `Evt::UserInput` only means Ante accepted the text — the fold happens at
+    /// the *next* step — so `delivered` waits for that step. The client keeps
+    /// drawing the marker until then, which is the whole point: "did the model
+    /// see what I just said" is the question being answered.
+    acked: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    /// The text actually handed to Ante, per held prompt. The client's copy is
+    /// what the user typed; ours carries the `@` mentions staged for pasted
+    /// images, and Ante echoes *that* back — plus the folder listing it loaded
+    /// for the mention — so acknowledging a prompt has to compare against this.
+    sent: Arc<Mutex<HashMap<String, String>>>,
     /// Frames fan out to every connected `/api/event` feed.
     events: broadcast::Sender<Value>,
 }
@@ -332,6 +368,8 @@ impl Store {
             sessions: Arc::new(Mutex::new(Vec::new())),
             messages: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            acked: Arc::new(Mutex::new(HashMap::new())),
+            sent: Arc::new(Mutex::new(HashMap::new())),
             events,
             ante: Ante::new(),
         }
@@ -342,7 +380,29 @@ impl Store {
         let mut queues = self.pending.lock().ok()?;
         let queue = queues.get_mut(session)?;
         let position = queue.iter().position(|item| item["id"] == inbox_id)?;
-        Some(queue.remove(position))
+        let item = queue.remove(position);
+        drop(queues);
+        self.forget_sent(inbox_id);
+        Some(item)
+    }
+
+    /// What Ante will be handed for this prompt: the text we staged, which is
+    /// the user's own plus a mention per pasted image. `None` for a prompt we
+    /// never staged, which the caller reads off the payload instead.
+    fn sent_text(&self, inbox_id: &str) -> Option<String> {
+        self.sent.lock().ok()?.get(inbox_id).cloned()
+    }
+
+    fn remember_sent(&self, inbox_id: &str, text: &str) {
+        if let Ok(mut sent) = self.sent.lock() {
+            sent.insert(inbox_id.to_string(), text.to_string());
+        }
+    }
+
+    fn forget_sent(&self, inbox_id: &str) {
+        if let Ok(mut sent) = self.sent.lock() {
+            sent.remove(inbox_id);
+        }
     }
 
     fn queued(&self, session: &str) -> Vec<Value> {
@@ -353,21 +413,100 @@ impl Store {
             .unwrap_or_default()
     }
 
-    /// The oldest queued prompt, taken off the queue. `None` when empty.
-    fn take_head(&self, session: &str) -> Option<Value> {
-        let mut queues = self.pending.lock().ok()?;
-        let queue = queues.get_mut(session)?;
-        if queue.is_empty() {
-            return None;
+    /// Re-label a held prompt. Steering one does not deliver it — it moves it from
+    /// the queue to Ante's inbox, and the pump clears it when Ante says it took it.
+    fn set_delivery(&self, session: &str, inbox_id: &str, delivery: &str) {
+        if let Ok(mut queues) = self.pending.lock()
+            && let Some(queue) = queues.get_mut(session)
+            && let Some(item) = queue.iter_mut().find(|item| item["id"] == inbox_id)
+        {
+            item["delivery"] = json!(delivery);
         }
-        Some(queue.remove(0))
     }
 
-    /// Put back an item that could not be handed over.
-    fn requeue_head(&self, session: &str, item: Value) {
-        if let Ok(mut queues) = self.pending.lock() {
-            queues.entry(session.to_string()).or_default().insert(0, item);
+    /// The oldest prompt the client *queued*, relabelled `steer`: it is being
+    /// handed to Ante now, so it must stop looking queued (a later turn boundary
+    /// must not offer the same text again) without being called delivered — the
+    /// model only reads it at the next step. The text is the staged one, since
+    /// that is what has to reach Ante; `None` when nothing is queued.
+    fn steer_head(&self, session: &str) -> Option<(String, String)> {
+        let mut queues = self.pending.lock().ok()?;
+        let queue = queues.get_mut(session)?;
+        let item = queue.iter_mut().find(|item| item["delivery"] == "queue")?;
+        item["delivery"] = json!("steer");
+        let id = item["id"].as_str()?.to_string();
+        let display = item["payload"]["text"].as_str().unwrap_or("").to_string();
+        Some((id.clone(), self.sent_text(&id).unwrap_or(display)))
+    }
+
+    /// Ante took this text. Remember which held prompt it was and leave it held:
+    /// the model has not read it yet, and the next step boundary is when it will.
+    fn ack_text(&self, session: &str, echoed: &str) -> Option<String> {
+        // What Ante echoes is the text we sent, with whatever it loaded for a
+        // mention appended — so a staged prompt comes back longer than it went.
+        let stripped = attachments::strip_expansion(echoed);
+        let id = {
+            let queues = self.pending.lock().ok()?;
+            queues
+                .get(session)?
+                .iter()
+                .find(|item| {
+                    let id = item["id"].as_str().unwrap_or("");
+                    let display = item["payload"]["text"].as_str().unwrap_or("");
+                    let staged = self.sent_text(id);
+                    let sent = staged.as_deref().unwrap_or(display);
+                    sent == echoed || sent == stripped || stripped.starts_with(sent)
+                })?["id"]
+                .as_str()?
+                .to_string()
+        };
+        if let Ok(mut acked) = self.acked.lock() {
+            acked.entry(session.to_string()).or_default().push(id.clone());
         }
+        Some(id)
+    }
+
+    /// Prompts whose step boundary has arrived (or whose turn is over), cleared
+    /// out so the caller can publish `delivered` for them.
+    fn take_acked(&self, session: &str) -> Vec<String> {
+        let Ok(mut acked) = self.acked.lock() else {
+            return Vec::new();
+        };
+        let mut ids = acked.remove(session).unwrap_or_default();
+        ids.sort();
+        ids.dedup();
+        for id in &ids {
+            self.forget_sent(id);
+        }
+        ids
+    }
+
+    /// The steered prompts still held, taken off the queue; queued ones stay for
+    /// `flush_queue`. Called at the turn boundary — a steer Ante never reported
+    /// has no step left to fold into, and a marker that stays on for good would
+    /// be worse than the rare prompt a turn genuinely dropped.
+    fn take_steers(&self, session: &str) -> Vec<Value> {
+        let Ok(mut queues) = self.pending.lock() else {
+            return Vec::new();
+        };
+        let Some(queue) = queues.get_mut(session) else {
+            return Vec::new();
+        };
+        let mut steers = Vec::new();
+        queue.retain(|item| {
+            if item["delivery"] == "steer" {
+                steers.push(item.clone());
+                return false;
+            }
+            true
+        });
+        drop(queues);
+        for item in &steers {
+            if let Some(id) = item["id"].as_str() {
+                self.forget_sent(id);
+            }
+        }
+        steers
     }
 
     /// Ephemeral event: no durable envelope.
@@ -883,6 +1022,16 @@ async fn spawn_ante(store: Store) {
                         }),
                         &session,
                     );
+                    // A step is the boundary Ante folds accepted prompts into, so
+                    // anything it took before this one is being read now.
+                    for inbox_id in store.take_acked(&session) {
+                        log_line(&format!("ante: 消息 {inbox_id} 送达（模型开始读）"));
+                        store.publish_durable(
+                            "session.inbox.delivered",
+                            json!({ "inboxID": inbox_id, "sessionID": session }),
+                            &session,
+                        );
+                    }
                 }
             };
         }
@@ -940,6 +1089,28 @@ async fn spawn_ante(store: Store) {
             };
         }
         match msg.event {
+            // The client named its session; Ante named the archive it writes to.
+            // This is the one event that carries Ante's id, so remember the pair
+            // while the client's id is the active one.
+            Evt::SessionStart(info) => {
+                if let Some(client) = store.ante.active.lock().ok().and_then(|slot| slot.clone()) {
+                    let archive = info.session_id.to_string();
+                    if archive != client {
+                        log_line(&format!("ante: 会话 {client} 的存档是 {archive}"));
+                        store.ante.remember_archive(&client, archive);
+                    }
+                }
+            }
+            // Ante took an input. It is *not* delivered yet: `Op::UserInput` and
+            // `Op::Steer` only offer the text, and the model reads it at the step
+            // that starts next — which is when the pump publishes `delivered`.
+            // Until then the client keeps the prompt marked as not delivered,
+            // which is exactly the question a steered message raises.
+            Evt::UserInput(text) => {
+                if let Some(inbox_id) = store.ack_text(&session, &text) {
+                    log_line(&format!("ante: 消息 {inbox_id} 已被 Ante 收下，等下一步"));
+                }
+            }
             Evt::TurnStart { .. } => {
                 step_open = false;
                 store.ante.set_busy(true);
@@ -1253,8 +1424,27 @@ async fn spawn_ante(store: Store) {
                     },
                     &session,
                 );
-                // The turn is over: a prompt the client queued belongs now.
+                // The turn is over: a prompt the client queued belongs now, and a
+                // steer Ante never reported is past the boundary it was waiting
+                // for, so it stops being "pending" either way.
                 store.ante.set_busy(false);
+                let mut settled = store.take_acked(&session);
+                settled.extend(
+                    store
+                        .take_steers(&session)
+                        .iter()
+                        .filter_map(|item| item["id"].as_str().map(str::to_string)),
+                );
+                settled.sort();
+                settled.dedup();
+                for inbox_id in settled {
+                    log_line(&format!("ante: 回合结束时 {inbox_id} 仍未送达，按已送达处理"));
+                    store.publish_durable(
+                        "session.inbox.delivered",
+                        json!({ "inboxID": inbox_id, "sessionID": session }),
+                        &session,
+                    );
+                }
                 flush_queue(&store, &session).await;
             }
             // Ante pauses the turn for a decision; the TUI shows this as a
@@ -1782,43 +1972,114 @@ async fn active_session() -> Json<Value> {
     Json(json!({ "data": {} }))
 }
 
-/// Ante keeps its session metadata on disk; opencode wants a session list, so
-/// this reads that directory and maps it into `Session.Info`.
+/// When a session started and what was first asked, read off its event log.
+///
+/// `meta.json` is Ante's own summary and Ante writes it when a turn *ends* — so a
+/// session that never finished one (paused on a question, then the process was
+/// killed) has `events.jsonl` and nothing else. Skipping those directories is why
+/// such a session reads as deleted when nothing touched it; the log carries the
+/// same two facts.
+fn events_head(id: &str) -> Option<(i64, String)> {
+    let raw = std::fs::read_to_string(ante_home().join("sessions").join(id).join("events.jsonl")).ok()?;
+    let mut created = None;
+    let mut title = None;
+    for line in raw.lines() {
+        let Ok(wrapper) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if created.is_none() {
+            created = wrapper
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+                .map(|when| when.timestamp_millis());
+        }
+        if title.is_none() {
+            title = wrapper
+                .get("event")
+                .and_then(|event| event.get("UserInput"))
+                .and_then(|v| v.as_str())
+                .map(|text| {
+                    // The log keeps the staged mentions and Ante's expansion of
+                    // them; a title is the message, not the paths.
+                    let (shown, _) = attachments::from_log(text);
+                    let shown = if shown.trim().is_empty() { text.to_string() } else { shown };
+                    short(&shown.replace(['\n', '\r'], " "), 60)
+                });
+        }
+        if created.is_some() && title.is_some() {
+            break;
+        }
+    }
+    Some((created.unwrap_or_else(now_ms), title.unwrap_or_else(|| "untitled".into())))
+}
+
+/// Whether Ante has this session on disk. `meta.json` is the stricter test and
+/// the wrong one: it only appears at `TurnEnd`, so a session killed mid-turn has
+/// its log and no summary — and treating that as "not a real session" both hides
+/// it from the picker and makes the next prompt start a *fresh* Ante session
+/// instead of continuing it.
+fn stored_session(id: &str) -> bool {
+    safe_id(id) && ante_home().join("sessions").join(id).is_dir()
+}
+
+/// Session ids are a single path component. Anything else (a slash, `..`) would
+/// let a request name a directory outside `~/.ante/sessions`.
+fn safe_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Ante keeps its sessions on disk; opencode wants a session list, so this reads
+/// that directory and maps it into `Session.Info`.
 fn ante_sessions() -> Vec<Value> {
-    let home = std::env::var_os("ANTE_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
-            home.join(".ante")
-        });
-    let Ok(entries) = std::fs::read_dir(home.join("sessions")) else {
+    let Ok(entries) = std::fs::read_dir(ante_home().join("sessions")) else {
         return Vec::new();
     };
 
     let mut sessions: Vec<(i64, Value)> = entries
         .flatten()
         .filter_map(|entry| {
-            let raw = std::fs::read_to_string(entry.path().join("meta.json")).ok()?;
-            let meta: Value = serde_json::from_str(&raw).ok()?;
-            let id = meta.get("id")?.as_str()?.to_string();
-            let created = meta
-                .get("started_time")
+            let dir = entry.file_name().to_string_lossy().into_owned();
+            let meta = session_meta(&dir);
+            let (created, title, tokens, model, provider) = match meta.as_ref() {
+                Some(meta) => {
+                    let created = meta
+                        .get("started_time")
+                        .and_then(|v| v.as_str())
+                        .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+                        .map(|when| when.timestamp_millis())
+                        .unwrap_or_else(now_ms);
+                    let title = meta
+                        .get("first_user_message")
+                        .and_then(|v| v.as_str())
+                        .map(|text| short(&text.replace(['\n', '\r'], " "), 60))
+                        .unwrap_or_else(|| "untitled".into());
+                    let usage = meta.get("usage").cloned().unwrap_or_else(|| json!({}));
+                    let tokens = tokens_json(
+                        usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                        usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                    );
+                    let model = meta.get("model").and_then(|v| v.as_str()).unwrap_or(MODEL).to_string();
+                    let provider = meta.get("provider").and_then(|v| v.as_str()).unwrap_or(PROVIDER).to_string();
+                    (created, title, tokens, model, provider)
+                }
+                // No summary yet: the session is still real. Its own turn never
+                // ended, so the model has to come from what Ante is configured
+                // on now — the log does not record it.
+                None => {
+                    let (created, title) = events_head(&dir)?;
+                    let (provider, model) = active_model();
+                    (created, title, tokens_json(0, 0), model, provider)
+                }
+            };
+            let id = meta
+                .as_ref()
+                .and_then(|meta| meta.get("id"))
                 .and_then(|v| v.as_str())
-                .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
-                .map(|when| when.timestamp_millis())
-                .unwrap_or_else(now_ms);
-            let title = meta
-                .get("first_user_message")
-                .and_then(|v| v.as_str())
-                .map(|text| short(&text.replace(['\n', '\r'], " "), 60))
-                .unwrap_or_else(|| "untitled".into());
-            let usage = meta.get("usage").cloned().unwrap_or_else(|| json!({}));
-            let tokens = tokens_json(
-                usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-            );
-            let model = meta.get("model").and_then(|v| v.as_str()).unwrap_or(MODEL);
-            let provider = meta.get("provider").and_then(|v| v.as_str()).unwrap_or(PROVIDER);
+                .map(str::to_string)
+                .unwrap_or_else(|| dir.clone());
             let info = json!({
                 "id": id,
                 "projectID": "prj_shim",
@@ -1840,6 +2101,63 @@ fn ante_sessions() -> Vec<Value> {
     // Newest first, which is the order the picker shows.
     sessions.sort_by(|a, b| b.0.cmp(&a.0));
     sessions.into_iter().map(|(_, info)| info).collect()
+}
+
+/// `DELETE /api/session/{id}` — what `ctrl+d` (pressed twice) in the sessions
+/// picker calls. The archive is Ante's, so removing the directory is what makes
+/// the delete real for every front end rather than only hiding the row here.
+async fn session_delete(State(store): State<Store>, Path(id): Path<String>) -> Response {
+    if !safe_id(&id) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({ "message": format!("不认识的会话 id：{id}") })),
+        )
+            .into_response();
+    }
+    // The client's own new sessions carry the id *it* invented, while the
+    // archive on disk is named after Ante's id; `SessionStart` gave us the pair.
+    let Some(archive) = store.ante.archive_of(&id) else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({ "message": format!("没有 {id} 的会话存档") })),
+        )
+            .into_response();
+    };
+    let dir = ante_home().join("sessions").join(&archive);
+    // Ante appends to the log while a turn runs; pulling the directory out from
+    // under the live turn would leave it writing into a path that is gone.
+    if store.ante.busy() && store.ante.live_id().as_deref() == Some(id.as_str()) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({ "message": "这个会话正在跑，先中断（Esc）再删" })),
+        )
+            .into_response();
+    }
+    if let Err(err) = std::fs::remove_dir_all(&dir) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({ "message": format!("删不掉 {id}：{err}") })),
+        )
+            .into_response();
+    }
+    if let Ok(mut sessions) = store.sessions.lock() {
+        sessions.retain(|session| session["id"] != id.as_str() && session["id"] != archive.as_str());
+    }
+    let _ = store.messages.lock().map(|mut messages| messages.remove(&id));
+    let _ = store.pending.lock().map(|mut queues| queues.remove(&id));
+    if let Ok(mut archives) = store.ante.archives.lock() {
+        archives.retain(|client, name| client != &id && name != &archive);
+    }
+    // The next prompt for this id has to resolve from scratch: the archive it
+    // would have resumed is the one just removed.
+    if store.ante.live_id().as_deref() == Some(id.as_str())
+        && let Ok(mut live) = store.ante.live.lock()
+    {
+        *live = None;
+    }
+    log_line(&format!("session: 删除会话 {id}（存档 {archive}，即 ~/.ante/sessions/{archive}/）"));
+    store.publish_durable("session.deleted", json!({ "sessionID": id }), &id);
+    axum::http::StatusCode::NO_CONTENT.into_response()
 }
 
 async fn sessions_list() -> Json<Value> {
@@ -1991,15 +2309,21 @@ fn replay_session(id: &str) -> Vec<Value> {
         ordinal += 1;
         let id = format!("msg_{:016x}{:04x}", created as u64, ordinal);
         match event {
-            Evt::UserInput(text) => messages.push(json!({
-                "id": id,
-                "type": "user",
-                "text": text,
-                "files": [],
-                "agents": [],
-                "skills": [],
-                "time": { "created": created },
-            })),
+            Evt::UserInput(recorded) => {
+                // A message Ante recorded carries the mentions staged for its
+                // pasted images (plus the folder listing Ante loaded for them):
+                // the transcript wants the message back, with the images.
+                let (text, files) = attachments::from_log(&recorded);
+                messages.push(json!({
+                    "id": id,
+                    "type": "user",
+                    "text": text,
+                    "files": files,
+                    "agents": [],
+                    "skills": [],
+                    "time": { "created": created },
+                }))
+            }
             Evt::TurnStart { .. } => messages.push(json!({
                 "id": id,
                 "type": "assistant",
@@ -2053,26 +2377,19 @@ async fn flush_queue(store: &Store, session: &str) {
     if store.ante.busy() || store.ante.live_id().as_deref() != Some(session) {
         return;
     }
-    let Some(item) = store.take_head(session) else {
+    let Some((inbox_id, text)) = store.steer_head(session) else {
         return;
     };
-    let text = item["payload"]["text"].as_str().unwrap_or("").to_string();
-    let inbox_id = item["id"].as_str().unwrap_or("").to_string();
     let Some(ops) = store.ante.ops.lock().await.clone() else {
-        store.requeue_head(session, item);
+        store.set_delivery(session, &inbox_id, "queue");
         return;
     };
     if let Err(err) = ops.send(ante_sdk::protocol::op_msg(Op::UserInput(text))).await {
         log_line(&format!("ante: 排队消息发送失败：{err}"));
-        store.requeue_head(session, item);
+        store.set_delivery(session, &inbox_id, "queue");
         return;
     }
     log_line(&format!("ante: 排队消息 {inbox_id} 交给 Ante（回合已结束）"));
-    store.publish_durable(
-        "session.inbox.delivered",
-        json!({ "inboxID": inbox_id, "sessionID": session }),
-        session,
-    );
 }
 
 /// `GET /api/session/{id}/inbox` — what the client queued and we are holding.
@@ -2092,6 +2409,12 @@ async fn session_inbox_update(
         // Already handed over: the real server answers 409 for that.
         return axum::http::StatusCode::CONFLICT;
     };
+    if item["delivery"] == "steer" {
+        // `steer` in the held list means Ante already has the text — pulling it
+        // back to the queue would only put it into the session a second time.
+        log_line(&format!("ante: {inbox_id} 已经交给 Ante，改不回去了"));
+        return axum::http::StatusCode::CONFLICT;
+    }
     if delivery == "queue" {
         store.publish_durable(
             "session.inbox.delivery.changed",
@@ -2100,8 +2423,15 @@ async fn session_inbox_update(
         );
         return axum::http::StatusCode::NO_CONTENT;
     }
-    let text = item["payload"]["text"].as_str().unwrap_or("").to_string();
-    let _ = store.take_queued(&id, &inbox_id);
+    // The text Ante gets is the staged one — the user's own plus the mentions for
+    // any pasted images — while the payload keeps what the client displays.
+    let display = item["payload"]["text"].as_str().unwrap_or("").to_string();
+    let text = store.sent_text(&inbox_id).unwrap_or(display);
+    // It stops being *queued* but is not delivered either: it stays held, now
+    // labelled `steer`, and the pump clears it when Ante reports the input. The
+    // client keeps drawing it as pending in the meantime — which is the truth
+    // until Ante folds it into the turn.
+    store.set_delivery(&id, &inbox_id, "steer");
     let live = store.ante.live_id().as_deref() == Some(id.as_str());
     match store.ante.ops.lock().await.clone() {
         Some(ops) => {
@@ -2115,29 +2445,38 @@ async fn session_inbox_update(
             };
             if let Err(err) = ops.send(ante_sdk::protocol::op_msg(op)).await {
                 log_line(&format!("ante: 排队消息插嘴失败：{err}"));
-                store.requeue_head(&id, item);
+                store.set_delivery(&id, &inbox_id, "queue");
                 return axum::http::StatusCode::NO_CONTENT;
             }
             store.publish_durable(
-                "session.inbox.delivered",
-                json!({ "inboxID": inbox_id, "sessionID": id }),
+                "session.inbox.delivery.changed",
+                json!({ "sessionID": id, "inboxID": inbox_id, "delivery": "steer" }),
                 &id,
             );
         }
         None => {
-            store.requeue_head(&id, item);
+            store.set_delivery(&id, &inbox_id, "queue");
             log_line("ante: 与 Ante 未连接，排队消息没送出去");
         }
     }
     axum::http::StatusCode::NO_CONTENT
 }
 
-/// `DELETE /api/session/{id}/inbox/{inbox_id}` — drop a queued prompt. Nothing
-/// to withdraw from Ante: a held prompt was never handed over.
+/// `DELETE /api/session/{id}/inbox/{inbox_id}` — drop a prompt we are holding. A
+/// steered one is not ours to drop (Ante already has the text), so it answers 409
+/// like the steer route does.
 async fn session_inbox_cancel(
     State(store): State<Store>,
     Path((id, inbox_id)): Path<(String, String)>,
 ) -> axum::http::StatusCode {
+    if store
+        .queued(&id)
+        .iter()
+        .any(|item| item["id"] == inbox_id.as_str() && item["delivery"] == "steer")
+    {
+        log_line(&format!("ante: {inbox_id} 已经交给 Ante，删不掉了"));
+        return axum::http::StatusCode::CONFLICT;
+    }
     if store.take_queued(&id, &inbox_id).is_some() {
         store.publish_durable(
             "session.inbox.cancelled",
@@ -2171,8 +2510,23 @@ async fn session_prompt(
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .unwrap_or_else(|| uid("msg"));
+    // Pasted images: the client sends inline `data:` URLs, Ante only reads
+    // mentions — so the body becomes a staged copy in Ante's paste cache plus an
+    // `@path` appended to the text we hand over. The client keeps its own text;
+    // the attachments it draws come from the echo below.
+    let attachments_in = body.get("files").and_then(Value::as_array).cloned().unwrap_or_default();
+    let (staged, files) = attachments::stage(&text, &attachments_in);
+    if !files.is_empty() {
+        log_line(&format!("attachments: 暂存 {} 个附件，随消息提及给 Ante", files.len()));
+    }
     let user = json!({
-        "id": user_id, "type": "user", "text": text, "time": { "created": now_ms() },
+        "id": user_id,
+        "type": "user",
+        "text": text,
+        "files": files,
+        "agents": [],
+        "skills": [],
+        "time": { "created": now_ms() },
     });
     store.messages.lock().ok().and_then(|mut m| m.get_mut(&id).map(|list| list.push(user.clone())));
     store.publish("message.updated", json!({ "sessionID": id, "info": user }));
@@ -2185,7 +2539,7 @@ async fn session_prompt(
         "sessionID": id,
         "time": { "created": now_ms() },
         "type": "user",
-        "payload": { "text": text, "files": [], "agents": [], "skills": [] },
+        "payload": { "text": text, "files": files, "agents": [], "skills": [] },
         "delivery": delivery,
     });
     store.publish_durable(
@@ -2193,20 +2547,19 @@ async fn session_prompt(
         json!({ "inboxID": user_id, "sessionID": id, "item": item }),
         &id,
     );
+    // Held either way until Ante reports the input (`Evt::UserInput` → the pump
+    // publishes `delivered`): `queue` waits for the turn boundary, `steer` for
+    // Ante to fold it into the running step. Both are what the client draws a
+    // pending prompt from, so neither may claim delivery here.
+    if let Ok(mut queues) = store.pending.lock() {
+        queues.entry(id.clone()).or_default().push(item.clone());
+    }
+    store.remember_sent(&user_id, &staged);
     if delivery == "queue" {
-        // Held, not handed over: the client shows it in the queue (no
-        // `delivered`), and it leaves the queue by itself at the turn boundary —
-        // or because the user steered/deleted it.
-        if let Ok(mut queues) = store.pending.lock() {
-            queues.entry(id.clone()).or_default().push(item.clone());
-        }
+        // Held, not handed over: it leaves the queue at the turn boundary — or
+        // because the user steered/deleted it.
         return Json(json!({ "data": item }));
     }
-    store.publish_durable(
-        "session.inbox.delivered",
-        json!({ "inboxID": user_id, "sessionID": id }),
-        &id,
-    );
 
     // Point the event pump at this session, then hand the text to Ante.
     if let Ok(mut active) = store.ante.active.lock() {
@@ -2240,10 +2593,13 @@ async fn session_prompt(
                 // What our own turn will be answered with: Ante replays a
                 // resumed conversation before it gets to this `UserInput`, and
                 // the guard drops that replay until the turn this op id starts.
-                let input = ante_sdk::protocol::op_msg(Op::UserInput(text.clone()));
+                let input = ante_sdk::protocol::op_msg(Op::UserInput(staged.clone()));
                 // A session Ante has on disk is a real conversation to resume;
                 // anything else (the id the client just invented) starts fresh.
-                let saved = if session_meta(&id).is_some() { id.parse::<Id>().ok() } else { None };
+                // The test is the directory, not `meta.json`: Ante writes that
+                // only at `TurnEnd`, so a session killed mid-turn has the log
+                // and no summary — and it is still the conversation to continue.
+                let saved = if stored_session(&id) { id.parse::<Id>().ok() } else { None };
                 if let Some(session_id) = saved {
                     store.ante.expect_turn(input.id.to_string());
                     let op = Op::ResumeSession { session_id, unattended: false };
@@ -2292,7 +2648,7 @@ async fn session_prompt(
             } else if delivery == "steer" && store.ante.busy() {
                 // `Ctrl+S` / plain Enter while a turn is running: Ante's `Steer`
                 // folds the text into that turn instead of queueing it behind.
-                match ops.send(ante_sdk::protocol::op_msg(Op::Steer(text.clone()))).await {
+                match ops.send(ante_sdk::protocol::op_msg(Op::Steer(staged.clone()))).await {
                     Ok(()) => log_line("ante: 插嘴（Steer）——并进正在跑的这一轮"),
                     Err(err) => log_line(&format!("ante: 插嘴发送失败：{err}")),
                 }
@@ -2304,7 +2660,7 @@ async fn session_prompt(
                     ..Default::default()
                 };
                 let _ = ops.send(ante_sdk::protocol::op_msg(Op::UpdateSession(update))).await;
-                if let Err(err) = ops.send(ante_sdk::protocol::op_msg(Op::UserInput(text.clone()))).await {
+                if let Err(err) = ops.send(ante_sdk::protocol::op_msg(Op::UserInput(staged.clone()))).await {
                     log_line(&format!("ante: 消息发送失败：{err}"));
                 }
             }
@@ -2317,7 +2673,7 @@ async fn session_prompt(
     // A session that just became live may still carry a queue from before.
     flush_queue(&store, &id).await;
 
-    Json(json!({ "data": { "id": user_id, "sessionID": id, "type": "user", "time": { "created": now_ms() }, "payload": { "text": text, "files": [], "agents": [], "skills": [] }, "delivery": delivery } }))
+    Json(json!({ "data": { "id": user_id, "sessionID": id, "type": "user", "time": { "created": now_ms() }, "payload": { "text": text, "files": files, "agents": [], "skills": [] }, "delivery": delivery } }))
 }
 
 /// The server-scoped feed. Frames are `{id, type, data}` and the first one must
@@ -2452,7 +2808,7 @@ async fn main() {
         .route("/api/experimental/capabilities", get(empty_reads))
         .route("/api/session", get(sessions_list).post(session_create))
         .route("/api/session/active", get(active_session))
-        .route("/api/session/{id}", get(session_get))
+        .route("/api/session/{id}", get(session_get).delete(session_delete))
         .route("/api/session/{id}/message", get(session_messages))
         .route("/api/session/{id}/prompt", post(session_prompt))
         .route("/api/session/{id}/interrupt", post(session_interrupt))

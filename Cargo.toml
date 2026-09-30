@@ -11,9 +11,11 @@ path = "src/main.rs"
 
 [dependencies]
 ante-sdk = "0.2.5"
+base64 = "0.22"
 chrono = "0.4"
 axum = "0.8"
 futures = "0.3"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "process", "io-util"] }
