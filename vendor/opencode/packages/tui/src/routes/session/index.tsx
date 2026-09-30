@@ -2302,6 +2302,15 @@ function UserMessage(props: { message: SessionMessageUser }) {
           flexShrink={0}
         >
           <text fg={theme.text.base}>{props.message.text}</text>
+          <Show when={delivery()}>
+            <box flexDirection="row" paddingTop={1}>
+              <text fg={theme.text.base}>
+                <span style={{ bg: theme.decrease(theme.background.raised.base), fg: theme.text.muted }}>
+                  {" 未送达 "}
+                </span>
+              </text>
+            </box>
+          </Show>
           <Show when={skills().length}>
             <box flexDirection="row" paddingTop={1} gap={1} flexWrap="wrap">
               <For each={skills()}>
@@ -2380,7 +2389,7 @@ function QueuedPromptDock(props: { prompts: { id: string; text: string }[]; onOp
         flexDirection="row"
       >
         <text fg={theme.text.muted} wrapMode="none" truncate flexGrow={1} flexShrink={1} minWidth={0}>
-          <span style={{ fg: theme.text.base }}>{props.prompts.length} queued</span>
+          <span style={{ fg: theme.text.base }}>{props.prompts.length} 条未送达</span>
           <Show when={next()}>{(text) => <> · {text()}</>}</Show>
         </text>
       </box>

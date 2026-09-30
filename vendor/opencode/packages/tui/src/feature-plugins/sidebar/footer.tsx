@@ -92,7 +92,9 @@ function SidebarFooter(props: { context: Plugin.Context; sessionID: string }) {
   })
   return (
     <box gap={1}>
-      <SidebarOnboarding context={props.context} sessionID={props.sessionID} />
+      {/* antex: the "Getting started / Connect provider" card is a dead end on
+          Ante — `/api/integration` answers empty and `provider.connect` opens an
+          empty dialog — so it is not rendered at all. */}
       <Show when={directory()}>
         {(value) => (
           <box
