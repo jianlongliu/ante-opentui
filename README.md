@@ -11,35 +11,41 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 
 首页（本仓库自编客户端的默认界面）：顶栏是 Ante 面具 + `ANTEX`，composer 下是权限模式与模型，右下角是 `ante <后端版本> · antex <构建日期>`。**这张图由 `script/shot-home.py` 生成**（PTY + pyte 抓屏 → Pango 渲染，可复现）。
 
-## 状态：改好了 / 待定 / 遗弃
+## 状态：已实现 / 待定 / 遗弃
 
-**日常路径上能用的都实测过；做得到没做的写「待定」；Ante 底层没这概念的写「遗弃」，别再提议硬做。**逐条细节与验证法在「实现清单」。
+**绿勾 = 已实现（实测过）；空框 = 待定（做得到，没做）；删除线 = 遗弃（Ante 底层没这个概念，别再提议硬做）。**逐条细节与验证法在「实现清单」。
 
-| 状态 | 项 | 说明 |
-| --- | --- | --- |
-| 改好了 | 起界、提示词送达、真 Ante 回复、流式文本、推理、工具调用、审批、失败可见 | 全由垫片喂真数据，实测 |
-| 改好了 | 会话：列表、恢复、恢复后继续、删除（`Ctrl+D` 两下） | 删的是 Ante 自己的存档目录 |
-| 改好了 | 插嘴与排队（`Ctrl+S`）+「未送达」标记 | 送到时机按 Ante 的真实边界判：**收下不算，下一个 step 开始才算模型读到** |
-| 改好了 | `/compact`、模型选择、`shift+tab` 权限模式、`@` 文件补全、贴图、herdr 上报、boot 接口全套 | 见「实现清单」 |
-| 改好了 | 多标签关掉（`tabs.mode = "off"`） | 它要服务端同时驱动多条会话，垫片只有一条连接 |
-| 改好了 | 做不了的入口从界面摘掉 | 插件 / 键位 / 命令黑名单 / 侧栏卡片四层，见「屏蔽做不了的入口」 |
-| 待定 | `/rename` | 隐藏中；补法：写 Ante 那条会话的 `meta.json` 标题 |
-| 待定 | `/copy`、`/export` | 隐藏中；补法：垫片用 `GET …/message` 拼一份导出载荷 |
-| 待定 | `/stats` | 隐藏中；补法：Ante 的 `meta.json` 里有 usage，够算 token / 成本 |
-| 待定 | `/skills` | 隐藏中；补法：列出 Ante 自己的技能目录（`~/.agents/skills`、`~/.ante/.system/skills`） |
-| 待定 | 会话内 `/cd` | 家目录下能用，会话里是空操作；退一步可「按新目录重开会话」 |
-| 待定 | 真多标签（session tabs） | 先验证 Ante 侧能否并发驱动多条会话，再谈垫片改造 |
-| 待定 | 断线时的终端还原 | TUI 只弹 `Connection lost · Reconnecting to the server automatically.`，终端留一屏裸 SGR；抓原始字节用 `~/antecode-scratch/tuiprobe/exit_probe.py` |
-| 遗弃 | `/undo`、`/redo`、消息菜单的 Revert | Ante 协议 18 个 op（`StartSession`…`Shutdown`）没有 revert/undo/rewind，`~/Projects/ante` 全仓 grep 零命中；硬做只剩重写 `events.jsonl` 截断历史——只对以后 resume 生效、对当前会话无效、还可能被 Ante 覆写 |
-| 遗弃 | `/fork` | 无分叉 op |
-| 遗弃 | `/share`、`/unshare` | 云端分享，Ante 无此概念（客户端自己也直接报 "Sharing is not implemented for V2 sessions yet"） |
-| 遗弃 | `/mcps`、`/status`、MCP 面板 | 无 MCP |
-| 遗弃 | `/connect`、`/pair` | 无 provider OAuth、无设备配对（`/api/integration` 恒空） |
-| 遗弃 | `/diff`、`/worktrees` | 无 diff / VCS / worktree 概念（`/api/vcs/*` 只能答空） |
-| 遗弃 | `/terminal`、Terminals 面板、`!` shell 模式 | 无 PTY、无 shell 会话 op（Bash 是工具调用，不是终端） |
-| 遗弃 | `/plugins`、`/btw` | 无 opencode 插件系统；`/btw` 要的是「旁问」的独立 generate op |
-| 遗弃 | `/reload`、`/update`、`/restart`、`Ctrl+B` 后台化工具 | 重新加载服务端配置 / 更新 opencode / 把工具调用扔后台——对 Ante 都无意义 |
-| 遗弃 | LSP、formatter | 无对应概念，打桩显示为空（入口已摘） |
+### 已实现
+
+- [x] 起界、提示词送达、真 Ante 回复、流式文本、推理、工具调用、审批、失败可见 —— 全由垫片喂真数据
+- [x] 会话：列表、恢复、恢复后继续、删除（`Ctrl+D` 两下）—— 删的是 Ante 自己那条存档目录
+- [x] 插嘴与排队（`Ctrl+S`）+「未送达」标记 —— 送到时机按 Ante 的真实边界判：**收下不算，下一个 step 开始才算模型读到**
+- [x] `/compact`、模型选择、`shift+tab` 权限模式、`@` 文件补全、贴图、herdr 上报、boot 接口全套
+- [x] 多标签关掉（`tabs.mode = "off"`）—— 它要服务端同时驱动多条会话，垫片只有一条连接
+- [x] 做不了的入口从界面摘掉 —— 插件 / 键位 / 命令黑名单 / 侧栏卡片四层，见「屏蔽做不了的入口」
+
+### 待定
+
+- [ ] `/rename` —— 隐藏中；补法：写 Ante 那条会话的 `meta.json` 标题
+- [ ] `/copy`、`/export` —— 隐藏中；补法：垫片用 `GET …/message` 拼一份导出载荷
+- [ ] `/stats` —— 隐藏中；补法：Ante 的 `meta.json` 里有 usage，够算 token / 成本
+- [ ] `/skills` —— 隐藏中；补法：列出 Ante 自己的技能目录（`~/.agents/skills`、`~/.ante/.system/skills`）
+- [ ] 会话内 `/cd` —— 家目录下能用，会话里是空操作；退一步可「按新目录重开会话」
+- [ ] 真多标签（session tabs）—— 先验证 Ante 侧能否并发驱动多条会话，再谈垫片改造
+- [ ] 断线时的终端还原 —— TUI 只弹 `Connection lost · Reconnecting to the server automatically.`，终端留一屏裸 SGR；抓原始字节用 `~/antecode-scratch/tuiprobe/exit_probe.py`
+
+### 遗弃
+
+- [ ] ~~`/undo`、`/redo`、消息菜单的 Revert~~ —— Ante 协议 18 个 op（`StartSession`…`Shutdown`）没有 revert/undo/rewind，`~/Projects/ante` 全仓 grep 零命中；硬做只剩重写 `events.jsonl` 截断历史——只对以后 resume 生效、对当前会话无效、还可能被 Ante 覆写
+- [ ] ~~`/fork`~~ —— 无分叉 op
+- [ ] ~~`/share`、`/unshare`~~ —— 云端分享，Ante 无此概念（客户端自己也直接报 "Sharing is not implemented for V2 sessions yet"）
+- [ ] ~~`/mcps`、`/status`、MCP 面板~~ —— 无 MCP
+- [ ] ~~`/connect`、`/pair`~~ —— 无 provider OAuth、无设备配对（`/api/integration` 恒空）
+- [ ] ~~`/diff`、`/worktrees`~~ —— 无 diff / VCS / worktree 概念（`/api/vcs/*` 只能答空）
+- [ ] ~~`/terminal`、Terminals 面板、`!` shell 模式~~ —— 无 PTY、无 shell 会话 op（Bash 是工具调用，不是终端）
+- [ ] ~~`/plugins`、`/btw`~~ —— 无 opencode 插件系统；`/btw` 要的是「旁问」的独立 generate op
+- [ ] ~~`/reload`、`/update`、`/restart`、`Ctrl+B` 后台化工具~~ —— 重新加载服务端配置 / 更新 opencode / 把工具调用扔后台，对 Ante 都无意义（**暂时遗弃**：等哪天有对应 op 再说）
+- [ ] ~~LSP、formatter~~ —— 无对应概念，打桩显示为空（入口已摘；**暂时遗弃**）
 
 ## 它在你系统里的位置
 
@@ -69,7 +75,7 @@ Ante（**你自己装的**：官方脚本装、`ante update` 升级）
 
 ## 实现清单
 
-**未实现（一条也不再单独列：分类、补法、依据都在开头「状态」那张表里）**
+**未实现（一条也不再单独列：分类、补法、依据都在开头「状态」那份清单里）**
 
 **已实现（均已实测）**
 
@@ -115,7 +121,7 @@ Ante（**你自己装的**：官方脚本装、`ante update` 升级）
 
 ### 未完成项的验证法
 
-**不在这张表里了**：遗弃项不用验（Ante 没有这个概念），待定项不用验（没做就是没做）。判断某个入口该不该留在界面上，看开头「状态」那张表，再用「屏蔽做不了的入口」的验收法复核一次即可。
+**不在这张表里了**：遗弃项不用验（Ante 没有这个概念），待定项不用验（没做就是没做）。判断某个入口该不该留在界面上，看开头「状态」那份清单，再用「屏蔽做不了的入口」的验收法复核一次即可。
 
 
 ## 怎么跑
@@ -209,7 +215,7 @@ Ante 没有 VCS/diff、MCP、revert、分享、PTY、provider OAuth。垫片对�
 
 **不摘的**：`/cd`（家目录下能用）、`/editor`、`/timeline`、`/variants`、`/themes`、`/settings`、`/debug`、`/open`、`/sessions`——要么纯客户端、要么垫片答得出真数据。
 
-**验收**：进 TUI 敲 `/un`、`/for`、`/mcps`、`/di`、`/st`、`/pl`、`/up` 应全是 `No matching commands`；`/` 列表里不该出现 `undo` `redo` `share` `unshare` `fork` `rename` `copy` `export` `skills` `worktrees` `terminal` `update`。**残留**：像 `/rename`、`/stats`、`/skills` 这种「其实做得到」（写 `meta.json` / 读 Ante 自己的 usage 与技能目录）先按做不了摘了，要恢复就照开头「状态」表里对应那行的补法做。
+**验收**：进 TUI 敲 `/un`、`/for`、`/mcps`、`/di`、`/st`、`/pl`、`/up` 应全是 `No matching commands`；`/` 列表里不该出现 `undo` `redo` `share` `unshare` `fork` `rename` `copy` `export` `skills` `worktrees` `terminal` `update`。**残留**：像 `/rename`、`/stats`、`/skills` 这种「其实做得到」（写 `meta.json` / 读 Ante 自己的 usage 与技能目录）先按做不了摘了，要恢复就照开头「状态」清单里对应那条的补法做。
 
 ## 依赖与版本
 
@@ -342,7 +348,7 @@ session.step.started → session.text.started → session.text.delta ×N → ses
 
 **日常路径上没有已知缺陷**：过去列在缺口里的中断收尾、多轮消息落位、会话列表、agent 切换、`/compact`、恢复旧会话后继续对话都已实现并实测。
 
-要接着做，就挑开头「状态」表里标 **待定** 的那七行（`/rename`、`/copy`、`/export`、`/stats`、`/skills`、会话内 `/cd`、真多标签、断线时的终端还原）；标 **遗弃** 的一条都别再提议——Ante 底层没有那些概念。
+要接着做，就挑开头「状态」清单里 **空框** 的那几条（`/rename`、`/copy`、`/export`、`/stats`、`/skills`、会话内 `/cd`、真多标签、断线时的终端还原）；**带删除线** 的一条都别再提议——Ante 底层没有那些概念。
 
 **已知瑕疵（不影响使用）**：TUI 新建会话时 id 是**客户端本地发号**的（`packages/tui/src/component/prompt/index.tsx` 的乐观创建），Ante 那边则按自己的 id 另建一条同格式目录。于是刚建的会话在重启前只以客户端 id 存在于内存里（本进程内就按它跟踪），重启后要从列表里按 Ante 的 id 恢复——内容一直在 Ante 那条目录里，不会丢，两个 id 也不会互相冒充。
 
