@@ -661,6 +661,41 @@ fn event_skipped(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Ante names its tools (`Bash`, `Read`, `Agent`); the client draws its rich
+/// per-tool cells only for the names it ships (`shell`, `read`, `subagent`, …)
+/// and falls back to a generic key/value block for anything else. Renaming a
+/// call to the client's spelling is what turns `Agent [description=…]` into the
+/// client's own subagent cell. Tools without a counterpart there — `Edit` (its
+/// cell wants a precomputed patch), `TodoWrite`, `ViewImage` — keep Ante's name
+/// and stay generic rather than degrade into an empty cell.
+fn client_tool_name(name: &str) -> &str {
+    match name {
+        "Bash" => "shell",
+        "Read" => "read",
+        "Write" => "write",
+        "Glob" => "glob",
+        "Grep" => "grep",
+        "WebFetch" => "webfetch",
+        "WebSearch" => "websearch",
+        "Agent" => "subagent",
+        "AskUser" => "question",
+        other => other,
+    }
+}
+
+/// `Read` and `Write` pass `file_path`; the client's views read `path`. Every
+/// other argument key agrees, so the rest goes through untouched.
+fn client_tool_args(name: &str, args: &Value) -> Value {
+    let mut args = args.clone();
+    if (name == "Read" || name == "Write")
+        && let Some(object) = args.as_object_mut()
+        && let Some(path) = object.get("file_path").cloned()
+    {
+        object.insert("path".to_string(), path);
+    }
+    args
+}
+
 /// The readable part of a tool result, for the tool cell.
 fn result_text(result: &Value) -> String {
     match result {
@@ -1220,14 +1255,15 @@ async fn spawn_ante(store: Store) {
             Evt::ToolStart(tool) => {
                 ensure_step!();
                 close_reasoning!();
-                let args = tool.args.to_string();
+                let name = client_tool_name(&tool.name);
+                let args = client_tool_args(&tool.name, &tool.args);
                 store.publish_durable(
                     "session.tool.input.started",
                     json!({
                         "sessionID": session,
                         "assistantMessageID": message_id,
                         "id": tool.id,
-                        "name": tool.name,
+                        "name": name,
                     }),
                     &session,
                 );
@@ -1237,7 +1273,7 @@ async fn spawn_ante(store: Store) {
                         "sessionID": session,
                         "assistantMessageID": message_id,
                         "id": tool.id,
-                        "text": args,
+                        "text": args.to_string(),
                     }),
                     &session,
                 );
@@ -1248,7 +1284,7 @@ async fn spawn_ante(store: Store) {
                         "assistantMessageID": message_id,
                         "id": tool.id,
                         "executed": false,
-                        "input": tool.args,
+                        "input": args,
                     }),
                     &session,
                 );
@@ -2513,12 +2549,14 @@ fn replay_session(id: &str, handed: &[(String, String)]) -> Vec<Value> {
                 close_reasoning!();
                 if let Some(fold) = step.as_mut() {
                     let content = messages[fold.message]["content"].as_array_mut().expect("content");
+                    let name = client_tool_name(&tool.name);
+                    let input = client_tool_args(&tool.name, &tool.args);
                     content.push(json!({
                         "type": "tool",
                         "id": tool.id,
-                        "name": tool.name,
+                        "name": name,
                         "executed": false,
-                        "state": { "status": "running", "input": tool.args, "metadata": {} },
+                        "state": { "status": "running", "input": input, "metadata": {} },
                         "time": { "created": created, "ran": created },
                     }));
                     calls.insert(tool.id.clone(), (fold.message, content.len() - 1));
@@ -3161,4 +3199,30 @@ async fn fallback() -> Response {
         "info": { "project": { "id": "prj_shim" } },
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tools_the_client_draws_get_its_name() {
+        assert_eq!(client_tool_name("Bash"), "shell");
+        assert_eq!(client_tool_name("Agent"), "subagent");
+        assert_eq!(client_tool_name("AskUser"), "question");
+        // No counterpart on the client side: Ante's own name, generic cell.
+        assert_eq!(client_tool_name("Edit"), "Edit");
+        assert_eq!(client_tool_name("TodoWrite"), "TodoWrite");
+    }
+
+    #[test]
+    fn read_and_write_gain_the_path_key_the_client_reads() {
+        let read = client_tool_args("Read", &json!({ "file_path": "/tmp/a", "limit": 10 }));
+        assert_eq!(read["path"], json!("/tmp/a"));
+        assert_eq!(read["limit"], json!(10));
+        // Keys the two sides already agree on stay as they are.
+        let grep = client_tool_args("Grep", &json!({ "pattern": "x", "path": "/tmp" }));
+        assert_eq!(grep["path"], json!("/tmp"));
+        assert_eq!(grep.get("file_path"), None);
+    }
 }
