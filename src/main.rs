@@ -361,6 +361,14 @@ struct Store {
     /// images, and Ante echoes *that* back — plus the folder listing it loaded
     /// for the mention — so acknowledging a prompt has to compare against this.
     sent: Arc<Mutex<HashMap<String, String>>>,
+    /// Inbox ids the client has already been told are delivered. The turn-end
+    /// sweep exists to clear a marker for a prompt Ante never reported — but a
+    /// steered prompt is *still* held there after its step boundary, so without
+    /// this the sweep would send a second `delivered` for it. That matters: the
+    /// client answers `delivered` by moving the prompt to the end of the
+    /// transcript, so the repeat would shove it past the reply it had just been
+    /// placed in front of.
+    delivered: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Frames fan out to every connected `/api/event` feed.
     events: broadcast::Sender<Value>,
 }
@@ -374,6 +382,7 @@ impl Store {
             pending: Arc::new(Mutex::new(HashMap::new())),
             acked: Arc::new(Mutex::new(HashMap::new())),
             sent: Arc::new(Mutex::new(HashMap::new())),
+            delivered: Arc::new(Mutex::new(std::collections::HashSet::new())),
             events,
             ante: Ante::new(),
         }
@@ -497,6 +506,22 @@ impl Store {
             self.forget_sent(id);
         }
         ids
+    }
+
+    /// Note a prompt whose `delivered` just went out at a step boundary.
+    fn mark_delivered(&self, inbox_id: &str) {
+        if let Ok(mut delivered) = self.delivered.lock() {
+            delivered.insert(inbox_id.to_string());
+        }
+    }
+
+    /// Whether this prompt already had a `delivered`, and drop the note: the
+    /// turn-end sweep is the last caller that asks.
+    fn claim_delivered(&self, inbox_id: &str) -> bool {
+        match self.delivered.lock() {
+            Ok(mut delivered) => delivered.remove(inbox_id),
+            Err(_) => false,
+        }
     }
 
     /// The steered prompts still held, taken off the queue; queued ones stay for
@@ -1069,6 +1094,22 @@ async fn spawn_ante(store: Store) {
                         .ok()
                         .and_then(|slot| slot.clone())
                         .unwrap_or_else(|| active_model());
+                    // A step is the boundary Ante folds accepted prompts into, so
+                    // anything it took before this one is being read now. Send
+                    // `delivered` **before** `step.started`: the client answers it by
+                    // moving that prompt to the end of the transcript, and the step
+                    // appends the assistant message right after it. The other order
+                    // prints the reply above the prompt it answers.
+                    let acked = store.take_acked(&session);
+                    for inbox_id in &acked {
+                        log_line(&format!("ante: 消息 {inbox_id} 送达（模型开始读）"));
+                        store.mark_delivered(inbox_id);
+                        store.publish_durable(
+                            "session.inbox.delivered",
+                            json!({ "inboxID": inbox_id.as_str(), "sessionID": session }),
+                            &session,
+                        );
+                    }
                     store.publish_durable(
                         "session.step.started",
                         json!({
@@ -1080,16 +1121,6 @@ async fn spawn_ante(store: Store) {
                         }),
                         &session,
                     );
-                    // A step is the boundary Ante folds accepted prompts into, so
-                    // anything it took before this one is being read now.
-                    for inbox_id in store.take_acked(&session) {
-                        log_line(&format!("ante: 消息 {inbox_id} 送达（模型开始读）"));
-                        store.publish_durable(
-                            "session.inbox.delivered",
-                            json!({ "inboxID": inbox_id, "sessionID": session }),
-                            &session,
-                        );
-                    }
                 }
             };
         }
@@ -1499,6 +1530,11 @@ async fn spawn_ante(store: Store) {
                 settled.sort();
                 settled.dedup();
                 for inbox_id in settled {
+                    // A steered prompt keeps its queue entry past its step, so the
+                    // sweep would otherwise announce it twice.
+                    if store.claim_delivered(&inbox_id) {
+                        continue;
+                    }
                     log_line(&format!("ante: 回合结束时 {inbox_id} 仍未送达，按已送达处理"));
                     store.publish_durable(
                         "session.inbox.delivered",
