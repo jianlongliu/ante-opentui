@@ -1,7 +1,7 @@
 #!/bin/sh
 # 重建「带 Ante logo 的客户端」。
 #
-# 为什么需要它：两处界面改动垫片喂不进去，只能在源码里改、再用源码编一个自己的二进制：
+# 为什么需要它：垫片喂不进去的界面改动，只能在源码里改、再用源码编一个自己的二进制：
 #   vendor/opencode/packages/tui/src/logo.ts            —— 首页大字 logo 换 Ante 面具 + ANTEX
 #   vendor/opencode/packages/tui/src/component/dialog-model.tsx —— 模型选择器永远显示供应商
 #                                                                 （antex 不提供 integration，connected() 恒假，
@@ -14,6 +14,17 @@
 #   vendor/opencode/packages/tui/src/feature-plugins/home/footer.tsx
 #                                                              —— 首页右下角的版本号改成 `ante <后端版本> · antex <构建日期>`
 #                                                                 （上游画的是客户端自己的版本，跟两端都不相干）
+#   vendor/opencode/packages/tui/src/routes/session/index.tsx  —— 待递送的消息挂「未送达」角标，
+#                                                                 队列 dock 从 «N queued» 改成 «N 条未送达 · 内容»
+#                                                                 （送没送到由垫片判：下一个 step 开始才算送到）
+#   vendor/opencode/packages/tui/src/context/keymap.tsx        —— 黑名单：把 Ante 做不了的命令从命令面板
+#                                                                 和斜杠补全一次摘掉（名单见 README）
+#   vendor/opencode/packages/tui/src/feature-plugins/sidebar/footer.tsx
+#                                                              —— 侧栏那张 Getting started / Connect provider
+#                                                                 卡片不再渲染（它读 /api/integration，恒空）
+#   vendor/opencode/packages/cli/src/services/server-connection.ts
+#                                                              —— --server 模式不再对垫片报版本不匹配
+#                                                                 （垫片答的是 Ante 版本，那行 warning 会常驻首行）
 #
 # 上游更新（git subtree pull ... v2）之后跑一次这个脚本，然后 antex 用的就是新的。
 set -eu
