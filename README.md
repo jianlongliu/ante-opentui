@@ -11,6 +11,46 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 
 首页（本仓库自编客户端的默认界面）：顶栏是 Ante 面具 + `ANTEX`，composer 下是权限模式与模型，右下角是 `ante <后端版本> · antex <构建日期>`。**这张图由 `script/shot-home.py` 生成**（PTY + pyte 抓屏 → Pango 渲染，可复现）。
 
+## 状态：改好了 / 待定 / 遗弃
+
+一句话：**日常路径上能用的，都实测过；做得到但没做的，列在「待定」；Ante 底层没有这个概念的，列在「遗弃」——别再提议硬做。**
+
+### 改好了（详单与验证法见「实现清单」）
+
+- 起界、提示词送达、真 Ante 回复、流式文本、推理、工具调用、审批、失败可见
+- 会话：列表 / 恢复 / 恢复后继续 / 删除（`Ctrl+D` 两下）
+- 插嘴与排队（`Ctrl+S`），**外加「未送达」标记**：送到时机按 Ante 的真实边界判——收下不算，**下一个 step 开始**才算模型读到
+- `/compact`、模型选择、`shift+tab` 权限模式、`@` 文件补全、贴图、herdr 上报、boot 接口全套
+- **多标签关掉**：它要服务端同时驱动多条会话，垫片只有一条连接（`tabs.mode = "off"`）
+- **做不了的入口从界面摘掉**：插件 / 键位 / 命令黑名单 / 侧栏卡片四层，见「屏蔽做不了的入口」
+
+### 待定（做得到，没做；要做就从这张表挑）
+
+| 项 | 现在什么状态 | 怎么补 |
+| --- | --- | --- |
+| `/rename` | 隐藏（`PATCH /api/session/{id}` 没实现） | 写 Ante 那条会话的 `meta.json` 标题即可 |
+| `/copy`、`/export` | 隐藏（`…/export` 端点没实现） | 垫片自己用 `GET …/message` 拼一份导出载荷 |
+| `/stats` | 隐藏（`…/session/stats` 没实现） | Ante 的 `meta.json` 里有 usage，够算 token/成本 |
+| `/skills` | 隐藏（`/api/skill` 恒空） | Ante 自己有技能目录（`~/.agents/skills`、`~/.ante/.system/skills`），列出来就行 |
+| 会话内 `/cd` | 家目录下能用，会话里是空操作（`…/move` 没实现） | Ante 无 move op，可退一步「按新目录重开会话」 |
+| 真多标签（session tabs） | 关闭 | 先验证 Ante 侧能否并发驱动多条会话，再谈垫片改造 |
+| 断线/被杀时的终端还原 | TUI 只弹 `Connection lost · Reconnecting to the server automatically.`，终端留一屏裸 SGR | 抓退出路径的原始字节：`~/antecode-scratch/tuiprobe/exit_probe.py`（配套的坑见「验收与排错开关」：按端口杀进程会误杀别人的 antex） |
+
+### 遗弃（Ante 底层没这个概念，别再尝试）
+
+| 入口 | 结论与依据 |
+| --- | --- |
+| `/undo`、`/redo`、消息菜单的 Revert | Ante 协议全部 18 个 op（`StartSession`…`Shutdown`）**没有 revert/undo/rewind**，`~/Projects/ante` 全仓 grep 零命中；opencode 那边是 `revert/stage` → `revert/commit` / `DELETE revert` 三步 + `staged/committed/cleared` 事件。硬做只剩「重写 `events.jsonl` 截断历史」——只对以后 resume 生效、对当前会话无效、还可能被 Ante 覆写，故不采用 |
+| `/fork` | 无分叉 op |
+| `/share`、`/unshare` | 云端分享，Ante 无此概念（客户端自己也直接报 "Sharing is not implemented for V2 sessions yet"） |
+| `/mcps`、`/status`、MCP 面板 | 无 MCP |
+| `/connect`、`/pair` | 无 provider OAuth、无设备配对（`/api/integration` 恒空） |
+| `/diff`、`/worktrees` | 无 diff / VCS / worktree 概念（`/api/vcs/*` 只能答空） |
+| `/terminal`、Terminals 面板、`!` shell 模式 | 无 PTY、无 shell 会话 op（Bash 是工具调用，不是终端） |
+| `/plugins`、`/btw` | 无 opencode 插件系统；`/btw` 要的是「旁问」的独立 generate op，Ante 没有 |
+| `/reload`、`/update`、`/restart`、`Ctrl+B` 后台化工具 | 重新加载服务端配置 / 更新 opencode / 把工具调用扔后台——对 Ante 都无意义 |
+| LSP、formatter | 无对应概念，打桩显示为空（入口已摘） |
+
 ## 它在你系统里的位置
 
 ```
@@ -39,10 +79,11 @@ Ante（**你自己装的**：官方脚本装、`ante update` 升级）
 
 ## 实现清单
 
-**未实现（按优先级；每条验证法见下方「未完成项的验证法」）**
+**未实现（分类见开头「状态」那节，这里只留一句）**
 
-- [ ] **diff / LSP / formatter / MCP / VCS** —— 打桩。**这些是 Ante 根本没有的概念，只能显示为空，别指望填上**
-- [ ] **撤销回滚、PTY、分享** —— **登记为「Ante 无对应能力」，不再尝试**。撤销回滚查证过：Ante 协议全部 18 个 op（`StartSession`…`Shutdown`）**没有 revert/undo/rewind**，`~/Projects/ante` 全仓 grep 同样零命中；opencode 那边是 `revert/stage` → `revert/commit` / `DELETE revert` 三步 + `staged/committed/cleared` 事件。硬做只剩「重写 `events.jsonl` 截断历史」——只对以后 resume 生效、对当前会话无效、还可能被 Ante 覆写，故不采用
+- **遗弃项**：撤销回滚 / 分享 / PTY / MCP / LSP / formatter / VCS / provider OAuth / fork / 后台化工具 —— Ante 底层没有对应概念，**别再尝试**（依据逐条列在「状态 · 遗弃」）
+- **打桩项**：diff、LSP、formatter 这类面板显示为空（它们所在的入口已从界面摘掉，见「屏蔽做不了的入口」）
+- **待定项**：`/rename`、`/copy`、`/export`、`/stats`、`/skills`、会话内 `/cd`、真多标签 —— 做得到，没做，补法在「状态 · 待定」表里
 
 **已实现（均已实测）**
 
@@ -88,10 +129,7 @@ Ante（**你自己装的**：官方脚本装、`ante update` 升级）
 
 ### 未完成项的验证法
 
-| 项 | 怎么验 | 备注 |
-| --- | --- | --- |
-| **diff / LSP / formatter / MCP / VCS** | 敲 `/diff`、开 MCP 面板看是否空 | **Ante 根本没有这些概念**，只能显示为空，别指望填上 |
-| **撤销回滚、PTY、分享** | 不用验了 | **Ante 无此能力**（详见实现清单该条的查证记录）；不要再提议硬做 |
+**不在这张表里了**：遗弃项不用验（Ante 没有这个概念），待定项不用验（没做就是没做）。判断某个入口该不该留在界面上，看「状态」那节的两张表，再用「屏蔽做不了的入口」的验收法复核一次即可。
 
 
 ## 怎么跑
@@ -185,7 +223,7 @@ Ante 没有 VCS/diff、MCP、revert、分享、PTY、provider OAuth。垫片对�
 
 **不摘的**：`/cd`（家目录下能用）、`/editor`、`/timeline`、`/variants`、`/themes`、`/settings`、`/debug`、`/open`、`/sessions`——要么纯客户端、要么垫片答得出真数据。
 
-**验收**：进 TUI 敲 `/un`、`/for`、`/mcps`、`/di`、`/st`、`/pl`、`/up` 应全是 `No matching commands`；`/` 列表里不该出现 `undo` `redo` `share` `unshare` `fork` `rename` `copy` `export` `skills` `worktrees` `terminal` `update`。**残留**：像 `/rename` 这种「其实做得到」（写 `meta.json`）的先按做不了摘了，要恢复就当新功能做。
+**验收**：进 TUI 敲 `/un`、`/for`、`/mcps`、`/di`、`/st`、`/pl`、`/up` 应全是 `No matching commands`；`/` 列表里不该出现 `undo` `redo` `share` `unshare` `fork` `rename` `copy` `export` `skills` `worktrees` `terminal` `update`。**残留**：像 `/rename`、`/stats`、`/skills` 这种「其实做得到」（写 `meta.json` / 读 Ante 自己的 usage 与技能目录）先按做不了摘了，要恢复就照「状态 · 待定」那张表补。
 
 ## 依赖与版本
 
@@ -316,13 +354,9 @@ session.step.started → session.text.started → session.text.delta ×N → ses
 
 ## 下一步
 
-**日常使用路径上没有已知缺陷**：过去列在缺口里的中断收尾、多轮消息落位、会话列表、agent 切换、`/compact`、恢复旧会话后继续对话都已实现并实测。
+**日常路径上没有已知缺陷**：过去列在缺口里的中断收尾、多轮消息落位、会话列表、agent 切换、`/compact`、恢复旧会话后继续对话都已实现并实测。
 
-剩下的两类，见上面的**实现清单 · 未实现**：
-
-- **打桩项**：diff / LSP / formatter / MCP / VCS —— Ante 没有这些概念，只能显示为空（验证法见「未完成项的验证法」）。
-- **无对应能力项**：撤销回滚 / PTY / 分享 —— Ante 协议里就没有，别再提议硬做。**贴图已做**（走提及那条路，见实现清单）。
-- **断线时的终端还原（未查）**：垫片一没，TUI 只弹 `Connection lost · Reconnecting to the server automatically.`，终端会留一屏裸 SGR（看着像崩）。抓退出/断线路径的原始字节即可上手：`~/antecode-scratch/tuiprobe/exit_probe.py`。顺带记着**一体化模式的端口会自动顺延，按端口杀进程会误杀别人的 antex**（见「验收与排错开关」）。
+要接着做，就从开头「状态 · 待定」那张表挑：`/rename`、`/copy`、`/export`、`/stats`、`/skills`、会话内 `/cd`、真多标签、断线时的终端还原。**「状态 · 遗弃」那张表里的一条都别再提议**——Ante 底层没有那些概念。
 
 **已知瑕疵（不影响使用）**：TUI 新建会话时 id 是**客户端本地发号**的（`packages/tui/src/component/prompt/index.tsx` 的乐观创建），Ante 那边则按自己的 id 另建一条同格式目录。于是刚建的会话在重启前只以客户端 id 存在于内存里（本进程内就按它跟踪），重启后要从列表里按 Ante 的 id 恢复——内容一直在 Ante 那条目录里，不会丢，两个 id 也不会互相冒充。
 
