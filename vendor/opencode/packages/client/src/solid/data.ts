@@ -453,8 +453,15 @@ export function createData(config: CreateDataInput) {
     },
     editText(sessionID: string, messageID: string, fn: (text: SessionMessageAssistantText) => void) {
       message.editAssistant(sessionID, messageID, (assistant) => {
-        const text = assistant.content.findLast((item): item is SessionMessageAssistantText => item.type === "text")
-        if (text) fn(text)
+        let text = assistant.content.findLast((item): item is SessionMessageAssistantText => item.type === "text")
+        if (!text) {
+          // A transcript read back mid-step can arrive before the answer has a
+          // part of its own. The deltas still belong to it — without one they
+          // land nowhere and the answer never shows.
+          text = { type: "text", text: "" }
+          assistant.content.push(text)
+        }
+        fn(text)
       })
     },
     editReasoning(sessionID: string, messageID: string, fn: (reasoning: SessionMessageAssistantReasoning) => void) {
@@ -1628,17 +1635,14 @@ export function createData(config: CreateDataInput) {
               order: "desc",
             })
             const fetched = response.data.toReversed()
-            // Same protection as the pending sync: a re-fetch racing an
-            // admission must not wipe its local transcript row.
+            // Keep every row the read did not mention. A transcript read back from
+            // Ante's log holds the conversation's messages and nothing else: the
+            // rows this client folds from events on its own — idle markers,
+            // compactions, switches, and the step currently streaming — are not in
+            // it, and dropping them on a re-read is what left an opened session
+            // looking like its answers had never been there.
             const ids = new Set(fetched.map((item) => item.id))
-            const admitted = new Set(
-              (store.session.pending[sessionID] ?? []).flatMap((item) =>
-                item.type === "user" || item.type === "synthetic" ? [item.id] : [],
-              ),
-            )
-            const local = (store.session.message[sessionID] ?? []).filter(
-              (item) => !ids.has(item.id) && (outbox.has(item.id) || admitted.has(item.id)),
-            )
+            const local = (store.session.message[sessionID] ?? []).filter((item) => !ids.has(item.id))
             const messages = local.length === 0 ? fetched : [...fetched, ...local]
             batch(() => {
               messageIndex.set(sessionID, new Map(messages.map((message, index) => [message.id, index])))

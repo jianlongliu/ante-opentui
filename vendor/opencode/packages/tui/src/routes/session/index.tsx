@@ -2305,8 +2305,8 @@ function UserMessage(props: { message: SessionMessageUser }) {
           <Show when={delivery()}>
             <box flexDirection="row" paddingTop={1}>
               <text fg={theme.text.base}>
-                <span style={{ bg: theme.decrease(theme.background.raised.base), fg: theme.text.muted }}>
-                  {" 未送达 "}
+                <span style={{ bg: theme.decrease(theme.background.raised.base), fg: theme.text.muted, italic: true }}>
+                  {" Pending... "}
                 </span>
               </text>
             </box>
@@ -2389,7 +2389,7 @@ function QueuedPromptDock(props: { prompts: { id: string; text: string }[]; onOp
         flexDirection="row"
       >
         <text fg={theme.text.muted} wrapMode="none" truncate flexGrow={1} flexShrink={1} minWidth={0}>
-          <span style={{ fg: theme.text.base }}>{props.prompts.length} 条未送达</span>
+          <span style={{ fg: theme.text.base, italic: true }}>{props.prompts.length} Pending...</span>
           <Show when={next()}>{(text) => <> · {text()}</>}</Show>
         </text>
       </box>

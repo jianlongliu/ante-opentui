@@ -339,7 +339,11 @@ impl Ante {
 struct Store {
     ante: Ante,
     sessions: Arc<Mutex<Vec<Value>>>,
-    messages: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    /// What the shim handed Ante, as (staged text, the client's message id). The
+    /// transcript is read back from Ante's log and opencode reconciles it by id,
+    /// so a prompt submitted here has to come back under the id the client is
+    /// already holding a row for.
+    handed: Arc<Mutex<Vec<(String, String)>>>,
     /// Prompts the client queued instead of steering. opencode's inbox lives on
     /// the server, so ours does too: the shim holds them and hands each one over
     /// at the turn boundary (or right away when the user steers it). Ante cannot
@@ -366,7 +370,7 @@ impl Store {
         let (events, _) = broadcast::channel(1024);
         Self {
             sessions: Arc::new(Mutex::new(Vec::new())),
-            messages: Arc::new(Mutex::new(HashMap::new())),
+            handed: Arc::new(Mutex::new(Vec::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             acked: Arc::new(Mutex::new(HashMap::new())),
             sent: Arc::new(Mutex::new(HashMap::new())),
@@ -397,6 +401,20 @@ impl Store {
         if let Ok(mut sent) = self.sent.lock() {
             sent.insert(inbox_id.to_string(), text.to_string());
         }
+    }
+
+    /// Record a prompt this process handed Ante, so the transcript read back from
+    /// Ante's log can give it the id the client already has a row under. Unlike
+    /// `sent`, this survives the hand-over: the row the client holds is read back
+    /// long after the prompt stopped being queued.
+    fn remember_handed(&self, inbox_id: &str, staged: &str) {
+        if let Ok(mut handed) = self.handed.lock() {
+            handed.push((staged.to_string(), inbox_id.to_string()));
+        }
+    }
+
+    fn handed(&self) -> Vec<(String, String)> {
+        self.handed.lock().map(|handed| handed.clone()).unwrap_or_default()
     }
 
     fn forget_sent(&self, inbox_id: &str) {
@@ -950,7 +968,11 @@ async fn spawn_ante(store: Store) {
     // A turn is made of steps (one model call each): Ante starts a step, may
     // call tools, then starts another. opencode models each step as its own
     // assistant message, so the step is opened lazily on its first content
-    // event and closed once a tool ends.
+    // event and closed once a tool ends. The message id is derived from the turn
+    // and the step, not minted: a transcript read back from Ante's log names the
+    // same steps the same way, and opencode reconciles a fetched transcript by id.
+    let mut turn = String::from("turn");
+    let mut steps = 0u32;
     let mut message_id = String::new();
     let mut step_open = false;
     let mut text_started = false;
@@ -1003,7 +1025,8 @@ async fn spawn_ante(store: Store) {
                     reasoning_text.clear();
                     text_part = 0;
                     reasoning_part = 0;
-                    message_id = uid("msg");
+                    steps += 1;
+                    message_id = step_message_id(&turn, steps);
                     let (provider, model) = store
                         .ante
                         .model
@@ -1111,7 +1134,9 @@ async fn spawn_ante(store: Store) {
                     log_line(&format!("ante: 消息 {inbox_id} 已被 Ante 收下，等下一步"));
                 }
             }
-            Evt::TurnStart { .. } => {
+            Evt::TurnStart { turn_id } => {
+                turn = turn_id.to_string();
+                steps = 0;
                 step_open = false;
                 store.ante.set_busy(true);
                 herdr::report("working", None, Some(&session));
@@ -2143,7 +2168,6 @@ async fn session_delete(State(store): State<Store>, Path(id): Path<String>) -> R
     if let Ok(mut sessions) = store.sessions.lock() {
         sessions.retain(|session| session["id"] != id.as_str() && session["id"] != archive.as_str());
     }
-    let _ = store.messages.lock().map(|mut messages| messages.remove(&id));
     let _ = store.pending.lock().map(|mut queues| queues.remove(&id));
     if let Ok(mut archives) = store.ante.archives.lock() {
         archives.retain(|client, name| client != &id && name != &archive);
@@ -2205,7 +2229,6 @@ async fn session_create(
     if let Ok(mut sessions) = store.sessions.lock() {
         sessions.push(info.clone());
     }
-    store.messages.lock().map(|mut m| m.insert(id.clone(), Vec::new())).ok();
     store.publish_durable("session.created", json!({ "sessionID": id }), &id);
     Json(json!({ "data": info }))
 }
@@ -2276,20 +2299,55 @@ async fn session_get(State(store): State<Store>, Path(id): Path<String>) -> Json
     Json(json!({ "data": info }))
 }
 
-/// Ante persists every session event to `events.jsonl`; replaying it rebuilds
-/// the transcript opencode asks for when a session is opened.
+/// The assistant message a step writes into. Both halves of the shim need the
+/// same id: the pump streams a live step under it, and a transcript read back from
+/// Ante's log rebuilds that step under it too. opencode reconciles a fetched
+/// transcript by id, so without this a re-read of a session this process is
+/// driving doubles every step it already has on screen.
+fn step_message_id(turn: &str, step: u32) -> String {
+    format!("msg_{turn}_{step}")
+}
+
+/// Ante persists every session event to `events.jsonl`; replaying it rebuilds the
+/// transcript opencode asks for when a session is opened.
 ///
 /// Each line is `{timestamp, id, event: {<variant>: <payload>}, parent}`, and the
-/// `event` field is exactly Ante's `Evt` in serde form, so the fold is the same
-/// shape as the live pump. v1 covers user turns and assistant text.
-fn replay_session(id: &str) -> Vec<Value> {
+/// `event` field is exactly Ante's `Evt` in serde form, so this fold is the shape
+/// the live pump publishes: one assistant message per *step* (one model call),
+/// carrying that step's thinking, its answer and its tool calls as parts. Folding
+/// a whole turn into a single text message is what lost the thinking blocks — and,
+/// once a steered prompt had landed mid-turn, every answer after it.
+///
+/// `handed` is what this process gave Ante, as (staged text, the client's message
+/// id), so a prompt submitted here keeps the row the client already has.
+fn replay_session(id: &str, handed: &[(String, String)]) -> Vec<Value> {
     let Ok(raw) = std::fs::read_to_string(ante_home().join("sessions").join(id).join("events.jsonl")) else {
         return Vec::new();
     };
-    let model = session_meta(id).map(|meta| meta_model(&meta)).unwrap_or_else(active_model);
+    let (provider, model) = session_meta(id).map(|meta| meta_model(&meta)).unwrap_or_else(active_model);
+
+    /// The step being written: the assistant message it belongs to, and the parts
+    /// already open in it.
+    struct Step {
+        message: usize,
+        /// The open reasoning part, and how many this step has had: Ante repeats
+        /// the whole block at the end of a streamed one, and that copy must not
+        /// open a second part.
+        reasoning: Option<usize>,
+        blocks: u32,
+        /// The step's answer is one text part; a later `AgentMessage` fills it.
+        text: Option<usize>,
+    }
 
     let mut messages: Vec<Value> = Vec::new();
     let mut ordinal = 0u64;
+    let mut turn = String::from("turn");
+    let mut steps = 0u32;
+    let mut step: Option<Step> = None;
+    // Tool parts by call id, so `ToolEnd` can close the part `ToolStart` opened.
+    let mut calls: std::collections::HashMap<String, (usize, usize)> = std::collections::HashMap::new();
+    let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     for line in raw.lines() {
         let Ok(wrapper) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -2307,12 +2365,90 @@ fn replay_session(id: &str) -> Vec<Value> {
             .map(|when| when.timestamp_millis())
             .unwrap_or_else(now_ms);
         ordinal += 1;
-        let id = format!("msg_{:016x}{:04x}", created as u64, ordinal);
+        // Only rows with no better identity of their own are keyed by position.
+        let log_id = format!("msg_{:016x}{:04x}", created as u64, ordinal);
+
+        // A step is one model call: these open it on the first content event and
+        // close it when a tool ends, exactly as the live pump does.
+        macro_rules! ensure_step {
+            () => {
+                if step.is_none() {
+                    // Opening the next step is what closes the one before it — the
+                    // same way the client's own fold closes the assistant message
+                    // it was streaming into. A prompt steered in mid-turn sits in
+                    // between, so this looks back for it rather than at the tail.
+                    if let Some(last) = messages.iter_mut().rev().find(|message| {
+                        message["type"] == "assistant" && message["time"].get("completed").is_none()
+                    }) {
+                        last["time"]["completed"] = json!(created);
+                    }
+                    steps += 1;
+                    messages.push(json!({
+                        "id": step_message_id(&turn, steps),
+                        "type": "assistant",
+                        "agent": reported_agent(),
+                        "model": { "id": model, "providerID": provider },
+                        "content": [],
+                        "cost": 0,
+                        "time": { "created": created },
+                    }));
+                    step = Some(Step { message: messages.len() - 1, reasoning: None, blocks: 0, text: None });
+                }
+            };
+        }
+        macro_rules! close_reasoning {
+            () => {
+                if let Some(fold) = step.as_mut()
+                    && let Some(index) = fold.reasoning.take()
+                    && let Some(part) = messages.get_mut(fold.message).and_then(|m| m["content"].get_mut(index))
+                {
+                    part["time"]["completed"] = json!(created);
+                }
+            };
+        }
+        macro_rules! open_reasoning {
+            () => {
+                ensure_step!();
+                if let Some(fold) = step.as_mut()
+                    && fold.reasoning.is_none()
+                {
+                    let content = messages[fold.message]["content"].as_array_mut().expect("content");
+                    content.push(json!({ "type": "reasoning", "text": "", "time": { "created": created } }));
+                    fold.reasoning = Some(content.len() - 1);
+                    fold.blocks += 1;
+                }
+            };
+        }
+        macro_rules! ensure_text {
+            () => {
+                ensure_step!();
+                let fold = step.as_mut().expect("step");
+                if fold.text.is_none() {
+                    let content = messages[fold.message]["content"].as_array_mut().expect("content");
+                    content.push(json!({ "type": "text", "text": "" }));
+                    fold.text = Some(content.len() - 1);
+                }
+            };
+        }
+
         match event {
             Evt::UserInput(recorded) => {
-                // A message Ante recorded carries the mentions staged for its
-                // pasted images (plus the folder listing Ante loaded for them):
-                // the transcript wants the message back, with the images.
+                // A recorded input is what we staged — the user's own text plus a
+                // mention per pasted image — with whatever Ante loaded for that
+                // mention appended, hence the same comparison the ack uses.
+                let expanded = attachments::strip_expansion(&recorded);
+                let id = handed
+                    .iter()
+                    .find(|(staged, id)| {
+                        !claimed.contains(id)
+                            && (staged == &recorded || staged == &expanded || expanded.starts_with(staged.as_str()))
+                    })
+                    .map(|(_, id)| {
+                        claimed.insert(id.clone());
+                        id.clone()
+                    })
+                    .unwrap_or_else(|| log_id.clone());
+                // The transcript wants the message back, with the images.
                 let (text, files) = attachments::from_log(&recorded);
                 messages.push(json!({
                     "id": id,
@@ -2322,22 +2458,137 @@ fn replay_session(id: &str) -> Vec<Value> {
                     "agents": [],
                     "skills": [],
                     "time": { "created": created },
-                }))
+                }));
             }
-            Evt::TurnStart { .. } => messages.push(json!({
-                "id": id,
-                "type": "assistant",
-                "agent": reported_agent(),
-                "model": { "id": model.1, "providerID": model.0 },
-                "content": [],
-                "time": { "created": created },
-            })),
-            Evt::AgentMessage(text) => {
-                if let Some(last) = messages.last_mut() {
-                    if last["type"] == "assistant" {
-                        last["content"] = json!([{ "type": "text", "text": text }]);
-                        last["time"]["completed"] = json!(created);
+            Evt::TurnStart { turn_id } => {
+                turn = turn_id.to_string();
+                steps = 0;
+                step = None;
+            }
+            Evt::ThinkingDelta(delta) => {
+                open_reasoning!();
+                if let Some(fold) = step.as_ref()
+                    && let Some(index) = fold.reasoning
+                    && let Some(part) = messages.get_mut(fold.message).and_then(|m| m["content"].get_mut(index))
+                {
+                    let text = part["text"].as_str().unwrap_or("").to_string();
+                    part["text"] = json!(format!("{text}{delta}"));
+                }
+            }
+            Evt::Thinking(text) => {
+                // The aggregate only opens a part when this step never streamed
+                // one; otherwise it is the same block, already closed.
+                if !text.trim().is_empty() && step.as_ref().is_none_or(|fold| fold.blocks == 0) {
+                    open_reasoning!();
+                    if let Some(fold) = step.as_mut()
+                        && let Some(index) = fold.reasoning
+                    {
+                        messages[fold.message]["content"][index]["text"] = json!(text);
                     }
+                }
+                close_reasoning!();
+            }
+            Evt::MessageDelta(delta) => {
+                ensure_text!();
+                close_reasoning!();
+                if let Some(fold) = step.as_ref()
+                    && let Some(index) = fold.text
+                    && let Some(part) = messages.get_mut(fold.message).and_then(|m| m["content"].get_mut(index))
+                {
+                    let text = part["text"].as_str().unwrap_or("").to_string();
+                    part["text"] = json!(format!("{text}{delta}"));
+                }
+            }
+            Evt::AgentMessage(text) => {
+                ensure_text!();
+                close_reasoning!();
+                if let Some(fold) = step.as_ref()
+                    && let Some(index) = fold.text
+                {
+                    messages[fold.message]["content"][index]["text"] = json!(text);
+                }
+            }
+            Evt::ToolStart(tool) => {
+                ensure_step!();
+                close_reasoning!();
+                if let Some(fold) = step.as_mut() {
+                    let content = messages[fold.message]["content"].as_array_mut().expect("content");
+                    content.push(json!({
+                        "type": "tool",
+                        "id": tool.id,
+                        "name": tool.name,
+                        "executed": false,
+                        "state": { "status": "running", "input": tool.args, "metadata": {} },
+                        "time": { "created": created, "ran": created },
+                    }));
+                    calls.insert(tool.id.clone(), (fold.message, content.len() - 1));
+                }
+            }
+            Evt::ToolEnd(end) => {
+                let failed = !matches!(end.status, ante_sdk::protocol::ToolEndStatus::Completed);
+                let text = result_text(&end.result_json);
+                if let Some((message, index)) = calls.remove(&end.tool_use_id)
+                    && let Some(part) = messages.get_mut(message).and_then(|m| m["content"].get_mut(index))
+                {
+                    let input = part["state"]["input"].clone();
+                    part["state"] = if failed {
+                        json!({
+                            "status": "error",
+                            "input": input,
+                            "error": { "type": "tool_error", "message": text },
+                            "metadata": {},
+                            "content": [],
+                        })
+                    } else {
+                        json!({
+                            "status": "completed",
+                            "input": input,
+                            "metadata": {},
+                            "content": [{ "type": "text", "text": text }],
+                        })
+                    };
+                    part["executed"] = json!(true);
+                    part["time"]["completed"] = json!(created);
+                }
+                // The next content begins a fresh step (and message).
+                step = None;
+            }
+            Evt::UsageUpdate { usage, .. } => {
+                if let Some(fold) = step.as_ref() {
+                    messages[fold.message]["tokens"] = json!({
+                        "input": usage.input_tokens,
+                        "output": usage.output_tokens,
+                        "reasoning": 0,
+                        "cache": { "read": usage.cache_read_tokens, "write": usage.cache_creation_tokens },
+                    });
+                }
+            }
+            Evt::TurnEnd { status, .. } => {
+                close_reasoning!();
+                let failed = matches!(&status, ante_sdk::protocol::TurnEndStatus::Error { .. });
+                if let Some(fold) = step.take() {
+                    messages[fold.message]["finish"] = json!(if failed { "error" } else { "stop" });
+                    messages[fold.message]["time"]["completed"] = json!(created);
+                }
+                // A failed turn ends with no answer at all; the log is the only
+                // place the reason survives, so it lands as its own message.
+                if let ante_sdk::protocol::TurnEndStatus::Error { kind, headline, details } = &status {
+                    let message = if details.is_empty() {
+                        headline.clone()
+                    } else {
+                        format!("{headline} — {}", details.join("; "))
+                    };
+                    messages.push(json!({
+                        "id": log_id.clone(),
+                        "type": "assistant",
+                        "agent": reported_agent(),
+                        "model": { "id": model, "providerID": provider },
+                        "content": [],
+                        "cost": 0,
+                        "error": { "type": kind.clone().unwrap_or_else(|| "error".to_string()), "message": message },
+                        "finish": "error",
+                        "time": { "created": created, "completed": created },
+                    }));
                 }
             }
             _ => {}
@@ -2351,15 +2602,12 @@ async fn session_messages(
     Path(id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Json<Value> {
-    // A session this process is driving comes from the live store; anything else
-    // is read back from Ante's event log.
-    let live = store
-        .messages
-        .lock()
-        .ok()
-        .and_then(|m| m.get(&id).cloned())
-        .unwrap_or_default();
-    let mut data = if live.is_empty() { replay_session(&id) } else { live };
+    // Ante's log is the transcript, live session or not: it holds every step and
+    // every part of the conversation, where the shim's own store only ever held
+    // the prompts it submitted. A session the client named itself lives under the
+    // archive Ante opened for it, so that is what gets read back.
+    let archive = store.ante.archive_of(&id).unwrap_or_else(|| id.clone());
+    let mut data = replay_session(&archive, &store.handed());
     // The transcript is read newest-first with a limit; honour both.
     if params.get("order").map(|value| value == "desc").unwrap_or(false) {
         data.reverse();
@@ -2528,7 +2776,6 @@ async fn session_prompt(
         "skills": [],
         "time": { "created": now_ms() },
     });
-    store.messages.lock().ok().and_then(|mut m| m.get_mut(&id).map(|list| list.push(user.clone())));
     store.publish("message.updated", json!({ "sessionID": id, "info": user }));
 
     // Tell the client about the user's message: `inbox.enqueued` admits it into
@@ -2555,6 +2802,7 @@ async fn session_prompt(
         queues.entry(id.clone()).or_default().push(item.clone());
     }
     store.remember_sent(&user_id, &staged);
+    store.remember_handed(&user_id, &staged);
     if delivery == "queue" {
         // Held, not handed over: it leaves the queue at the turn boundary — or
         // because the user steered/deleted it.

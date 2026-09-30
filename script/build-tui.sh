@@ -14,9 +14,15 @@
 #   vendor/opencode/packages/tui/src/feature-plugins/home/footer.tsx
 #                                                              —— 首页右下角的版本号改成 `ante <后端版本> · antex <构建日期>`
 #                                                                 （上游画的是客户端自己的版本，跟两端都不相干）
-#   vendor/opencode/packages/tui/src/routes/session/index.tsx  —— 待递送的消息挂「未送达」角标，
-#                                                                 队列 dock 从 «N queued» 改成 «N 条未送达 · 内容»
+#   vendor/opencode/packages/tui/src/routes/session/index.tsx  —— 待递送的消息挂斜体 `Pending...` 角标，
+#                                                                 队列 dock 从 «N queued» 改成 «N Pending... · 内容»
 #                                                                 （送没送到由垫片判：下一个 step 开始才算送到）
+#   vendor/opencode/packages/client/src/solid/data.ts          —— ① 拉取 transcript 时不再丢掉「这次没提到的行」
+#                                                                 （垫片那份来自 Ante 日志，客户端自己从事件折出来的
+#                                                                  idle / compaction / 正在流的那一步不在里面）
+#                                                              —— ② editText 在没有 text part 时补建一个，
+#                                                                 使重读插进「正流到一半」的那步后 delta 仍有处可落
+#                                                                 （两处都见 README「记录回读」）
 #   vendor/opencode/packages/tui/src/context/keymap.tsx        —— 黑名单：把 Ante 做不了的命令从命令面板
 #                                                                 和斜杠补全一次摘掉（名单见 README）
 #   vendor/opencode/packages/tui/src/feature-plugins/sidebar/footer.tsx
