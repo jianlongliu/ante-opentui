@@ -1,0 +1,66 @@
+# 打 tag 推上来就出一个包（.pkg.tar.zst）挂到 Release；workflow_dispatch 手动点也行。
+#
+# 为什么用容器手跑 docker 而不是 container: 任务：archlinux 镜像里没有 node，
+# 而 actions/checkout、action-gh-release 这些 JS action 在容器任务里需要 node，
+# 会直接失败。所以任务跑在 ubuntu 上，只在里面调 docker 起 Arch。
+#
+# 构建目录 /build 是空的、隔离的：makepkg 默认的 $srcdir 是 startdir/src，而这个仓库
+# 根目录本身就有一个 src/（Rust 源码），在仓库根跑 makepkg 会往那儿克隆、撞车。
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  pkg:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 定版本（以 PKGBUILD 的 pkgver 为准）
+        id: ver
+        run: |
+          pkgver=$(sed -n 's/^pkgver=//p' PKGBUILD)
+          test -n "$pkgver"
+          echo "pkgver=$pkgver" >> "$GITHUB_OUTPUT"
+          echo "tag=v$pkgver" >> "$GITHUB_OUTPUT"
+
+      - name: tag 与 PKGBUILD 对不上就停（免得编出一个名不副实的包）
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          test "${{ steps.ver.outputs.tag }}" = "${GITHUB_REF_NAME}" || {
+            echo "PKGBUILD pkgver = ${{ steps.ver.outputs.pkgver }}，但推上来的 tag 是 ${GITHUB_REF_NAME}"
+            exit 1
+          }
+
+      # 手动触发时 tag 还不存在，而 PKGBUILD 的 source 就指向这个 tag，先补上。
+      - name: 手动触发时补打 tag
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git tag "${{ steps.ver.outputs.tag }}" 2>/dev/null || true
+          git push origin "${{ steps.ver.outputs.tag }}"
+
+      - name: 在 Arch 容器里 makepkg
+        run: |
+          mkdir -p build
+          cp PKGBUILD build/
+          docker run --rm -v "$PWD/build":/build -w /build archlinux:latest \
+            bash -euxo pipefail -c '
+              pacman -Syu --noconfirm --needed base-devel rust bun git
+              useradd -m builder
+              chown -R builder /build
+              su builder -c "makepkg -f --noconfirm"
+            '
+          ls -l build/*.pkg.tar.zst
+
+      - name: 挂到 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          files: build/*.pkg.tar.zst
+          generate_release_notes: true
