@@ -785,16 +785,31 @@ impl Store {
 
     /// Ephemeral event: no durable envelope.
     fn publish(&self, name: &str, data: Value) {
-        self.publish_inner(name, data, None);
+        self.publish_inner(name, data, None, None);
+    }
+
+    /// An event the client routes *by location*. Its handler for these sits
+    /// behind `if (!event.location) return` in the client's store, so an event
+    /// published without one is read and thrown away — silently, with no error
+    /// anywhere. `form.*` is such a family (`permission.*`, which works, is
+    /// handled before that gate).
+    fn publish_located(&self, name: &str, data: Value) {
+        self.publish_inner(name, data, None, Some(loc_plain()));
     }
 
     /// Durable event. `Payload` for a durable definition requires the
     /// `{aggregateID, seq, version}` envelope on top of the common fields.
     fn publish_durable(&self, name: &str, data: Value, aggregate: &str) {
-        self.publish_inner(name, data, Some(aggregate.to_string()));
+        self.publish_inner(name, data, Some(aggregate.to_string()), None);
     }
 
-    fn publish_inner(&self, name: &str, data: Value, aggregate: Option<String>) {
+    fn publish_inner(
+        &self,
+        name: &str,
+        data: Value,
+        aggregate: Option<String>,
+        location: Option<Value>,
+    ) {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let mut event = json!({
             "id": uid("evt"),
@@ -802,6 +817,9 @@ impl Store {
             "created": now_ms(),
             "data": data,
         });
+        if let Some(place) = location {
+            event["location"] = place;
+        }
         if let Some(aggregate_id) = aggregate {
             event["durable"] = json!({
                 "aggregateID": aggregate_id,
@@ -1872,12 +1890,16 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
                     &session,
                 );
                 // The cell can only say "Asked N questions" — the options are the
-                // client's form prompt, so the call is mirrored into one.
+                // client's form prompt, so the call is mirrored into one. The
+                // location has to ride both the event and the form itself: the
+                // client's `form.created` branch sits behind a `location` gate,
+                // and its `removeForm` keeps any form that carries none.
                 if tool.name == "AskUser"
-                    && let Some(form) = askuser_form(&tool.args, &session, &message_id, &tool.id)
+                    && let Some(mut form) = askuser_form(&tool.args, &session, &message_id, &tool.id)
                 {
+                    form["location"] = loc_plain();
                     store.hold_form(form.clone());
-                    store.publish("form.created", json!({ "form": form }));
+                    store.publish_located("form.created", json!({ "form": form }));
                 }
             }
             Evt::ToolEnd(end) => {
@@ -1911,7 +1933,7 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
                 // A question stands only while its call does: answered (the reply
                 // came back as the user's message) or overtaken, the prompt goes.
                 for form in store.drop_tool_forms(&session, &end.tool_use_id) {
-                    store.publish("form.cancelled", json!({ "sessionID": session, "id": form }));
+                    store.publish_located("form.cancelled", json!({ "sessionID": session, "id": form }));
                 }
                 // The next content begins a fresh step (and message).
                 step_open = false;
@@ -3418,7 +3440,7 @@ async fn session_form_cancel(
     if store.take_form(&form_id).is_none() {
         return axum::http::StatusCode::NOT_FOUND;
     }
-    store.publish("form.cancelled", json!({ "sessionID": id, "id": form_id }));
+    store.publish_located("form.cancelled", json!({ "sessionID": id, "id": form_id }));
     axum::http::StatusCode::NO_CONTENT
 }
 
@@ -3438,7 +3460,7 @@ async fn session_form_reply(
     };
     let answer = body.get("answer").cloned().unwrap_or(json!({}));
     let text = question_answer_text(&form, &answer);
-    store.publish("form.replied", json!({ "sessionID": id, "id": form_id, "answer": answer }));
+    store.publish_located("form.replied", json!({ "sessionID": id, "id": form_id, "answer": answer }));
     let prompt = json!({ "text": text, "id": uid("msg"), "delivery": "steer" });
     let _ = session_prompt(State(store.clone()), Path(id), Json(prompt)).await;
     axum::http::StatusCode::NO_CONTENT
@@ -3962,5 +3984,28 @@ mod tests {
         // worth saying out loud — "nothing" is not something to guess at.
         assert!(question_answer_text(&form, &json!({ "q0": "" })).contains("跳过"));
         assert_eq!(question_answer_text(&form, &json!({})), "（用户跳过了这次提问，没有作答）");
+    }
+
+    #[test]
+    fn a_form_event_carries_the_location_the_client_routes_by() {
+        // Without it the client reads the frame and throws it away — no error, no
+        // form. Both the event and the form itself need it: the client's
+        // `removeForm` keeps a form that carries none, so a reply would never
+        // clear the prompt.
+        let store = Store::new();
+        let mut feed = store.events.subscribe();
+        let mut form = json!({ "id": "frm_1", "sessionID": "ses_1", "fields": [] });
+        form["location"] = loc_plain();
+        store.publish_located("form.created", json!({ "form": form }));
+        let event = feed.try_recv().expect("the frame reaches the feed");
+        assert_eq!(event["type"], json!("form.created"));
+        assert_eq!(event["location"]["directory"], json!(default_directory()));
+        assert_eq!(event["data"]["form"]["location"]["directory"], json!(default_directory()));
+        assert!(event.get("durable").is_none(), "form events are not durable");
+
+        // Everything else stays location-free on purpose: the client's catalog
+        // branch is behind that gate too, and it must not start firing.
+        store.publish("message.updated", json!({ "sessionID": "ses_1" }));
+        assert!(feed.try_recv().expect("the second frame").get("location").is_none());
     }
 }
