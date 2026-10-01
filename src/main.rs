@@ -29,7 +29,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{get, patch, post},
+    routing::{delete, get, patch, post},
 };
 use futures::stream::{self, Stream, StreamExt};
 use serde_json::{Value, json};
@@ -526,6 +526,11 @@ struct Store {
     /// transcript, so the repeat would shove it past the reply it had just been
     /// placed in front of.
     delivered: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Questions Ante asked and is still waiting on, keyed by the form id the
+    /// client was given. A call shows up in the tool cell as "Asked N questions"
+    /// — the options live in opencode's *form* prompt — so the call is mirrored
+    /// into one and held here until the user picks something.
+    forms: Arc<Mutex<HashMap<String, Value>>>,
     /// Frames fan out to every connected `/api/event` feed.
     events: broadcast::Sender<Value>,
 }
@@ -540,6 +545,7 @@ impl Store {
             acked: Arc::new(Mutex::new(HashMap::new())),
             sent: Arc::new(Mutex::new(HashMap::new())),
             delivered: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            forms: Arc::new(Mutex::new(HashMap::new())),
             events,
             ante: Ante::new(),
         }
@@ -731,6 +737,52 @@ impl Store {
         steers
     }
 
+    /// Hold a question form until it is answered or its call is over.
+    fn hold_form(&self, form: Value) {
+        let Some(id) = form["id"].as_str().map(str::to_string) else {
+            return;
+        };
+        if let Ok(mut forms) = self.forms.lock() {
+            forms.insert(id, form);
+        }
+    }
+
+    fn take_form(&self, form_id: &str) -> Option<Value> {
+        self.forms.lock().ok()?.remove(form_id)
+    }
+
+    /// The questions still open in this session, for the client's form list.
+    fn held_forms(&self, session: &str) -> Vec<Value> {
+        self.forms
+            .lock()
+            .map(|forms| {
+                forms
+                    .values()
+                    .filter(|form| form["sessionID"] == session)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Forget the forms a finished tool call was holding, by the call's id.
+    fn drop_tool_forms(&self, session: &str, tool_call: &str) -> Vec<String> {
+        let Ok(mut forms) = self.forms.lock() else {
+            return Vec::new();
+        };
+        let done: Vec<String> = forms
+            .iter()
+            .filter(|(_, form)| {
+                form["sessionID"] == session && form["metadata"]["tool"]["id"] == tool_call
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &done {
+            forms.remove(id);
+        }
+        done
+    }
+
     /// Ephemeral event: no durable envelope.
     fn publish(&self, name: &str, data: Value) {
         self.publish_inner(name, data, None);
@@ -898,6 +950,110 @@ fn client_tool_args(name: &str, args: &Value) -> Value {
         object.insert("path".to_string(), path);
     }
     args
+}
+
+/// Ante's `AskUser` as one of opencode's question forms.
+///
+/// The two sides do not agree on a shape: Ante sends
+/// `{questions: [{header, question, options: [{label, description}], multiple}]}`
+/// and the client draws *fields*. The option list is the whole point — the tool
+/// cell can only say "Asked N questions" — so every question becomes a field: a
+/// single pick a `string` carrying `options` (there is no enum field type), a
+/// multiple one a `multiselect`.
+fn askuser_form(args: &Value, session: &str, message_id: &str, tool_call: &str) -> Option<Value> {
+    let questions = args["questions"].as_array().filter(|q| !q.is_empty())?;
+    let mut fields = Vec::new();
+    for (index, question) in questions.iter().enumerate() {
+        let header = question["header"].as_str().unwrap_or("");
+        let ask = question["question"].as_str().unwrap_or("");
+        // Ante has no field for a headline, so the header becomes the label and
+        // the question itself the line under it.
+        let label = if header.is_empty() { ask } else { header };
+        // An option's label is also its value: the answer travels back to Ante as
+        // the user's own message, so the words they saw are the words to send.
+        let options: Vec<Value> = question["options"]
+            .as_array()
+            .map(|options| {
+                options
+                    .iter()
+                    .filter_map(|option| {
+                        let label = option["label"].as_str()?;
+                        let mut mapped = json!({ "value": label, "label": label });
+                        if let Some(description) = option["description"].as_str() {
+                            mapped["description"] = json!(description);
+                        }
+                        Some(mapped)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let multiple = question["multiple"].as_bool().unwrap_or(false);
+        let mut field = json!({
+            "key": format!("q{index}"),
+            "type": if multiple { "multiselect" } else { "string" },
+            "title": if label.is_empty() { format!("q{index}") } else { label.to_string() },
+            "required": true,
+            // Writing an answer the model did not offer has to stay possible:
+            // these are options, not the last word.
+            "custom": question["custom"].as_bool().unwrap_or(true),
+        });
+        if !ask.is_empty() {
+            field["description"] = json!(ask);
+        }
+        if !options.is_empty() {
+            field["options"] = json!(options);
+        }
+        fields.push(field);
+    }
+    let title = match fields.len() {
+        1 => short(fields[0]["title"].as_str().unwrap_or("Question"), 60),
+        count => format!("{count} questions"),
+    };
+    Some(json!({
+        // Derived from the call, so the same question never opens twice.
+        "id": format!("frm_{tool_call}"),
+        "sessionID": session,
+        "title": title,
+        "metadata": { "kind": "question", "tool": { "messageID": message_id, "id": tool_call } },
+        "fields": fields,
+    }))
+}
+
+/// What the user's answer becomes on the way back to Ante.
+///
+/// A plain message, because that is what settles the call there — Ante has no op
+/// that answers an `AskUser` (a question is over when the next user input
+/// arrives). The picked labels are the words the user saw in the prompt.
+fn question_answer_text(form: &Value, answer: &Value) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for field in form["fields"].as_array().into_iter().flatten() {
+        let key = field["key"].as_str().unwrap_or_default();
+        let picked = match &answer[key] {
+            Value::Null => continue,
+            Value::Array(values) => values
+                .iter()
+                .map(|value| value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string()))
+                .collect::<Vec<_>>()
+                .join(", "),
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        let picked = picked.trim();
+        if picked.is_empty() {
+            continue;
+        }
+        let label = field["title"]
+            .as_str()
+            .or_else(|| field["description"].as_str())
+            .unwrap_or(key);
+        lines.push(format!("- {label}：{picked}"));
+    }
+    if lines.is_empty() {
+        // The client allows skipping a question, and "nothing" is an answer the
+        // model should not have to guess at.
+        return "（用户跳过了这次提问，没有作答）".to_string();
+    }
+    format!("回答提问：\n{}", lines.join("\n"))
 }
 
 /// The readable part of a tool result, for the tool cell.
@@ -1715,6 +1871,14 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
                     }),
                     &session,
                 );
+                // The cell can only say "Asked N questions" — the options are the
+                // client's form prompt, so the call is mirrored into one.
+                if tool.name == "AskUser"
+                    && let Some(form) = askuser_form(&tool.args, &session, &message_id, &tool.id)
+                {
+                    store.hold_form(form.clone());
+                    store.publish("form.created", json!({ "form": form }));
+                }
             }
             Evt::ToolEnd(end) => {
                 let failed = !matches!(end.status, ante_sdk::protocol::ToolEndStatus::Completed);
@@ -1744,6 +1908,11 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
                 };
                 let name = if failed { "session.tool.failed" } else { "session.tool.success" };
                 store.publish_durable(name, payload, &session);
+                // A question stands only while its call does: answered (the reply
+                // came back as the user's message) or overtaken, the prompt goes.
+                for form in store.drop_tool_forms(&session, &end.tool_use_id) {
+                    store.publish("form.cancelled", json!({ "sessionID": session, "id": form }));
+                }
                 // The next content begins a fresh step (and message).
                 step_open = false;
             }
@@ -2460,7 +2629,9 @@ async fn providers() -> Json<Value> {
 }
 
 async fn vcs() -> Json<Value> {
-    envelope(json!({ "provider": "git", "branch": { "current": "main", "default": "main" } }))
+    // Ante has no VCS. An empty branch keeps the client from appending a fake
+    // `:main` to every location label (`dir:branch` in the prompt and sidebar footers).
+    envelope(json!({ "branch": {} }))
 }
 
 async fn migration() -> Json<Value> {
@@ -2473,13 +2644,6 @@ async fn plugins() -> Json<Value> {
 
 async fn empty_reads() -> Json<Value> {
     envelope(json!([]))
-}
-
-/// `/inbox` and `/form` answer `{data: []}` and nothing else — their schemas set
-/// `additionalProperties: false`, so the usual `location` field makes the whole
-/// response fail validation (and the session view then refuses to open).
-async fn bare_empty() -> Json<Value> {
-    Json(json!({ "data": [] }))
 }
 
 /// `/api/session/active` and friends: the client's submit path reads
@@ -3234,6 +3398,52 @@ async fn session_inbox_cancel(
     axum::http::StatusCode::NO_CONTENT
 }
 
+/// `GET /api/session/{id}/form` — the questions still open in this session. The
+/// client reads it when a session is opened, so answering has to survive a tab
+/// switch; a question that is over is gone from here, not left as a stale prompt.
+/// Like `/inbox`, the schema is strict (`additionalProperties: false`), so the
+/// answer is a bare `{data: […]}` — a `location` field fails the whole read and
+/// the session view then refuses to open.
+async fn session_forms(State(store): State<Store>, Path(id): Path<String>) -> Json<Value> {
+    Json(json!({ "data": store.held_forms(&id) }))
+}
+
+/// `DELETE /api/session/{id}/form/{form_id}` — the user dismissed the question.
+/// Nothing goes to Ante: it cannot withdraw the call, and the next message the
+/// user sends settles it either way.
+async fn session_form_cancel(
+    State(store): State<Store>,
+    Path((id, form_id)): Path<(String, String)>,
+) -> axum::http::StatusCode {
+    if store.take_form(&form_id).is_none() {
+        return axum::http::StatusCode::NOT_FOUND;
+    }
+    store.publish("form.cancelled", json!({ "sessionID": id, "id": form_id }));
+    axum::http::StatusCode::NO_CONTENT
+}
+
+/// `POST /api/session/{id}/form/{form_id}/reply` — the user picked an option.
+///
+/// The answer goes to Ante as the user's next message, which is the only thing
+/// that settles an `AskUser` there (see `askuser_form`) — so the reply rides the
+/// ordinary prompt route instead of a channel of its own, and the picked label
+/// lands in the transcript as what it is: what the user said.
+async fn session_form_reply(
+    State(store): State<Store>,
+    Path((id, form_id)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> axum::http::StatusCode {
+    let Some(form) = store.take_form(&form_id) else {
+        return axum::http::StatusCode::NOT_FOUND;
+    };
+    let answer = body.get("answer").cloned().unwrap_or(json!({}));
+    let text = question_answer_text(&form, &answer);
+    store.publish("form.replied", json!({ "sessionID": id, "id": form_id, "answer": answer }));
+    let prompt = json!({ "text": text, "id": uid("msg"), "delivery": "steer" });
+    let _ = session_prompt(State(store.clone()), Path(id), Json(prompt)).await;
+    axum::http::StatusCode::NO_CONTENT
+}
+
 /// The prompt the user typed. opencode has two deliveries for it — `steer` (into
 /// the turn in flight, or a new turn when idle) and `queue` (held here until the
 /// turn boundary) — and Ante has the matching ops: `Steer` and `UserInput`.
@@ -3532,7 +3742,9 @@ async fn main() {
             "/api/session/{id}/inbox/{inbox_id}",
             patch(session_inbox_update).delete(session_inbox_cancel),
         )
-        .route("/api/session/{id}/form", get(bare_empty))
+        .route("/api/session/{id}/form", get(session_forms))
+        .route("/api/session/{id}/form/{form_id}", delete(session_form_cancel))
+        .route("/api/session/{id}/form/{form_id}/reply", post(session_form_reply))
         .route("/api/session/{id}/model", post(session_model))
         .route("/api/session/{id}/compact", post(session_compact))
         .route("/api/session/{id}/agent", post(session_agent))
@@ -3695,5 +3907,60 @@ mod tests {
         assert!(!ante.notice_due(floor), "紧接着的第二条要被挡住");
         // 门槛为零就等于不限流，测试和调试要的就是这个。
         assert!(ante.notice_due(std::time::Duration::ZERO));
+    }
+
+    #[test]
+    fn ask_user_becomes_a_form_with_its_options() {
+        // The shape Ante sends, verbatim.
+        let args = json!({ "questions": [
+            { "header": "发版", "question": "这两个改动要现在发版装上吗？", "options": [
+                { "label": "发，走 CI（推荐）", "description": "改 pkgver → 提交 → tag → 推" },
+                { "label": "先不发，攒着" },
+            ]},
+            { "header": "Checks", "question": "Pick previews", "multiple": true, "options": [
+                { "label": "Diff" }, { "label": "Subagent" },
+            ]},
+        ]});
+        let form = askuser_form(&args, "ses_1", "msg_1", "call_9").unwrap();
+        assert_eq!(form["id"], json!("frm_call_9"));
+        assert_eq!(form["sessionID"], json!("ses_1"));
+        assert_eq!(form["metadata"]["kind"], json!("question"));
+        assert_eq!(form["metadata"]["tool"]["id"], json!("call_9"));
+        assert_eq!(form["metadata"]["tool"]["messageID"], json!("msg_1"));
+        let fields = form["fields"].as_array().unwrap();
+        assert_eq!(fields.len(), 2);
+        // One pick is a `string` carrying options — the client has no enum field.
+        assert_eq!(fields[0]["type"], json!("string"));
+        assert_eq!(fields[0]["title"], json!("发版"));
+        assert_eq!(fields[0]["description"], json!("这两个改动要现在发版装上吗？"));
+        // The label is also the value: the answer travels back as the words the
+        // user saw.
+        assert_eq!(fields[0]["options"][0]["value"], json!("发，走 CI（推荐）"));
+        assert_eq!(fields[0]["options"][1]["description"], Value::Null);
+        // A multi pick is a `multiselect`, and free text stays possible either
+        // way: these are options, not the last word.
+        assert_eq!(fields[1]["type"], json!("multiselect"));
+        assert_eq!(fields[1]["options"][1]["value"], json!("Subagent"));
+        assert_eq!(fields[0]["custom"], json!(true));
+        // Nothing to ask is not a form.
+        assert!(askuser_form(&json!({ "questions": [] }), "s", "m", "c").is_none());
+        assert!(askuser_form(&json!({}), "s", "m", "c").is_none());
+    }
+
+    #[test]
+    fn the_answer_reads_back_as_the_user_would_say_it() {
+        let form = json!({ "fields": [
+            { "key": "q0", "title": "发版" },
+            { "key": "q1", "title": "Checks" },
+        ]});
+        let answer = json!({ "q0": "先不发，攒着", "q1": ["Diff", "Subagent"] });
+        assert_eq!(
+            question_answer_text(&form, &answer),
+            "回答提问：\n- 发版：先不发，攒着\n- Checks：Diff, Subagent"
+        );
+        // A question left blank is not an answer, and a fully blank form is still
+        // worth saying out loud — "nothing" is not something to guess at.
+        assert!(question_answer_text(&form, &json!({ "q0": "" })).contains("跳过"));
+        assert_eq!(question_answer_text(&form, &json!({})), "（用户跳过了这次提问，没有作答）");
     }
 }

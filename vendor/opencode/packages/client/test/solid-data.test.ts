@@ -1124,3 +1124,71 @@ async function wait(check: () => boolean) {
     await Bun.sleep(10)
   }
 }
+
+test("slots a row the read did not mention in by its timestamp", async () => {
+  const listeners = new Set<Parameters<CreateDataInput["event"]["listen"]>[0]>()
+  const api = OpenCode.make({
+    baseUrl: "http://opencode.local",
+    fetch: async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init)
+      if (new URL(request.url).pathname.endsWith("/message"))
+        return Response.json({
+          // `order=desc`: the newest step first, so the read reverses these back to oldest-first.
+          data: [
+            {
+              id: "msg_step",
+              type: "assistant",
+              agent: "build",
+              model: { providerID: "demo", id: "model" },
+              content: [],
+              time: { created: 9 },
+            },
+            { id: "msg_first", type: "user", text: "first", time: { created: 1 } },
+          ],
+          cursor: {},
+        })
+      throw new Error(`Unexpected request: ${request.url}`)
+    },
+  })
+  const setup = createRoot((dispose) => ({
+    data: createData({
+      api: () => api,
+      directory: "/project",
+      event: {
+        on: () => () => {},
+        listen(handler) {
+          listeners.add(handler)
+          return () => listeners.delete(handler)
+        },
+      },
+    }),
+    dispose,
+  }))
+
+  try {
+    // A prompt Ante has accepted but not read yet: the client admits it on its own, and a
+    // transcript read back from Ante's log does not mention it.
+    const enqueued = {
+      id: "evt_steer",
+      created: 5,
+      type: "session.inbox.enqueued",
+      durable: { aggregateID: "ses_refresh", seq: 1, version: 1 },
+      data: {
+        sessionID: "ses_refresh",
+        inboxID: "msg_steer",
+        item: { type: "user", delivery: "steer", payload: { text: "steer" } },
+      },
+    } satisfies OpenCodeEvent
+    listeners.forEach((listener) => listener({ name: enqueued.type, details: enqueued }))
+    expect(setup.data.session.message.list("ses_refresh").map((row) => row.id)).toEqual(["msg_steer"])
+
+    await setup.data.session.message.sync("ses_refresh")
+    expect(setup.data.session.message.list("ses_refresh").map((row) => row.id)).toEqual([
+      "msg_first",
+      "msg_steer",
+      "msg_step",
+    ])
+  } finally {
+    setup.dispose()
+  }
+})

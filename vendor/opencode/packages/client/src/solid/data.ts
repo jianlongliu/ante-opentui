@@ -75,6 +75,21 @@ export type CreateDataInput = {
 
 const messageIDFromEvent = (eventID: string) => eventID.replace(/^evt_/, "msg_")
 const messagePageLimit = 20
+
+// Fold the rows a transcript read did not mention back in by timestamp. Appending them all
+// after the read put a prompt still waiting for Ante below the steps the model produced after
+// reading it, so the transcript read out of order until the row settled. `held` keeps its own
+// relative order, and lands after reads that share its timestamp.
+function mergeHeldRows(read: SessionMessageInfo[], held: SessionMessageInfo[]) {
+  const merged = [...read]
+  let at = merged.length
+  for (let index = held.length - 1; index >= 0; index--) {
+    const item = held[index]!
+    while (at > 0 && merged[at - 1]!.time.created > item.time.created) at--
+    merged.splice(at, 0, item)
+  }
+  return merged
+}
 // Trailing window for event bursts that each ask for the same refetch.
 export const settleMs = 150
 
@@ -1643,7 +1658,7 @@ export function createData(config: CreateDataInput) {
             // looking like its answers had never been there.
             const ids = new Set(fetched.map((item) => item.id))
             const local = (store.session.message[sessionID] ?? []).filter((item) => !ids.has(item.id))
-            const messages = local.length === 0 ? fetched : [...fetched, ...local]
+            const messages = local.length === 0 ? fetched : mergeHeldRows(fetched, local)
             batch(() => {
               messageIndex.set(sessionID, new Map(messages.map((message, index) => [message.id, index])))
               setStore("session", "message", sessionID, reconcile(messages))

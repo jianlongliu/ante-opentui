@@ -42,7 +42,7 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 - [ ] ~~`/share`、`/unshare`~~ —— 云端分享，Ante 无此概念（客户端自己也直接报 "Sharing is not implemented for V2 sessions yet"）
 - [ ] ~~`/mcps`、`/status`、MCP 面板~~ —— 无 MCP
 - [ ] ~~`/connect`、`/pair`~~ —— 无 provider OAuth、无设备配对（`/api/integration` 恒空）
-- [ ] ~~`/diff`、`/worktrees`~~ —— 无 diff / VCS / worktree 概念（`/api/vcs/*` 只能答空）
+- [ ] ~~`/diff`、`/worktrees`~~ —— 无 diff / VCS / worktree 概念（`/api/vcs/*` 只能答空；`/api/vcs` 因此答**空分支** `{branch:{}}`，位置标签才不会挂上假 `:main`）
 - [ ] ~~`/terminal`、Terminals 面板、`!` shell 模式~~ —— 无 PTY、无 shell 会话 op（Bash 是工具调用，不是终端）
 - [ ] ~~`/plugins`、`/btw`~~ —— 无 opencode 插件系统；`/btw` 要的是「旁问」的独立 generate op
 - [ ] ~~`/reload`、`/update`、`/restart`、`Ctrl+B` 后台化工具~~ —— 重新加载服务端配置 / 更新 opencode / 把工具调用扔后台，对 Ante 都无意义（**暂时遗弃**：等哪天有对应 op 再说）
@@ -86,7 +86,8 @@ Ante（**你自己装的**：官方脚本装、`ante update` 升级）
 - [x] **真 Ante 回复** —— `ante-sdk` 连 `ante serve --stdio`；模型名、耗时、token 均为真实数据
 - [x] **流式文本** —— `step.started` → `text.started` → `text.delta` ×N → `text.ended`
 - [x] **推理（thinking）** —— `session.reasoning.started/delta/ended`，显示为 `+ Thought · 762ms`
-- [x] **工具调用** —— 发出去的工具名按**客户端的拼法**映射，于是每一步都由客户端自己的单元格渲染，而不是通用的 key/value 块。映射表（`client_tool_name` / `client_tool_args`）：`Bash`→`shell`、`Read`→`read`、`Write`→`write`、`Glob`→`glob`、`Grep`→`grep`、`WebFetch`→`webfetch`、`WebSearch`→`websearch`、`Agent`→`subagent`、`AskUser`→`question`，另把 `Read`/`Write` 的 `file_path` 补一个 `path`（客户端只读 `path`）。实测渲染：`$ echo hi` + 输出、`✓ General Subagent — 查 activspot 是什么`、`→ Read demo.md`（探索类会被客户端并成 `Explored: 1 read` / `1 search`）、`→ Asked 1 question`。**没映射的**：`Edit`（它的单元格要预计算的 patch 元数据，硬映射只会退化成空块）、`TodoWrite`、`ViewImage` —— 保留 Ante 原名、继续走通用块（参数与输出都在）。**也没转的**：Ante 的 `ToolUpdate`（子代理排队等 slot 时才发）没转成 `session.tool.progress`——那个事件只喂单元格的 metadata 字段，而 Subagent 单元格不读它，转了界面上看不出差别。**子代理只有这一层**：Ante 不推子代理内部活动，所以块里不会长出子会话（见「遗弃」）
+- [x] **工具调用** —— 发出去的工具名按**客户端的拼法**映射，于是每一步都由客户端自己的单元格渲染，而不是通用的 key/value 块。映射表（`client_tool_name` / `client_tool_args`）：`Bash`→`shell`、`Read`→`read`、`Write`→`write`、`Glob`→`glob`、`Grep`→`grep`、`WebFetch`→`webfetch`、`WebSearch`→`websearch`、`Agent`→`subagent`、`AskUser`→`question`，另把 `Read`/`Write` 的 `file_path` 补一个 `path`（客户端只读 `path`）。实测渲染：`$ echo hi` + 输出、`✓ General Subagent — 查 activspot 是什么`、`→ Read demo.md`（探索类会被客户端并成 `Explored: 1 read` / `1 search`）、`→ Asked 1 question`（**选项不在这一格里**，见下条「提问」）。**没映射的**：`Edit`（它的单元格要预计算的 patch 元数据，硬映射只会退化成空块）、`TodoWrite`、`ViewImage` —— 保留 Ante 原名、继续走通用块（参数与输出都在）。**也没转的**：Ante 的 `ToolUpdate`（子代理排队等 slot 时才发）没转成 `session.tool.progress`——那个事件只喂单元格的 metadata 字段，而 Subagent 单元格不读它，转了界面上看不出差别。**子代理只有这一层**：Ante 不推子代理内部活动，所以块里不会长出子会话（见「遗弃」）
+- [x] **提问（`AskUser`）—— 选项列表** —— 工具单元格只会写 `→ Asked 1 question`：**选项在客户端自己的「表单」里**（`routes/session/form.tsx`；单选的坑位是 `string` 字段带 `options`，客户端没有 enum 字段类型），而垫片原先从不发 `form.created`、`/api/session/{id}/form` 还恒答空，于是提问在界面上等于没有选项。现在 `ToolStart(AskUser)` 除三个 tool 事件外再发一条 **`form.created`**：Ante 的 `questions[]` 逐条落成一个 field（`header`→`title`、`question`→`description`、`options[].label` 同时当 `value` 与 `label`、`multiple` 决定 `multiselect` 还是 `string`、`custom` 默认开＝允许写选项外的答案），form 的 `id` 由 `call_…` 推出（同一问不会开两次）、`metadata.tool` 指回那条调用。三条路由补齐：`GET …/form`（列在挂的那份，裸 `{data:[…]}`，schema 同 `/inbox` 一样严格）、`POST …/form/{id}/reply`、`DELETE …/form/{id}`（取消）。**答案怎么回到 Ante**：Ante **没有「作答」这个 op** —— 提问是被**下一条用户输入**结掉的（实测 `ToolStart` 之后 56 秒才 `ToolEnd{Completed}`，正是用户下一条消息到达那一刻），所以 reply 把选中的 label 拼成一条普通用户消息（`回答提问：` + 每问一行 `- <header>：<label>`）走**原本的 prompt 路由**（`session_prompt`），转录里出现的就是用户自己那句话、模型那边收到的也是它；`DELETE` 则什么都不发（Ante 撤不回，下一条消息照样结掉）。调用结束时（`ToolEnd`）按 call id 清掉在挂的 form 并发 `form.cancelled`，提示不会比调用活得久。**验证法（不必进 TUI）**：`antex serve PORT` → `POST /api/session` 建会话 → prompt 一句「请调用一次 AskUser 问我…」→ `ANTE_SHIM_TRACE` 里出现 `PUB form.created` 且 `GET /api/session/<id>/form` 取得到它 → `POST …/form/<formID>/reply -d '{"answer":{"q0":"…"}}'` 回 204、列表随即为空、trace 里 `Evt::UserInput` 带的正是那条「回答提问」文本（本机已按此实测通过）
 - [x] **审批** —— Ante 暂停 → TUI 弹 `△ Permission required` → 在 TUI 批准 → `ApprovalResponse` → Ante 继续执行
 - [x] **消息顺序与去重** —— `inbox.enqueued`+`delivered` 入列表；复用客户端提交自带的 message id。**顺序的坑（2026-10-01 修）**：客户端收到 `session.inbox.delivered` 会把那条 prompt **移到转录末尾**（`packages/client/src/solid/data.ts` 的 `draft.splice` + `draft.push`），而 `session.step.started` 会追加助手消息——所以垫片**必须先发 `delivered`、再发 `step.started`**，反过来就把回复画在提问上面。另有一处重复：回合结束的收尾（`take_steers`）会把**已经送达过**的 steer 消息再宣布一次，客户端于是又把它推到末尾（这一次推到回复之后）；现在 step 边界发过 `delivered` 的会记进 `Store::delivered`，收尾时用 `claim_delivered` 跳过。**验证法（不必进 TUI）**：`ANTE_SHIM_TRACE=/tmp/t.log antex serve PORT` → 建会话并发一条 prompt → `/tmp/t.log` 里 `PUB session.inbox.delivered` 必须**只有一条**，且紧跟在 `PUB session.step.started` **之前**
 - [x] **多轮消息落位** —— 三条连发实测：用户与回复正确交错（前两条因排队相邻属正常）
@@ -184,7 +185,7 @@ opencode2 --server http://127.0.0.1:41999     # 终端 B
   - `packages/cli/src/services/server-connection.ts` —— `--server` 模式下**不再对垫片报版本不匹配**。垫片答的是 Ante 的版本（`0.2.5`）、还带一个 `antex` 字段，跟客户端版本永远不等；上游那行 warning 会直接打在 TUI 首行、常驻不退（截图和日常观感都被它毁掉）。判断改成「带 `antex` 字段就静默」，只有连到真 server 且版本确实不同才警告。
   - `packages/tui/src/routes/session/index.tsx` —— 待递送的消息在正文下方挂一枚**斜体 `Pending...`** 角标（`ctx.pendingDelivery(id)` 有值就是还没送到），队列 dock 的 `N queued` 改成 `N Pending... · 内容`。**判据在垫片那边**（见实现清单那节），客户端只负责画。
   - `packages/tui/src/context/keymap.tsx` —— `useCommands()` 里加一张黑名单（按 slash 名 / 命令 id 匹配），把 Ante 做不了的命令从**命令面板与斜杠补全一次摘掉**（两处都从这份 entry 列表生成，所以只改这一处）。名单：`mcps` `connect` `status` `pair` `reload` `share` `rename` `fork` `unshare` `undo` `redo` `copy` `export` `skills` `worktrees` `terminal` `update` `restart` `session.background`。
-  - `packages/client/src/solid/data.ts`（两处，见「记录回读」）—— ① `message.sync` 不再把「这次 read 没提到的行」删掉，只保留并追加；垫片那份 transcript 来自 Ante 的日志，客户端自己从事件折出来的行（idle / compaction / 切换 / 正在流的那一步）不在里面，原先的 reconcile 一读就抹。② `editText` 在没有 text part 时补建一个空 part，使重读忽然插进「一句话正流到一半」时后续 delta 仍有处可落（否则那一步的回答永远不显示）。
+  - `packages/client/src/solid/data.ts`（两处，见「记录回读」）—— ① `message.sync` 不再把「这次 read 没提到的行」删掉，保留后**按 `time.created` 插回原位**（`mergeHeldRows`：一律追加到末尾会把还没被 Ante 读走的那条挂在模型后续步骤**下面**，看着像顺序错）；垫片那份 transcript 来自 Ante 的日志，客户端自己从事件折出来的行（idle / compaction / 切换 / 正在流的那一步 / 待递送的 prompt）不在里面，原先的 reconcile 一读就抹。② `editText` 在没有 text part 时补建一个空 part，使重读忽然插进「一句话正流到一半」时后续 delta 仍有处可落（否则那一步的回答永远不显示）。
   - `packages/tui/src/feature-plugins/sidebar/footer.tsx` —— 侧栏那张 `Getting started / Connect provider` 卡片不再渲染：它读 `/api/integration`（垫片空），点「Connect provider」进的是空对话框，纯死路（同文件里那个工作目录行是好的，留着）
 - 编出来的客户端装在 `~/.local/bin/antex-tui`，**`antex` 默认就用它**（源码模式启动不慢，且底部没有 dev 模式的 `✓ Server ○ UI…` 那行）。
 - **上游更新后**（`git subtree pull`）跑一次 `script/build-tui.sh` 即可；两步合一就是下面那条 `./script/upgrade-upstream.sh`。
@@ -360,6 +361,14 @@ session.step.started → session.text.started → session.text.delta ×N → ses
 | 真 server 形状对照 | 起一个真 server 当 oracle：`opencode2 serve --hostname 127.0.0.1 --port 41998`（日志打印 `server password <PW>`；API 用 HTTP Basic，用户名 `opencode`），再订阅 `/api/event` 抓权威事件序列 |
 
 ## 下一步
+
+**v2026.10.01.3（2026-10-01 发）**——三处一起出的改动，机制与验法：
+
+- **位置标签不再长 `:main`**：垫片 `/api/vcs` 原先恒答 `{provider:"git", branch:{current:"main", default:"main"}}`，于是每个会话的 `目录:分支` 都挂上假分支（垫片只有一个 location＝家目录，家目录不是仓库，真去读 git 也是空）。改成答空分支（`src/main.rs` 的 `vcs()`），客户端那行 `branch ? dir:branch : dir` 自己就只剩目录。**验法**：`antex serve PORT` 后 `curl -s localhost:PORT/api/vcs`，`data.branch` 应为空对象；界面上输入栏底部与侧栏都只剩目录。
+- **本地独有的行按时间归位**：`message.sync` 重拉 transcript 时，本机自己折出来的行（idle / compaction / 切换 / 正在流的那一步 / 待递送的 prompt）改为按 `time.created` 插回原位（`vendor/opencode/packages/client/src/solid/data.ts` 的 `mergeHeldRows`）。原先一律追加到末尾，会把还没被 Ante 读走的那条 prompt 挂在模型后续步骤**下面**，看着像顺序错（`Pending...` 挂多久，它就压多久）。**验法**：client 包 `bun test test/solid-data.test.ts` 的「slots a row the read did not mention in by its timestamp」——旧实现 fail、新实现 pass。
+- **`AskUser` 的选项列表**：工具单元格只会写 `→ Asked 1 question`——选项在客户端自己的表单提示里，而垫片从不发 `form.created`（`/api/session/{id}/form` 还恒答空），于是提问在界面上等于没有选项。现在 `ToolStart(AskUser)` 把它镜像成一张 question 表单，reply 把选中的 label 当**下一条用户消息**交给 Ante（Ante 没有作答 op，结掉提问的正是下一条用户输入），`DELETE` 只撤提示。**验法**：见实现清单里「提问（`AskUser`）—— 选项列表」那节（`antex serve` + `curl` 足够，不必进 TUI）。
+
+下次发版：改 `PKGBUILD` 的 `pkgver`（日期 + 当日序号）→ 提交 → 打**同名** tag 推上去（流程见 `release-via-ci`）。
 
 **日常路径上没有已知缺陷**：过去列在缺口里的中断收尾、多轮消息落位、会话列表、agent 切换、`/compact`、恢复旧会话后继续对话都已实现并实测。
 

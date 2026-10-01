@@ -17,7 +17,9 @@
 #   vendor/opencode/packages/tui/src/routes/session/index.tsx  —— 待递送的消息挂斜体 `Pending...` 角标，
 #                                                                 队列 dock 从 «N queued» 改成 «N Pending... · 内容»
 #                                                                 （送没送到由垫片判：下一个 step 开始才算送到）
-#   vendor/opencode/packages/client/src/solid/data.ts          —— ① 拉取 transcript 时不再丢掉「这次没提到的行」
+#   vendor/opencode/packages/client/src/solid/data.ts          —— ① 拉取 transcript 时不再丢掉「这次没提到的行」，
+#                                                                 并**按 time.created 插回原位**（一律追加到末尾会
+#                                                                 把还没读走的那条挂在后续步骤下面，像顺序错）
 #                                                                 （垫片那份来自 Ante 日志，客户端自己从事件折出来的
 #                                                                  idle / compaction / 正在流的那一步不在里面）
 #                                                              —— ② editText 在没有 text part 时补建一个，
