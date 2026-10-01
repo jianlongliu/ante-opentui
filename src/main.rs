@@ -57,12 +57,18 @@ static ANTE_VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// The URL this instance listens on, set once the port is known (`ServerInfo`
 /// declares `urls`, and the client builds its display address from it).
 static SERVER_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-/// The model Ante is configured with, so the composer shows something real.
-/// This is the fallback for a client that never picked one — it has to be the
-/// catalog's name (provider-scoped), or the first turn comes back as an HTTP
-/// 400 from the provider.
+/// The pair to fall back on when Ante's own `settings.json` records no
+/// provider/model yet, so the composer still shows something. It has to name an
+/// entry in *your* catalog (provider-scoped), or the first turn comes back as an
+/// HTTP 400 from the provider — so it is a placeholder here, and meant to be
+/// pointed at your own pair with `ANTEX_PROVIDER` / `ANTEX_MODEL`.
 const MODEL: &str = "example/example-model";
 const PROVIDER: &str = "example";
+
+/// `ANTEX_PROVIDER` / `ANTEX_MODEL` when set, else the placeholder above.
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
 
 fn ante_home() -> std::path::PathBuf {
     std::env::var_os("ANTE_HOME")
@@ -100,15 +106,15 @@ fn active_model() -> (String, String) {
     let provider = settings
         .get("provider")
         .and_then(|v| v.as_str())
-        .unwrap_or(PROVIDER)
-        .to_string();
+        .map(str::to_string)
+        .unwrap_or_else(|| env_or("ANTEX_PROVIDER", PROVIDER));
     let model = settings
         .get("provider_model")
         .and_then(|v| v.get(&provider))
         .and_then(|v| v.as_str())
         .or_else(|| settings.get("model").and_then(|v| v.as_str()))
-        .unwrap_or(MODEL)
-        .to_string();
+        .map(str::to_string)
+        .unwrap_or_else(|| env_or("ANTEX_MODEL", MODEL));
     (provider, model)
 }
 
@@ -1593,7 +1599,9 @@ async fn attach_session(store: &Store, ops: &OpSender, id: &str, mode: Permissio
                 announce_unresumed(store, id);
             }
             let chosen = store.ante.model.lock().ok().and_then(|slot| slot.clone());
-            let (provider, model) = chosen.unwrap_or_else(|| (PROVIDER.into(), MODEL.into()));
+            let (provider, model) = chosen.unwrap_or_else(|| {
+                (env_or("ANTEX_PROVIDER", PROVIDER), env_or("ANTEX_MODEL", MODEL))
+            });
             let request = SessionRequest {
                 permission_mode: Some(mode),
                 provider: Some(provider),
@@ -2469,12 +2477,16 @@ async fn session_model(
     Json(body): Json<Value>,
 ) -> axum::http::StatusCode {
     let model = body.get("model").cloned().unwrap_or_default();
-    let id = model.get("id").and_then(|v| v.as_str()).unwrap_or(MODEL).to_string();
+    let id = model
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| env_or("ANTEX_MODEL", MODEL));
     let provider = model
         .get("providerID")
         .and_then(|v| v.as_str())
-        .unwrap_or(PROVIDER)
-        .to_string();
+        .map(str::to_string)
+        .unwrap_or_else(|| env_or("ANTEX_PROVIDER", PROVIDER));
     // Read the outgoing pair before overwriting it, or `previous` ends up
     // reporting the new model.
     let previous = store
@@ -2737,7 +2749,10 @@ async fn agents() -> Json<Value> {
                 "hidden": false,
                 "request": { "settings": {}, "headers": {}, "body": {} },
                 "permissions": [{ "action": "*", "resource": "*", "effect": "allow" }],
-                "model": { "id": MODEL, "providerID": PROVIDER },
+                "model": {
+                    "id": env_or("ANTEX_MODEL", MODEL),
+                    "providerID": env_or("ANTEX_PROVIDER", PROVIDER),
+                },
             })
         })
         .collect();
@@ -2751,7 +2766,7 @@ async fn models() -> Json<Value> {
         let (provider, model) = active_model();
         list.push(json!({
             "id": model, "modelID": model, "providerID": provider,
-            "name": "Example Model",
+            "name": model.clone(),
             "capabilities": {},
             "variants": [],
             "time": { "created": now_ms() },
@@ -2776,8 +2791,9 @@ async fn config_providers() -> Json<Value> {
 async fn providers() -> Json<Value> {
     let mut list = catalog_providers();
     if list.is_empty() {
+        let provider = env_or("ANTEX_PROVIDER", PROVIDER);
         list.push(json!({
-            "id": PROVIDER, "name": "Example AI", "activation": "auto", "package": "example",
+            "id": provider, "name": provider, "activation": "auto", "package": provider,
         }));
     }
     envelope(json!(list))
@@ -2896,8 +2912,16 @@ fn ante_sessions() -> Vec<Value> {
                         usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
                         usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
                     );
-                    let model = meta.get("model").and_then(|v| v.as_str()).unwrap_or(MODEL).to_string();
-                    let provider = meta.get("provider").and_then(|v| v.as_str()).unwrap_or(PROVIDER).to_string();
+                    let model = meta
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| env_or("ANTEX_MODEL", MODEL));
+                    let provider = meta
+                        .get("provider")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| env_or("ANTEX_PROVIDER", PROVIDER));
                     (created, title, tokens, model, provider)
                 }
                 // No summary yet: the session is still real. Its own turn never

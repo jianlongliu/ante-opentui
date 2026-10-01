@@ -330,7 +330,7 @@ session.step.started → session.text.started → session.text.delta ×N → ses
 | 助手回复不渲染（事件照发，界面不动也不报错） | 两层原因：① 事件名用了上一代的 `message.part.updated`；② **即使名字对了，还缺 `session.step.started`**——助手消息没被追加进列表，后续 `editAssistant` 全是空操作 |
 | 整轮空白（不是少一个块，是整段没了） | 帧**解码失败会静默丢弃该事件，并连带丢掉它之后的整轮**；先看客户端的 `--print-logs --log-level debug` |
 | 事件流 `Connection lost` | SSE 帧必须是 `{id,type,data}` 形式且**首帧 `server.connected`**，并且走 chunked |
-| 第一轮就 `Error: … invalid_request` / `HTTP 400 Bad Request`（`Model "…" is not supported on …`） | 垫片顶部的 `MODEL`/`PROVIDER` 兜底常量必须是 **catalog 里的 provider-scoped 名**（如 `example` 上是 `example/example-model`）；名字错了只有 provider 会告诉你，Ante 侧不报错 |
+| 第一轮就 `Error: … invalid_request` / `HTTP 400 Bad Request`（`Model "…" is not supported on …`） | 垫片顶部的 `MODEL`/`PROVIDER` 兜底常量（可用 `ANTEX_MODEL`/`ANTEX_PROVIDER` 覆盖）必须是 **你自己 catalog 里的 provider-scoped 名**，形如 `<provider>/<model-id>`；名字错了只有 provider 会告诉你，Ante 侧不报错 |
 | 恢复旧会话后消息记在别的会话里（界面看着正常） | 垫片没把会话 id 交给 Ante：`StartSession` 建的那条会话从此吸收所有 prompt，而事件按 `active` 路由，所以 UI 不露馅。**已修**（`Ante.live` + `ResumeSession` + `Ante.replay_turn`，见实现清单）；要判断落点只能看 `.ante/sessions/<id>/events.jsonl` |
 | 自己发的提问显示在它的**回复下面**（或同一轮里飘到回复之后） | 客户端处理 `session.inbox.delivered` 时会把那条 prompt **移到转录末尾**，所以垫片**先发 `step.started`（追加回复）再发 `delivered`** 就会颠倒；回合结束的收尾还会把已送达的 steer 再宣布一次，于是又推一次。**已修**（先 `delivered` 后 `step.started` + `claim_delivered` 去重，见实现清单「消息顺序与去重」） |
 | 提问只有 `→ Asked 1 question` 那一格，**选项列表永远不出现** | `form.created` 落在客户端 store 的**第二段 switch** 里，而它的开头是 `if (!event.location) return`——垫片所有事件都不带 `location`，于是事件被静默丢掉（`GET …/form` 却有数据，只按 curl 验会误判成「垫片没问题」）。**已修**（三条 form 事件走 `publish_located()`，form 对象也自带一份；见 `.4`） |
