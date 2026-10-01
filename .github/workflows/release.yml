@@ -53,8 +53,11 @@ jobs:
             bash -euxo pipefail -c '
               pacman -Syu --noconfirm --needed base-devel rust bun git
               useradd -m builder
+              # 不这样写的话 .PKGINFO 里会是 "Unknown Packager"（发行版默认把 PACKAGER 注释掉了）
+              sed "s|^#\?PACKAGER=.*|PACKAGER=\"Jianlong Liu <jianlongliu@hotmail.com>\"|" \
+                /etc/makepkg.conf > /build/makepkg.conf
               chown -R builder /build
-              su builder -c "makepkg -f --noconfirm"
+              su builder -c "makepkg --config /build/makepkg.conf -f --noconfirm"
             '
           ls -l build/*.pkg.tar.zst
 

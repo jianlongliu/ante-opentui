@@ -16,8 +16,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ante_sdk::{
-    ConnectOptions, OpSender, connect,
-    protocol::{Evt, Id, Op, ReviewDecision, SessionRequest, ToolDecision, ToolUse, TurnPauseReason},
+    ConnectOptions, EventReceiver, OpSender, connect,
+    protocol::{
+        Evt, Id, Op, PermissionMode, ReviewDecision, SessionRequest, SessionUpdate, ToolDecision,
+        ToolUse, TurnPauseReason,
+    },
 };
 use axum::{
     Json, Router,
@@ -236,6 +239,10 @@ struct Ante {
     /// without it a delete aimed at a session the client just created names no
     /// directory at all.
     archives: Arc<Mutex<HashMap<String, String>>>,
+    /// Where the connection to Ante stands. See [`Link`].
+    link: Arc<Mutex<Link>>,
+    /// When the last "backend is gone" row went into the transcript.
+    notice_at: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 /// An Ante turn paused for approval, held until the TUI answers.
@@ -245,10 +252,72 @@ struct PendingApproval {
     tools: Vec<ToolUse>,
 }
 
+/// Where the connection to Ante stands.
+///
+/// Ante is a separate program, so it can go away at any point: a crash, an
+/// upgrade, a `pkill`, a host that never started. The shim is the only one who
+/// can see that — the client only ever talks to the shim — so it is the shim's
+/// job to say so (`health`, the transcript) and to get back on its feet.
+#[derive(Clone, PartialEq, Eq)]
+enum Link {
+    /// The first connect, or a retry after a failure.
+    Connecting,
+    Up,
+    /// Down. `since` is when it went down (not when it was last retried), so a
+    /// flapping host still reports how long the outage really has been.
+    Down { reason: String, since: i64, attempt: u32 },
+}
+
+impl Link {
+    fn reason(&self) -> String {
+        match self {
+            Link::Connecting => "还没连上".to_string(),
+            Link::Up => "连接正常".to_string(),
+            Link::Down { reason, .. } => reason.clone(),
+        }
+    }
+
+    fn json(&self) -> Value {
+        match self {
+            Link::Connecting => json!({ "connected": false, "state": "connecting" }),
+            Link::Up => json!({ "connected": true, "state": "up" }),
+            Link::Down { reason, since, attempt } => json!({
+                "connected": false,
+                "state": "down",
+                "reason": reason,
+                "since": since,
+                "attempt": attempt,
+            }),
+        }
+    }
+}
+
+/// How long a connection has to last before its failure stops counting towards
+/// the backoff. A host that dies the moment it starts should keep slowing down
+/// instead of retrying once a second forever.
+const LINK_HEALTHY: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// How long the replay guard waits for its own turn to appear. Ante replays a
 /// resumed conversation in one burst, so a longer wait means the switch never
 /// took effect.
 const REPLAY_GUARD: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Floor between two "the backend is gone" rows in the transcript. A host that
+/// flaps must not stack one per retry on the user's screen.
+const OFFLINE_NOTICE_FLOOR: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Backoff between reconnect attempts, capped. The first retry is quick because
+/// the common case by far is a host someone restarted by hand.
+fn reconnect_delay(failures: u32) -> f32 {
+    match failures {
+        0 | 1 => 1.0,
+        2 => 2.0,
+        3 => 4.0,
+        4 => 8.0,
+        5 => 15.0,
+        _ => 30.0,
+    }
+}
 
 impl Ante {
     fn new() -> Self {
@@ -263,7 +332,63 @@ impl Ante {
             last_user: Arc::new(Mutex::new(String::new())),
             busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             archives: Arc::new(Mutex::new(HashMap::new())),
+            link: Arc::new(Mutex::new(Link::Connecting)),
+            notice_at: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn link(&self) -> Link {
+        self.link.lock().map(|link| link.clone()).unwrap_or(Link::Connecting)
+    }
+
+    fn link_up(&self) {
+        if let Ok(mut link) = self.link.lock() {
+            *link = Link::Up;
+        }
+    }
+
+    /// Note that the link went down. `since` is kept from the previous failure,
+    /// so a connection that keeps failing reports one outage rather than a
+    /// stream of new ones.
+    fn link_down(&self, reason: String, attempt: u32) {
+        if let Ok(mut link) = self.link.lock() {
+            let since = match &*link {
+                Link::Down { since, .. } => *since,
+                _ => now_ms(),
+            };
+            *link = Link::Down { reason, since, attempt };
+        }
+    }
+
+    /// Drop everything that described the connection that just died: which
+    /// session it drove, the replay guard it was waiting on, the approval it was
+    /// sitting on, and the turn it was running. Anything left behind would be
+    /// read as if it were still true of the *new* connection.
+    fn forget_link_state(&self) {
+        self.set_busy(false);
+        if let Ok(mut live) = self.live.lock() {
+            *live = None;
+        }
+        if let Ok(mut replay) = self.replay_turn.lock() {
+            *replay = None;
+        }
+        if let Ok(mut pending) = self.pending.lock() {
+            *pending = None;
+        }
+    }
+
+    /// Whether a "backend is gone" row is due, and if so take the slot. Called
+    /// once per notice, so the throttle cannot be fooled by two callers racing.
+    fn notice_due(&self, floor: std::time::Duration) -> bool {
+        let Ok(mut last) = self.notice_at.lock() else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        if last.is_some_and(|last| now.duration_since(last) < floor) {
+            return false;
+        }
+        *last = Some(now);
+        true
     }
 
     /// Ante's archive name for a session the client knows under another id, or
@@ -279,6 +404,22 @@ impl Ante {
         if let Ok(mut archives) = self.archives.lock() {
             archives.insert(client_id.to_string(), archive);
         }
+    }
+
+    /// The archive [`attach_session`] may hand to `ResumeSession`: the one Ante
+    /// has, and can open.
+    ///
+    /// `meta.json` is what Ante writes when a turn ends, so a session killed
+    /// mid-flight leaves its directory — and its log — without it. `ResumeSession`
+    /// on such a directory comes back as `Failed to resume session: No such file
+    /// or directory (os error 2)`, a refusal the reconnect path cannot answer:
+    /// by the time it arrives the queued prompt has been handed over and is gone.
+    /// So it is treated as "no archive" — the transcript is still read back
+    /// (`archive_of` still names it, which is also what delete needs), but the
+    /// conversation restarts.
+    fn resumable_archive_of(&self, id: &str) -> Option<String> {
+        self.archive_of(id)
+            .filter(|archive| ante_home().join("sessions").join(archive).join("meta.json").is_file())
     }
 
     /// Whether a turn is in flight, so `steer` can mean what Ante means by it.
@@ -308,17 +449,17 @@ impl Ante {
     /// the turn it was armed for; a refusal or a timeout lifts it too, and
     /// drops the session binding so the next prompt resolves again rather than
     /// talking into the wrong session.
-    fn dropping(&self, event: &Evt) -> bool {
+    fn dropping(&self, event: &Evt) -> Replay {
         let Ok(mut slot) = self.replay_turn.lock() else {
-            return false;
+            return Replay::Pass;
         };
         let Some((expected, armed)) = slot.as_ref() else {
-            return false;
+            return Replay::Pass;
         };
         let ours = matches!(event, Evt::TurnStart { turn_id } if turn_id.to_string() == *expected);
         if ours {
             *slot = None;
-            return false;
+            return Replay::Pass;
         }
         let refused = matches!(event, Evt::Error(_));
         if refused || armed.elapsed() > REPLAY_GUARD {
@@ -330,9 +471,25 @@ impl Ante {
                 "ante: 恢复会话没生效（{}），这次重放已放行——下一条消息会重新定位会话",
                 if refused { "Ante 拒绝了这个 id" } else { "等不到它自己的 turn" }
             ));
+            return Replay::Unresumed;
         }
-        true
+        Replay::Replay
     }
+}
+
+/// What [`Ante::dropping`] decided about an event that arrived while a resume
+/// was in flight.
+#[derive(PartialEq, Eq, Debug)]
+enum Replay {
+    /// No resume in flight: ordinary traffic.
+    Pass,
+    /// Part of the conversation Ante replayed — the client already has it, and
+    /// drawing it again would double the transcript.
+    Replay,
+    /// The resume never took: Ante refused it, or its own turn never came. This
+    /// is not a replay, and whatever was handed to that connection is still
+    /// owed to the user.
+    Unresumed,
 }
 
 #[derive(Clone)]
@@ -449,6 +606,28 @@ impl Store {
         {
             item["delivery"] = json!(delivery);
         }
+    }
+
+    /// Take back every prompt this session holds that was handed to a session
+    /// which never opened. Handing one over relabels it (see [`Self::steer_head`])
+    /// and only an ack from Ante clears the marker, so a hand-over into a
+    /// connection that refused the session leaves it looking taken when the text
+    /// went nowhere. Returns how many came back.
+    fn requeue_undelivered(&self, session: &str) -> usize {
+        let Ok(mut queues) = self.pending.lock() else {
+            return 0;
+        };
+        let Some(queue) = queues.get_mut(session) else {
+            return 0;
+        };
+        let mut back = 0;
+        for item in queue.iter_mut() {
+            if item["delivery"] == "steer" {
+                item["delivery"] = json!("queue");
+                back += 1;
+            }
+        }
+        back
     }
 
     /// The oldest prompt the client *queued*, relabelled `steer`: it is being
@@ -995,36 +1174,241 @@ mod herdr {
     }
 }
 
-async fn spawn_ante(store: Store) {
-    let endpoint: ante_sdk::Endpoint = match "stdio".parse() {
-        Ok(endpoint) => endpoint,
-        Err(err) => {
-            log_line(&format!("ante: 端点解析失败：{err}"));
-            return;
-        }
-    };
-    let mut options = ConnectOptions::default();
+/// Dial Ante. Success is transport-level — the child spawned, or the socket
+/// dialed — so a host that dies on startup only shows up as a stream that
+/// closes immediately, which the caller's backoff handles.
+async fn connect_ante() -> Result<ante_sdk::Client, String> {
+    let endpoint: ante_sdk::Endpoint = "stdio".parse().map_err(|err| format!("端点解析失败：{err}"))?;
     let bin = ante_executable();
+    let mut options = ConnectOptions::default();
     options.executable = bin.clone();
-    let client = match connect(endpoint, options).await {
-        Ok(client) => client,
-        Err(err) => {
-            // The TUI is already on the user's screen by now, so this must land
-            // in the log — stderr alone is how "nothing happens" starts.
-            log_line(&format!(
-                "ante: 连接失败：{err}\n  ante = {}；antex 编译于 ante-sdk {}",
-                bin.map(|p| p.display().to_string()).unwrap_or_else(|| "（没找到）".into()),
-                env!("ANTE_SDK_VERSION"),
-            ));
-            return;
+    connect(endpoint, options).await.map_err(|err| {
+        format!(
+            "连接失败：{err}\n  ante = {}；antex 编译于 ante-sdk {}",
+            bin.map(|p| p.display().to_string()).unwrap_or_else(|| "（没找到）".into()),
+            env!("ANTE_SDK_VERSION"),
+        )
+    })
+}
+
+/// Keep Ante attached: connect, pump its events, and when the stream ends,
+/// reconnect with backoff and pick the conversation back up.
+///
+/// It used to connect once and let the link die quietly — the interface stayed
+/// up, `health` said `healthy`, and every later prompt went nowhere. The shim
+/// cannot keep Ante alive, but it can say what happened and come back.
+async fn spawn_ante(store: Store) {
+    let mut failures: u32 = 0;
+    loop {
+        let started = std::time::Instant::now();
+        // 短句给界面和 `health`，细节给日志：一条断线说明塞进转录行里没人看。
+        let (reason, detail) = match connect_ante().await {
+            Ok(client) => {
+                let (ops, rx) = client.into_parts();
+                *store.ante.ops.lock().await = Some(ops);
+                store.ante.link_up();
+                log_line("ante: 已连接，开始转发事件");
+                // Ante is up and waiting for input; that is what `idle` means
+                // here. The session id lands with the first state change inside
+                // a session.
+                herdr::report("idle", None, None);
+                // Anything the client queued while we were down goes out now —
+                // a prompt typed during the outage is held, not dropped.
+                flush_after_reconnect(&store).await;
+                let reason = pump_events(&store, rx).await;
+                (reason.clone(), reason)
+            }
+            Err(err) => ("连不上 ante".to_string(), err),
+        };
+        // The connection is gone. Drop the handle first: it is what makes a
+        // later prompt take the "not connected" path instead of sending into a
+        // dead pipe, and dropping the last `OpSender` closes the child's stdin,
+        // which is how it learns to exit.
+        *store.ante.ops.lock().await = None;
+        store.ante.forget_link_state();
+        // 一连好过 5 秒的就算了结，退避从第一次重来（多数情况是主机刚被人
+        // 重启）；紧接着又断才算「一直在失败」，退避才往上走。
+        failures = if started.elapsed() >= LINK_HEALTHY { 0 } else { failures } + 1;
+        store.ante.link_down(reason, failures);
+        let delay = reconnect_delay(failures);
+        log_line(&format!("ante: {detail}；{delay}s 后重连（第 {failures} 次）"));
+        herdr::report("blocked", Some(&detail), None);
+        tokio::time::sleep(std::time::Duration::from_secs_f32(delay)).await;
+    }
+}
+
+/// 重连之后把掉线期间排队的消息交出去。交之前会先把连接切回那条会话，所以
+/// 这一步顺带把「会话回来了」做了；没有排队的消息就什么都不做——不为恢复而
+/// 恢复，Ante 那份历史重放留给下一条真消息去挡（见 [`attach_session`]）。
+async fn flush_after_reconnect(store: &Store) {
+    let viewed = store.ante.active.lock().ok().and_then(|slot| slot.clone());
+    let mut sessions: Vec<String> = store
+        .pending
+        .lock()
+        .map(|queues| {
+            queues.iter().filter(|(_, queue)| !queue.is_empty()).map(|(id, _)| id.clone()).collect()
+        })
+        .unwrap_or_default();
+    // 用户正看着的那条先来：它多半就是刚断掉的那条。
+    sessions.sort_by_key(|id| Some(id) == viewed.as_ref());
+    for session in sessions {
+        flush_queue(store, &session).await;
+    }
+}
+
+/// Point the live connection at `id`: resume its archive when Ante has one on
+/// disk, otherwise start a fresh session with the client's chosen model.
+///
+/// `expect` is the op id of the `UserInput` that follows: a resume hands the
+/// whole conversation back, and the replay guard drops that until the turn that
+/// op starts shows up. Both the prompt route and the reconnect path go through
+/// here, so a conversation survives the backend dying.
+async fn attach_session(store: &Store, ops: &OpSender, id: &str, mode: PermissionMode, expect: &Id) {
+    // The client's id and Ante's archive name are not the same thing, so the
+    // archive is looked up by mapping, not by guessing.
+    let known = store.ante.archive_of(id);
+    let archive = store.ante.resumable_archive_of(id).and_then(|archive| archive.parse::<Id>().ok());
+    match archive {
+        Some(session_id) => {
+            store.ante.expect_turn(expect.to_string());
+            let op = Op::ResumeSession { session_id, unattended: false };
+            if let Err(err) = ops.send(ante_sdk::protocol::op_msg(op)).await {
+                log_line(&format!("ante: 恢复会话 {id} 发送失败：{err}"));
+            }
+            log_line(&format!("ante: 切到旧会话 {id}（ResumeSession）"));
+        }
+        None => {
+            // An archive is there and Ante still cannot open it — the turn that
+            // was writing it was killed — so this starts a new conversation
+            // under the client's id. Say so; the alternative is a reply that
+            // quietly ignores everything above it.
+            if known.is_some() {
+                announce_unresumed(store, id);
+            }
+            let chosen = store.ante.model.lock().ok().and_then(|slot| slot.clone());
+            let (provider, model) = chosen.unwrap_or_else(|| (PROVIDER.into(), MODEL.into()));
+            let request = SessionRequest {
+                permission_mode: Some(mode),
+                provider: Some(provider),
+                model: Some(model),
+                ..Default::default()
+            };
+            if let Err(err) = ops.send(ante_sdk::protocol::op_msg(Op::StartSession(request))).await {
+                log_line(&format!("ante: 新建会话发送失败：{err}"));
+            }
+        }
+    }
+    // Resume resolves the permission mode from the host's own settings, so the
+    // TUI's `shift+tab` choice has to be put back on the session explicitly.
+    let update = SessionUpdate { permission_mode: Some(mode), ..Default::default() };
+    let _ = ops.send(ante_sdk::protocol::op_msg(Op::UpdateSession(update))).await;
+    if let Ok(mut live) = store.ante.live.lock() {
+        *live = Some(id.to_string());
+    }
+}
+
+/// The permission mode this session should run with: an explicit
+/// `SHIM_PERMISSION_MODE` wins (debugging), otherwise it follows the agent the
+/// client picked.
+fn current_permission_mode(store: &Store) -> PermissionMode {
+    match std::env::var("SHIM_PERMISSION_MODE").as_deref() {
+        Ok("strict") => return PermissionMode::Strict,
+        Ok("yolo") => return PermissionMode::Yolo,
+        Ok("auto") => return PermissionMode::Auto,
+        _ => {}
+    }
+    let agent = store
+        .ante
+        .agent
+        .lock()
+        .map(|slot| slot.clone())
+        .unwrap_or_else(|_| reported_agent().to_string());
+    permission_mode_for(&agent)
+}
+
+/// Put "the backend is gone" in front of the user, in the place they are
+/// already looking.
+fn announce_offline(store: &Store, session: &str, reason: &str, open_message: Option<&str>) {
+    if !store.ante.notice_due(OFFLINE_NOTICE_FLOOR) {
+        return;
+    }
+    publish_failure(
+        store,
+        session,
+        json!({
+            "type": "ante_disconnected",
+            "message": format!(
+                "与 Ante 后端的连接断了（{reason}）。antex 正在自动重连，之后排队的消息会自动发出去。"
+            ),
+        }),
+        open_message,
+    );
+}
+
+/// The conversation cannot be picked back up, so it restarts. Said out loud,
+/// because the transcript in front of the user still shows the old one and a
+/// model that has forgotten it is not something to discover from a reply that
+/// no longer fits.
+fn announce_unresumed(store: &Store, session: &str) {
+    publish_failure(
+        store,
+        session,
+        json!({
+            "type": "session_unresumed",
+            "message": "这条会话在 Ante 里打不开（上一轮没跑完就被杀了，存档没落盘），接不上上次那段；掉线期间排队的消息还在，下一条消息会新开一条会话带走它。",
+        }),
+        None,
+    );
+}
+
+/// A failure in the transcript, plus the events that put the session back to
+/// idle: without them the client keeps its spinner up, and it ignores a failure
+/// for a message it never saw start. `open_message` is the assistant row a dead
+/// turn left open — failing *that* row is better than appending another one —
+/// and `None` opens a row to fail.
+fn publish_failure(store: &Store, session: &str, error: Value, open_message: Option<&str>) {
+    let message_id = match open_message {
+        Some(message_id) => message_id.to_string(),
+        None => {
+            let id = format!("msg_offline_{}", now_ms());
+            let (provider, model) = store.current_model();
+            store.publish_durable(
+                "session.step.started",
+                json!({
+                    "sessionID": session,
+                    "assistantMessageID": id,
+                    "agent": reported_agent(),
+                    "model": { "id": model, "providerID": provider },
+                    "started": now_ms(),
+                }),
+                session,
+            );
+            id
         }
     };
-    let (ops, mut rx) = client.into_parts();
-    *store.ante.ops.lock().await = Some(ops);
-    // Ante is up and waiting for input; that is what `idle` means here. The
-    // session id lands with the first state change inside a session.
-    herdr::report("idle", None, None);
+    store.publish_durable(
+        "session.step.failed",
+        json!({
+            "sessionID": session,
+            "assistantMessageID": message_id,
+            "error": error,
+            "executed": false,
+        }),
+        session,
+    );
+    // Also the thing that puts the session back to idle: without it the TUI
+    // keeps its spinner up for a turn that will never end.
+    store.publish_durable(
+        "session.execution.failed",
+        json!({ "sessionID": session, "error": error }),
+        session,
+    );
+}
 
+/// Ante's events, translated into opencode's. Returns why the stream ended —
+/// Ante exited, or it dropped us.
+async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
+    let mut goodbye = false;
     // A turn is made of steps (one model call each): Ante starts a step, may
     // call tools, then starts another. opencode models each step as its own
     // assistant message, so the step is opened lazily on its first content
@@ -1061,12 +1445,24 @@ async fn spawn_ante(store: Store) {
         trace_ante(&msg.event);
         // A resume hands the whole persisted conversation back; the client
         // already fetched that history, so rendering it again would double it.
-        if store.ante.dropping(&msg.event) {
-            continue;
-        }
+        let unresumed = match store.ante.dropping(&msg.event) {
+            Replay::Replay => continue,
+            Replay::Pass => false,
+            Replay::Unresumed => true,
+        };
         let Some(session) = store.ante.active.lock().ok().and_then(|s| s.clone()) else {
             continue;
         };
+        // The session this connection was switching to never opened, so the
+        // prompts the flush just handed over went to a session that does not
+        // exist: `Op::UserInput` is answered with `session not initialized` and
+        // the text is dropped. Take them back, and say what happened — the next
+        // prompt starts a new conversation, which is not something to find out
+        // from a history that quietly stops matching.
+        if unresumed {
+            store.requeue_undelivered(&session);
+            announce_unresumed(store, &session);
+        }
         // A switch to another session is worth telling Herdr about on its own:
         // otherwise it only learns the id when a turn happens to run. `idle`
         // is right, because the point of a switch is to sit ready for input.
@@ -1574,13 +1970,29 @@ async fn spawn_ante(store: Store) {
                 store.publish("permission.asked", payload);
                 herdr::report("blocked", Some(&waiting), Some(&session));
             }
+            // Ante answered `Shutdown`: this connection is ending on purpose
+            // rather than dying, which is worth distinguishing in the log.
+            Evt::Goodbye => goodbye = true,
             _ => {}
         }
     }
-    // Ante's event stream ended: it exited, or it dropped us (a version
-    // mismatch can do that mid-handshake). Later prompts will not be answered,
-    // so say so rather than let the UI go quiet.
-    log_line("ante: 事件流已结束——Ante 进程退出，或它在握手后断开了连接；后续消息不会有回复");
+    // The stream ended. A turn that was running will never get its `TurnEnd`,
+    // so if one was open, fail it here — otherwise the TUI spins forever over a
+    // reply that Ante never had the chance to send.
+    if let Some(session) = store.ante.active.lock().ok().and_then(|slot| slot.clone()) {
+        let open = step_open.then(|| message_id.clone());
+        announce_offline(
+            store,
+            &session,
+            if goodbye { "Ante 关闭了连接" } else { "事件流结束" },
+            open.as_deref(),
+        );
+    }
+    if goodbye {
+        "Ante 关闭了连接".to_string()
+    } else {
+        "事件流结束".to_string()
+    }
 }
 
 /// What the TUI polls to learn about a pending permission prompt.
@@ -1819,7 +2231,11 @@ async fn session_interrupt(State(store): State<Store>, Path(_id): Path<String>) 
     Json(json!({ "interrupted": interrupted }))
 }
 
-async fn health() -> Json<Value> {
+/// The shim's own health is not in question — it is up, that is how you got
+/// here. What the client (and a human with `curl`) cannot otherwise see is
+/// whether the *backend* is: `ante` carries that, and `healthy` stays true on
+/// purpose, because the client reads it as "is this server usable".
+async fn health(State(store): State<Store>) -> Json<Value> {
     Json(json!({
         "healthy": true,
         // `version` is the Ante backend's — the shim stands in for Ante, so the
@@ -1829,6 +2245,9 @@ async fn health() -> Json<Value> {
         "pid": std::process::id(),
         "urls": [SERVER_URL.get().map(String::as_str).unwrap_or("")],
         "paths": { "tmp": std::env::temp_dir().to_string_lossy() },
+        // `{connected, state, reason, since, attempt}` — the connection to Ante,
+        // which this process reconnects by itself.
+        "ante": store.ante.link().json(),
     }))
 }
 
@@ -2693,10 +3112,12 @@ async fn session_messages(
 }
 
 /// Hand the oldest queued prompt to Ante. A queued prompt belongs at the turn
-/// boundary, and only the live session can take one — anything else would land
+/// boundary, so a running turn keeps it waiting. If the connection is not on
+/// this session — after a disconnect, say — the switch happens here first, which
+/// is also what puts the conversation back on its feet; anything else would land
 /// in whichever session the connection happens to be driving.
 async fn flush_queue(store: &Store, session: &str) {
-    if store.ante.busy() || store.ante.live_id().as_deref() != Some(session) {
+    if store.ante.busy() {
         return;
     }
     let Some((inbox_id, text)) = store.steer_head(session) else {
@@ -2706,12 +3127,16 @@ async fn flush_queue(store: &Store, session: &str) {
         store.set_delivery(session, &inbox_id, "queue");
         return;
     };
-    if let Err(err) = ops.send(ante_sdk::protocol::op_msg(Op::UserInput(text))).await {
+    let input = ante_sdk::protocol::op_msg(Op::UserInput(text));
+    if store.ante.live_id().as_deref() != Some(session) {
+        attach_session(store, &ops, session, current_permission_mode(store), &input.id).await;
+    }
+    if let Err(err) = ops.send(input).await {
         log_line(&format!("ante: 排队消息发送失败：{err}"));
         store.set_delivery(session, &inbox_id, "queue");
         return;
     }
-    log_line(&format!("ante: 排队消息 {inbox_id} 交给 Ante（回合已结束）"));
+    log_line(&format!("ante: 排队消息 {inbox_id} 交给 Ante"));
 }
 
 /// `GET /api/session/{id}/inbox` — what the client queued and we are holding.
@@ -2889,19 +3314,7 @@ async fn session_prompt(
     }
     // The client carries the chosen agent in the prompt body (it does not call
     // the switch route for a plain `shift+tab`), so the agent is applied here.
-    // An explicit SHIM_PERMISSION_MODE wins when set.
-    let agent = store
-        .ante
-        .agent
-        .lock()
-        .map(|slot| slot.clone())
-        .unwrap_or_else(|_| reported_agent().to_string());
-    let mode = match std::env::var("SHIM_PERMISSION_MODE").as_deref() {
-        Ok("strict") => ante_sdk::protocol::PermissionMode::Strict,
-        Ok("yolo") => ante_sdk::protocol::PermissionMode::Yolo,
-        Ok("auto") => ante_sdk::protocol::PermissionMode::Auto,
-        _ => permission_mode_for(&agent),
-    };
+    let mode = current_permission_mode(&store);
 
     let ops = store.ante.ops.lock().await.clone();
     // Ante drives one session per connection, so a prompt aimed at a session
@@ -2916,41 +3329,11 @@ async fn session_prompt(
                 // resumed conversation before it gets to this `UserInput`, and
                 // the guard drops that replay until the turn this op id starts.
                 let input = ante_sdk::protocol::op_msg(Op::UserInput(staged.clone()));
-                // A session Ante has on disk is a real conversation to resume;
-                // anything else (the id the client just invented) starts fresh.
-                // The test is the directory, not `meta.json`: Ante writes that
-                // only at `TurnEnd`, so a session killed mid-turn has the log
-                // and no summary — and it is still the conversation to continue.
-                let saved = if stored_session(&id) { id.parse::<Id>().ok() } else { None };
-                if let Some(session_id) = saved {
-                    store.ante.expect_turn(input.id.to_string());
-                    let op = Op::ResumeSession { session_id, unattended: false };
-                    if let Err(err) = ops.send(ante_sdk::protocol::op_msg(op)).await {
-                        log_line(&format!("ante: 恢复会话 {id} 发送失败：{err}"));
-                    }
-                    // Resume resolves the permission mode from the host's own
-                    // settings, so the TUI's `shift+tab` choice has to be put
-                    // back on the session explicitly.
-                    let update = ante_sdk::protocol::SessionUpdate {
-                        permission_mode: Some(mode),
-                        ..Default::default()
-                    };
-                    let _ = ops.send(ante_sdk::protocol::op_msg(Op::UpdateSession(update))).await;
-                    log_line(&format!("ante: 切到旧会话 {id}（ResumeSession）"));
-                } else {
-                    let chosen = store.ante.model.lock().ok().and_then(|slot| slot.clone());
-                    let (provider, model) = chosen.unwrap_or_else(|| (PROVIDER.into(), MODEL.into()));
-                    let request = SessionRequest {
-                        permission_mode: Some(mode),
-                        provider: Some(provider),
-                        model: Some(model),
-                        ..Default::default()
-                    };
-                    if let Err(err) = ops.send(ante_sdk::protocol::op_msg(Op::StartSession(request))).await {
-                        log_line(&format!("ante: 新建会话发送失败：{err}"));
-                    }
-                    // The real server announces the title once; Ante titles from the
-                    // first message too, so mirror it here.
+                let fresh = store.ante.resumable_archive_of(&id).is_none();
+                attach_session(&store, &ops, &id, mode, &input.id).await;
+                if fresh {
+                    // The real server announces the title once; Ante titles from
+                    // the first message too, so mirror it here.
                     let title: String = text.chars().take(60).collect();
                     let title = title.trim().to_string();
                     if !title.is_empty() {
@@ -2960,9 +3343,6 @@ async fn session_prompt(
                             &id,
                         );
                     }
-                }
-                if let Ok(mut live) = store.ante.live.lock() {
-                    *live = Some(id.clone());
                 }
                 if let Err(err) = ops.send(input).await {
                     log_line(&format!("ante: 消息发送失败：{err}"));
@@ -2977,10 +3357,7 @@ async fn session_prompt(
             } else {
                 // Same session, nothing to switch: the agent may still have
                 // changed, since `shift+tab` never calls the switch route.
-                let update = ante_sdk::protocol::SessionUpdate {
-                    permission_mode: Some(mode),
-                    ..Default::default()
-                };
+                let update = SessionUpdate { permission_mode: Some(mode), ..Default::default() };
                 let _ = ops.send(ante_sdk::protocol::op_msg(Op::UpdateSession(update))).await;
                 if let Err(err) = ops.send(ante_sdk::protocol::op_msg(Op::UserInput(staged.clone()))).await {
                     log_line(&format!("ante: 消息发送失败：{err}"));
@@ -2990,7 +3367,20 @@ async fn session_prompt(
                 *slot = text.clone();
             }
         }
-        None => log_line("ante: 与 Ante 未连接，这条消息被丢弃（看日志开头的自检那行）"),
+        None => {
+            // 与 Ante 没连上。这条消息不进 Ante，但也不丢：它留在队列里，重连
+            // 之后由 `flush_after_reconnect` 交出去。同时把断线摆到界面上——
+            // 只写日志的话，用户看到的是一条永远 Pending 的消息。
+            let reason = store.ante.link().reason();
+            store.set_delivery(&id, &user_id, "queue");
+            store.publish_durable(
+                "session.inbox.delivery.changed",
+                json!({ "sessionID": id, "inboxID": user_id, "delivery": "queue" }),
+                &id,
+            );
+            log_line(&format!("ante: 与 Ante 未连接（{reason}），这条消息排进队列等重连"));
+            announce_offline(&store, &id, &reason, None);
+        }
     }
     // A session that just became live may still carry a queue from before.
     flush_queue(&store, &id).await;
@@ -3260,5 +3650,50 @@ mod tests {
         let grep = client_tool_args("Grep", &json!({ "pattern": "x", "path": "/tmp" }));
         assert_eq!(grep["path"], json!("/tmp"));
         assert_eq!(grep.get("file_path"), None);
+    }
+
+    #[test]
+    fn reconnect_backoff_grows_then_holds() {
+        // The first retry is quick — a host restarted by hand comes back at once.
+        assert_eq!(reconnect_delay(1), 1.0);
+        let delays: Vec<f32> = (1..=8).map(reconnect_delay).collect();
+        for pair in delays.windows(2) {
+            assert!(pair[1] >= pair[0], "backoff must not shrink: {delays:?}");
+        }
+        assert_eq!(delays.last(), Some(&30.0), "and it must stop growing: {delays:?}");
+    }
+
+    #[test]
+    fn a_failing_link_reports_one_outage_not_one_per_retry() {
+        let ante = Ante::new();
+        assert!(!ante.link().json()["connected"].as_bool().unwrap());
+        assert_eq!(ante.link().json()["state"], json!("connecting"));
+
+        ante.link_down("第一次".to_string(), 1);
+        let first = ante.link().json()["attempt"].clone();
+        assert_eq!(first, json!(1));
+
+        ante.link_up();
+        assert_eq!(ante.link().json()["state"], json!("up"));
+        assert_eq!(ante.link().json()["connected"], json!(true));
+
+        ante.link_down("第二次".to_string(), 3);
+        assert_eq!(ante.link().json()["reason"], json!("第二次"));
+        assert_eq!(ante.link().json()["attempt"], json!(3));
+
+        // 同一次断线里的重试不重置起点，否则「断了多久」永远只有几秒。
+        let since = ante.link().json()["since"].clone();
+        ante.link_down("第二次，又试了一遍".to_string(), 4);
+        assert_eq!(ante.link().json()["since"], since);
+    }
+
+    #[test]
+    fn the_offline_row_is_throttled() {
+        let ante = Ante::new();
+        let floor = std::time::Duration::from_secs(20);
+        assert!(ante.notice_due(floor), "第一条要放行");
+        assert!(!ante.notice_due(floor), "紧接着的第二条要被挡住");
+        // 门槛为零就等于不限流，测试和调试要的就是这个。
+        assert!(ante.notice_due(std::time::Duration::ZERO));
     }
 }

@@ -12,13 +12,15 @@
 # 还放一个 opencode2 软链让它能从 PATH 找到。
 pkgname=antex
 pkgver=2026.10.01
-pkgrel=1
-pkgdesc="把 Ante 后端接上 opencode v2 TUI 的垫片（含魔改过的客户端）"
+pkgrel=2   # 只改了打包元数据；换 pkgver 时退回 1
+pkgdesc="Ante agent, driven by the opencode v2 TUI (antex)"
 arch=('x86_64')
 url="https://github.com/jianlongliu/ante-opentui"
-# 仓库自己没放 LICENSE；vendor/opencode 随上游是 MIT。别写成 MIT 冒充整个包。
-license=('custom')
+# 仓库根有 LICENSE（MIT）。vendor/opencode 是上游的 MIT，各是各的。
+license=('MIT')
 depends=()
+# 后端本体不在任何仓库（官方脚本装到 ~/.ante/bin），只能声明成可选依赖。
+optdepends=('ante: the agent backend this TUI talks to (installed by its own installer)')
 makedepends=('rust' 'bun' 'git')
 options=('!strip')   # bun 编出来的单文件二进制里塞了运行时，别去动它的段
 

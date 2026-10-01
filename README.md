@@ -21,8 +21,9 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 - [x] 会话：列表、恢复、恢复后继续、删除（`Ctrl+D` 两下）—— 删的是 Ante 自己那条存档目录；**打开一条会话即从它的 `events.jsonl` 重建整份记录**（每一步的思考、回答、工具都在，见「记录回读」）
 - [x] 插嘴与排队（`Ctrl+S`）+ 斜体 `Pending...` 标记 —— 送到时机按 Ante 的真实边界判：**收下不算，下一个 step 开始才算模型读到**
 - [x] `/compact`、模型选择、`shift+tab` 权限模式、`@` 文件补全、贴图、herdr 上报、boot 接口全套
-- [x] 多标签关掉（`tabs.mode = "off"`）—— 它要服务端同时驱动多条会话，垫片只有一条连接
+- [x] 多标签**临时**关掉（`tabs.mode = "off"`，只是个配置项，不是能力）—— 它要服务端同时驱动多条会话，垫片只有一条连接；真做多标签见「待定」那条
 - [x] 做不了的入口从界面摘掉 —— 插件 / 键位 / 命令黑名单 / 侧栏卡片四层，见「屏蔽做不了的入口」
+- [x] 断线重连，且掉线期间排队的消息不丢 —— 退避重连 + `health` 说真话 + 转录里一行说明；**回合没跑完就被杀掉的会话（盘上只有 `events.jsonl`）Ante 打不开**，这种会话会新开一条继续，见「实现清单」那条
 
 ### 待定
 
@@ -31,7 +32,7 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 - [ ] `/stats` —— 隐藏中；补法：Ante 的 `meta.json` 里有 usage，够算 token / 成本
 - [ ] `/skills` —— 隐藏中；补法：列出 Ante 自己的技能目录（`~/.agents/skills`、`~/.ante/.system/skills`）
 - [ ] 会话内 `/cd` —— 家目录下能用，会话里是空操作；退一步可「按新目录重开会话」
-- [ ] 真多标签（session tabs）—— 先验证 Ante 侧能否并发驱动多条会话，再谈垫片改造
+- [ ] 真多标签（session tabs）—— **待定**：先验证 Ante 侧能否并发驱动多条会话，再谈垫片改造（现在只是把入口临时关掉）
 - [ ] 断线时的终端还原 —— TUI 只弹 `Connection lost · Reconnecting to the server automatically.`，终端留一屏裸 SGR；抓原始字节用 `~/antecode-scratch/tuiprobe/exit_probe.py`
 
 ### 遗弃
@@ -102,7 +103,7 @@ Ante（**你自己装的**：官方脚本装、`ante update` 升级）
 - [x] **删除会话（`Ctrl+D`，按两下确认）** —— `DELETE /api/session/{id}` → 删掉 `~/.ante/sessions/<id>/`（**Ante 自己的存档，删了所有前端都看不到**，返回 204）；id 必须是单一路径段（否则 400），没有存档回 404，正在跑的那条拒删（400，先 Esc 中断）。**要删的是 Ante 的存档名，而客户端新会话用的是它自己编的 id**（`StartSession` 不接收 id，Ante 自己铸 `ses_01M3…`）——靠 `Evt::SessionStart` 里带的 `session_id` 建立对应（`Ante.archives`），否则按客户端 id 删会 404。**顺带修掉两个「会话凭空消失」**：① 列表原先只读 `meta.json`，而 Ante **只在 `TurnEnd` 写它**——回合没跑完（卡在提问 / 被杀）的会话只剩 `events.jsonl`，于是从列表里消失；现在缺 `meta.json` 就从日志取首条 `UserInput` 当标题、首个事件时间当创建时间（模型回落到当前配置）。② 续写判据同样从「有 `meta.json`」改成「有目录」，否则这种会话被打开时会**另开一条新会话**、历史看着少一半。**已知边界**：删完若还有**孤儿 Ante 进程**（`fuser -k` 只杀垫片，`ante serve --stdio` 子进程还活着），它退出时会把 `meta.json`/`dialog.json` 写回目录（实测复现，`events.jsonl` 不会回来）——真要清干净就确认目录不在了。**验证法（不必进 TUI）**：`antex serve PORT` → （a）`curl -X DELETE localhost:PORT/api/session/<编的 id>` → 404；（b）`POST /api/session` 建会话 + prompt 一次 → 用**客户端那个 id** 删 → 204 且 Ante 目录消失、垫片日志出现 `session: 删除会话 <id>（存档 …）`；（c）挑一条没有 `meta.json` 的存档（`ls ~/.ante/sessions/*/meta.json` 比对）→ 列表能看到它，prompt 一次垫片日志出现 `切到旧会话 …（ResumeSession）` 且新事件落进**同一个**目录
 - [x] **插嘴 / 排队（`Ctrl+S`）** —— opencode 的提交带 `delivery`：`steer`（回车，默认）走 Ante 的 **`Op::Steer`**，插进正在跑的那一轮；`queue`（`<leader>return`）**由垫片自己持有**（`Store::pending`），到回合边界（`TurnEnd`）才作为 `Op::UserInput` 交给 Ante——Ante 撤不回已提交的输入，放在垫片手里「插嘴 / 删除」才都算数。补齐 inbox 三件套：`GET …/inbox`（列出持有的条目，字段含 `delivery`/`payload.text`）、`PATCH …/inbox/{id}`（`{"delivery":"steer"}` 插嘴、`"queue"` 保持；该条已交给 Ante 时回 **409**）、`DELETE …/inbox/{id}`（丢弃；同样对已交给 Ante 的回 409）。**客户端侧补了上游没有的键位**：`ctrl+s`（见「首页 logo」那节的三处补丁）
 - [x] **「未送达」标记（插嘴 / 排队的消息，模型读到没有）** —— 递出去 ≠ 模型看见了：`Op::Steer` / `Op::UserInput` 只是**递给** Ante，`Evt::UserInput` 也只是 Ante **收下**（实测工具还在跑时就发），真正进上下文是**下一个 step 开始**那一下。所以 `session.inbox.delivered` 不再在提交时发：收 `Evt::UserInput` 只把该条记进 `Store::acked`，等 `session.step.started` 才发 `delivered`（`take_acked`）；`TurnEnd` 把仍没送到的（`take_steers`）按已送达收尾——否则角标会一直挂着。`flush_queue` 与 `PATCH …/inbox/{id}` 也只把持有时那条改成 `steer`（**不**算送达），「已交给 Ante 的改不回去」由此自洽。客户端在消息下方画一枚**斜体 `Pending...`** 角标，队列 dock 从 `N queued` 改成 `N Pending... · 内容`（`routes/session/index.tsx`）。**验证法（不必进 TUI）**：`antex serve PORT` → `POST …/prompt`（`delivery: steer`）后立刻 `GET …/inbox` 应看到那条挂着；`ANTE_SHIM_TRACE` 里 `Evt::UserInput` 之后**不能**紧跟 `PUB session.inbox.delivered`，要等该轮的下一个 step。**TUI 验证法**：`tui_drive.py --send '8:请调用一次 Bash 跑 sleep 30，然后再汇报。\r' --send '22:插一句：结束后末尾加一行 END。\r'`，插嘴那条的角标应一直挂到 `sleep` 跑完、下一步开始
-- [x] **多标签（session tabs）关掉** —— opencode v2 的 session tabs 要服务端**同时**驱动多条会话：切标签就是切会话，而垫片只有一条 Ante 连接（`Ante.live`），多标签一「同步」（客户端会替每个标签预取 message / pending / permission）就互相抢会话，界面整个乱掉。真做得让垫片并发驱动多会话，代价不合算，**关掉**：`~/.config/opencode/cli.json` 里 `tabs.mode = "off"`（herdr 里本来就是 auto→关，现在哪都一样，切会话走 `/sessions` 或 quick slot）
+- [x] **多标签（session tabs）临时关掉** —— opencode v2 的 session tabs 要服务端**同时**驱动多条会话：切标签就是切会话，而垫片只有一条 Ante 连接（`Ante.live`），多标签一「同步」（客户端会替每个标签预取 message / pending / permission）就互相抢会话，界面整个乱掉。真做得让垫片并发驱动多会话，代价不合算，**先临时关掉**（摘掉入口而已，真开发多标签挂在「状态」的待定里）：`~/.config/opencode/cli.json` 里 `tabs.mode = "off"`（herdr 里本来就是 auto→关，现在哪都一样，切会话走 `/sessions` 或 quick slot）
 - [x] **Ante 做不了的入口从界面里摘掉** —— 见「屏蔽做不了的入口」一节
 - [x] **思考块按时收尾** —— 真 server 的推理是「一次性 `reasoning.ended` + 全文」，Ante 是流式 delta、而聚合的 `Thinking` 要等整步结束才到（实测比正文晚 1 秒以上，期间那行 `Thought` 一直转圈）。垫片自己缓存 delta，遇到首个正文 delta / 工具调用 / 回合结束就把 `reasoning.ended`（带缓存全文）补在正文前面，顺序回到标准的 `reasoning.ended` → `text.started`
 - [x] **首 token 那几秒不空屏** —— 实测「提交 → 模型吐第一个字」有 **2.3 秒**（思考型模型预填期间不产出任何内容），那段的转录区**一片空白**，只有页脚在动；垫片造不出不存在的 part（硬塞会留下假 `Thought` 行）。改成客户端补一行占位（`routes/session/index.tsx`：会话在跑、且没有任何未完成的助手消息时画 `⠦ Thinking`），实测空窗 **2341ms → 169ms**，真推理行一到即接管（见「首页 logo」那节的第四处补丁）
@@ -124,6 +125,12 @@ Ante（**你自己装的**：官方脚本装、`ante update` 升级）
   - **本机开关**：`~/.config/opencode/cli.json` 里 `session.image_preview`（转录区）与 `prompt.image_preview`（输入框上方）默认都是 off——已开；终端要支持 kitty 图形协议（本机 Ghostty 支持）。
   - **验证法**：`cargo test`（8 项：压缩达标、提及转义、回显形状、日志反解、未知类型丢弃）；端到端 —— `antex serve PORT` → `POST /api/session` 建会话 → `POST …/prompt` 带上 `files:[{uri:"data:image/jpeg;base64,…", name:…}]` → `~/.ante/sessions/<新目录>/events.jsonl` 里 `UserInput` 应带 `@…/ante-paste-cache/antex-…`，`AgentMessage` 应能复述图里的字（实测 510KB 的图压到 152KB 后模型仍读出「SHRINK-7」）
 - [x] **事件流（SSE）** —— `{id, type, created, data}` 帧，首帧 `server.connected`
+- [x] **断线重连（Ante 掉了自己爬起来）** —— 原来 `spawn_ante` 里事件流一断只写一行日志：`ops` 留着旧句柄、`health` 照答 `healthy: true`、之后的每条 prompt 静默丢弃。现在拆成「连接 / 泵事件 / 重连循环」三块：
+  - **状态**：`Link::{Connecting,Up,Down{reason,since,attempt}}` 进 `/api/health`；转录里「后端没了」那行按 `OFFLINE_NOTICE_FLOOR = 20s` 节流（`notice_due()` 取槽，两个调用方不会各发一条）。
+  - **退避**：`reconnect_delay()` 首次 1s（多数情况是主机刚被人重启），封顶 30s；连接**活过 `LINK_HEALTHY = 5s`** 才把失败计数清零，否则「一启动就死」的后端会被永久按 1s 重试。断线时 `forget_link_state()` 清掉「它驱动的会话 / 重放判定 / 挂着的审批 / 在跑的回合」——留下的会被当成新连接的事实。
+  - **排队不丢**：断线期间提交的 prompt 不进 Ante，也不丢，留在 `Store::pending`（客户端看到的是那段 `session.step.failed` + 排队标记）；重连后 `flush_after_reconnect()` 先切回那条会话、再交队列；顺手把界面上那行 spinner 收掉。
+  - **回合进行中掉线是特例（本轮修）**：Ante **只在 `TurnEnd` 写 `meta.json`**，所以回合没跑完就被杀的会话在盘上**只有 `events.jsonl`**——目录在、`ResumeSession` 却回 `Failed to resume session: No such file or directory (os error 2)`。垫片原判据 `stored_session()` 只看目录存不存在，于是排队的消息被投进这条打不开的会话，Ante 回 `session not initialized`，**消息就没了**。现在：`resumable_archive_of()` 要求 `meta.json` 在场才算「能恢复的存档」（`archive_of()` 不动——历史回读与删除仍认这种半截会话，它还有救得回来的日志），这种会话直接走「新开一条」并把排队消息带走；`Replay::Unresumed`（Ante 拒绝，或等不到它自己那个 turn）时把已递出去的消息**退回队列**并在转录里说明——否则一次静默的上下文断档，用户只会看到「回复忽略了上文」。
+  - **验证法**（不必进 TUI，端口别用 41999——那是本机 TUI 占的）：`antex serve PORT`（带 `ANTE_SHIM_TRACE=/tmp/trace.log` 更好）→ `POST /api/session` → prompt 一条**至少跑 8 秒**的（例如让它跑 `sleep 8`）→ 3 秒后 `kill $(pgrep -P <shim pid> -f 'ante serve --stdio')` → 掉线期间再 prompt 一条 → 期望日志：`事件流结束；1s 后重连（第 1 次）`、`未连接…排进队列等重连`、`已连接，开始转发事件`、**一个新存档 id**、`排队消息 … 交给 Ante`、`…已被 Ante 收下`、`…送达（模型开始读）`，SSE 里出现 `session_unresumed` 的失败行 + 新会话的 `session.execution.succeeded`。**回合之间**掉线（第一条跑完再 kill）应仍走 `切到旧会话 …（ResumeSession）`，上下文接着上——两条都要跑，只测一条会把另一边测坏。
 
 ### 未完成项的验证法
 
@@ -420,3 +427,11 @@ script/              build-tui.sh（重建客户端）、upgrade-upstream.sh（�
 vendor/opencode/     上游 opencode（subtree，v2 分支）——魔改对象
 Cargo.toml           axum + tokio + serde
 ```
+
+## 致谢
+
+**TUI、键位系统、渲染、插件机制，连「用服务端 API 驱动一个现成客户端」这条路子本身**，全部来自
+**opencode**（<https://github.com/sst/opencode>）。本仓库做的只是把它 git subtree 收进来、在「TUI 调后端」那一层
+打几个补丁接到 Ante 上——等于站在人家肩上，上游不再更新，这里也就跟着停。感谢 opencode 的作者和所有贡献者。
+
+许可跟上游一致（MIT，见 `LICENSE`）：随意分发修改
