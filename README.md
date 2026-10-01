@@ -33,7 +33,7 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 - [ ] `/skills` —— 隐藏中；补法：列出 Ante 自己的技能目录（`~/.agents/skills`、`~/.ante/.system/skills`）
 - [ ] 会话内 `/cd` —— 家目录下能用，会话里是空操作；退一步可「按新目录重开会话」
 - [ ] 真多标签（session tabs）—— **待定**：先验证 Ante 侧能否并发驱动多条会话，再谈垫片改造（现在只是把入口临时关掉）
-- [ ] 断线时的终端还原 —— TUI 只弹 `Connection lost · Reconnecting to the server automatically.`，终端留一屏裸 SGR；抓原始字节用 `~/antecode-scratch/tuiprobe/exit_probe.py`
+- [ ] 断线时的终端还原 —— TUI 只弹 `Connection lost · Reconnecting to the server automatically.`，终端留一屏裸 SGR；抓原始字节：用 PTY 跑一次（`script/tui_drive.py` 就是这条路子），把读到的 chunk **先原样落盘再喂 `pyte`**——SGR 序列只在原始字节里看得见
 
 ### 遗弃
 
@@ -87,9 +87,9 @@ Ante（**你自己装的**：官方脚本装、`ante update` 升级）
 - [x] **流式文本** —— `step.started` → `text.started` → `text.delta` ×N → `text.ended`
 - [x] **推理（thinking）** —— `session.reasoning.started/delta/ended`，显示为 `+ Thought · 762ms`
 - [x] **工具调用** —— 发出去的工具名按**客户端的拼法**映射，于是每一步都由客户端自己的单元格渲染，而不是通用的 key/value 块。映射表（`client_tool_name` / `client_tool_args`）：`Bash`→`shell`、`Read`→`read`、`Write`→`write`、`Glob`→`glob`、`Grep`→`grep`、`WebFetch`→`webfetch`、`WebSearch`→`websearch`、`Agent`→`subagent`、`AskUser`→`question`，另把 `Read`/`Write` 的 `file_path` 补一个 `path`（客户端只读 `path`）。实测渲染：`$ echo hi` + 输出、`✓ General Subagent — 查 activspot 是什么`、`→ Read demo.md`（探索类会被客户端并成 `Explored: 1 read` / `1 search`）、`→ Asked 1 question`（**选项不在这一格里**，见下条「提问」）。**没映射的**：`Edit`（它的单元格要预计算的 patch 元数据，硬映射只会退化成空块）、`TodoWrite`、`ViewImage` —— 保留 Ante 原名、继续走通用块（参数与输出都在）。**也没转的**：Ante 的 `ToolUpdate`（子代理排队等 slot 时才发）没转成 `session.tool.progress`——那个事件只喂单元格的 metadata 字段，而 Subagent 单元格不读它，转了界面上看不出差别。**子代理只有这一层**：Ante 不推子代理内部活动，所以块里不会长出子会话（见「遗弃」）
-- [x] **提问（`AskUser`）—— 选项列表** —— 工具单元格只会写 `→ Asked 1 question`：**选项在客户端自己的「表单」里**（`routes/session/form.tsx`；单选的坑位是 `string` 字段带 `options`，客户端没有 enum 字段类型），而垫片原先从不发 `form.created`、`/api/session/{id}/form` 还恒答空，于是提问在界面上等于没有选项。现在 `ToolStart(AskUser)` 除三个 tool 事件外再发一条 **`form.created`**：Ante 的 `questions[]` 逐条落成一个 field（`header`→`title`、`question`→`description`、`options[].label` 同时当 `value` 与 `label`、`multiple` 决定 `multiselect` 还是 `string`、`custom` 默认开＝允许写选项外的答案），form 的 `id` 由 `call_…` 推出（同一问不会开两次）、`metadata.tool` 指回那条调用。三条路由补齐：`GET …/form`（列在挂的那份，裸 `{data:[…]}`，schema 同 `/inbox` 一样严格）、`POST …/form/{id}/reply`、`DELETE …/form/{id}`（取消）。**答案怎么回到 Ante**：Ante **没有「作答」这个 op** —— 提问是被**下一条用户输入**结掉的（实测 `ToolStart` 之后 56 秒才 `ToolEnd{Completed}`，正是用户下一条消息到达那一刻），所以 reply 把选中的 label 拼成一条普通用户消息（`回答提问：` + 每问一行 `- <header>：<label>`）走**原本的 prompt 路由**（`session_prompt`），转录里出现的就是用户自己那句话、模型那边收到的也是它；`DELETE` 则什么都不发（Ante 撤不回，下一条消息照样结掉）。调用结束时（`ToolEnd`）按 call id 清掉在挂的 form 并发 `form.cancelled`，提示不会比调用活得久。**必须带 `location`（2026-10-01 修，v2026.10.01.4）**：客户端 store 里**第二段 switch 的开头就是 `if (!event.location) return`**（`packages/client/src/solid/data.ts`），`form.created` 正落在那道门后面——而垫片所有事件都不带 `location`，于是这条被读进来又**静默丢掉**：没有报错、没有日志、`GET …/form` 照样取得到，只按 curl 验会误判成「垫片没问题」。现在这三条 form 事件改走 `publish_located()`（事件级 `{"directory":…}`），而且 **form 对象自己也带一份**：客户端的 `removeForm` 对没有 location 的 form 一律放行（＝永远摘不掉提示）。同一支里还有 `provider.updated` / `model.updated` / `vcs.branch.updated` 那类目录事件，垫片**有意**不发它们（`permission.asked` 在前一段，所以审批一直好使）。**验证法**：`antex serve PORT` + `curl` 只能验垫片这一侧——`POST /api/session` 建会话 → prompt 一句「请调用一次 AskUser 问我…」→ `ANTE_SHIM_TRACE` 里出现 `PUB form.created` 且 `GET /api/session/<id>/form` 取得到它 → `POST …/form/<formID>/reply -d '{"answer":{"q0":"…"}}'` 回 204、列表随即为空、trace 里 `Evt::UserInput` 带的正是那条「回答提问」文本。**要算过必须进 TUI**：`script/tui_drive.py --send '18:请调用一次 AskUser 问我：午饭吃什么？两个选项：吃面、吃饭。\r' --send '45:\r' --after 45` → 屏上先出 `1. 吃面 … 3. Type your own answer` 与 `↑↓ select  enter submit  esc dismiss`，回车后转录里出现用户那条 `回答提问：` `- 午饭：吃面`、模型接着往下走（本机已实测）
+- [x] **提问（`AskUser`）—— 选项列表** —— 工具单元格只会写 `→ Asked 1 question`：**选项在客户端自己的「表单」里**（`routes/session/form.tsx`；单选的坑位是 `string` 字段带 `options`，客户端没有 enum 字段类型），而垫片原先从不发 `form.created`、`/api/session/{id}/form` 还恒答空，于是提问在界面上等于没有选项。现在 `ToolStart(AskUser)` 除三个 tool 事件外再发一条 **`form.created`**：Ante 的 `questions[]` 逐条落成一个 field（`header`→`title`、`question`→`description`、`options[].label` 同时当 `value` 与 `label`、`multiple` 决定 `multiselect` 还是 `string`、`custom` 默认开＝允许写选项外的答案），form 的 `id` 由 `call_…` 推出（同一问不会开两次）、`metadata.tool` 指回那条调用。三条路由补齐：`GET …/form`（列在挂的那份，裸 `{data:[…]}`，schema 同 `/inbox` 一样严格）、`POST …/form/{id}/reply`、`DELETE …/form/{id}`（取消）。**答案怎么回到 Ante**：Ante **没有「作答」这个 op** —— 提问是被**下一条用户输入**结掉的（实测 `ToolStart` 之后 56 秒才 `ToolEnd{Completed}`，正是用户下一条消息到达那一刻），所以 reply 把选中的 label 拼成一条普通用户消息（`回答提问：` + 每问一行 `- <header>：<label>`）走**原本的 prompt 路由**（`session_prompt`），转录里出现的就是用户自己那句话、模型那边收到的也是它；`DELETE` 则什么都不发（Ante 撤不回，下一条消息照样结掉）。调用结束时（`ToolEnd`）按 call id 清掉在挂的 form 并发 `form.cancelled`，提示不会比调用活得久。**必须带 `location`**：客户端 store 里**第二段 switch 的开头就是 `if (!event.location) return`**（`packages/client/src/solid/data.ts`），`form.created` 正落在那道门后面——而垫片所有事件都不带 `location`，于是这条被读进来又**静默丢掉**：没有报错、没有日志、`GET …/form` 照样取得到，只按 curl 验会误判成「垫片没问题」。现在这三条 form 事件改走 `publish_located()`（事件级 `{"directory":…}`），而且 **form 对象自己也带一份**：客户端的 `removeForm` 对没有 location 的 form 一律放行（＝永远摘不掉提示）。同一支里还有 `provider.updated` / `model.updated` / `vcs.branch.updated` 那类目录事件，垫片**有意**不发它们（`permission.asked` 在前一段，所以审批一直好使）。**验证法**：`antex serve PORT` + `curl` 只能验垫片这一侧——`POST /api/session` 建会话 → prompt 一句「请调用一次 AskUser 问我…」→ `ANTE_SHIM_TRACE` 里出现 `PUB form.created` 且 `GET /api/session/<id>/form` 取得到它 → `POST …/form/<formID>/reply -d '{"answer":{"q0":"…"}}'` 回 204、列表随即为空、trace 里 `Evt::UserInput` 带的正是那条「回答提问」文本。**要算过必须进 TUI**：`script/tui_drive.py --send '18:请调用一次 AskUser 问我：午饭吃什么？两个选项：吃面、吃饭。\r' --send '45:\r' --after 45` → 屏上先出 `1. 吃面 … 3. Type your own answer` 与 `↑↓ select  enter submit  esc dismiss`，回车后转录里出现用户那条 `回答提问：` `- 午饭：吃面`、模型接着往下走（本机已实测）
 - [x] **审批** —— Ante 暂停 → TUI 弹 `△ Permission required` → 在 TUI 批准 → `ApprovalResponse` → Ante 继续执行
-- [x] **消息顺序与去重** —— `inbox.enqueued`+`delivered` 入列表；复用客户端提交自带的 message id。**顺序的坑（2026-10-01 修）**：客户端收到 `session.inbox.delivered` 会把那条 prompt **移到转录末尾**（`packages/client/src/solid/data.ts` 的 `draft.splice` + `draft.push`），而 `session.step.started` 会追加助手消息——所以垫片**必须先发 `delivered`、再发 `step.started`**，反过来就把回复画在提问上面。另有一处重复：回合结束的收尾（`take_steers`）会把**已经送达过**的 steer 消息再宣布一次，客户端于是又把它推到末尾（这一次推到回复之后）；现在 step 边界发过 `delivered` 的会记进 `Store::delivered`，收尾时用 `claim_delivered` 跳过。**验证法（不必进 TUI）**：`ANTE_SHIM_TRACE=/tmp/t.log antex serve PORT` → 建会话并发一条 prompt → `/tmp/t.log` 里 `PUB session.inbox.delivered` 必须**只有一条**，且紧跟在 `PUB session.step.started` **之前**
+- [x] **消息顺序与去重** —— `inbox.enqueued`+`delivered` 入列表；复用客户端提交自带的 message id。**顺序的坑**：客户端收到 `session.inbox.delivered` 会把那条 prompt **移到转录末尾**（`packages/client/src/solid/data.ts` 的 `draft.splice` + `draft.push`），而 `session.step.started` 会追加助手消息——所以垫片**必须先发 `delivered`、再发 `step.started`**，反过来就把回复画在提问上面。另有一处重复：回合结束的收尾（`take_steers`）会把**已经送达过**的 steer 消息再宣布一次，客户端于是又把它推到末尾（这一次推到回复之后）；现在 step 边界发过 `delivered` 的会记进 `Store::delivered`，收尾时用 `claim_delivered` 跳过。**验证法（不必进 TUI）**：`ANTE_SHIM_TRACE=/tmp/t.log antex serve PORT` → 建会话并发一条 prompt → `/tmp/t.log` 里 `PUB session.inbox.delivered` 必须**只有一条**，且紧跟在 `PUB session.step.started` **之前**
 - [x] **多轮消息落位** —— 三条连发实测：用户与回复正确交错（前两条因排队相邻属正常）
 - [x] **中断收尾** —— Esc 两下（第一下上膛、第二下中断）后 Ante 正常收尾：工具单元格变 `✗`、转轮停止
 - [x] **失败可见** —— Ante 那轮失败时补发 `session.step.failed` + `session.execution.failed`（两者都必带 `error`），TUI 显示 `Error: …` 而不是空转
@@ -99,7 +99,7 @@ Ante（**你自己装的**：官方脚本装、`ante update` 升级）
   - **assistant**：id = `msg_<turn_id>_<第几步>`（`step_message_id`）。活会话的 pump 与日志重放**用同一个函数算**，所以同一 step 在哪边都是同一个 id；
   - **user**：`Store.handed`（交给 Ante 的文本 → 客户端自己的消息 id）在重放时认领回去——客户端那条是它自己铸的 id，换一个就会出现两条一样的提问。`forget_sent` 会在交付时清掉映射，所以这份另存；
   - 客户端自己的会话 id 与 Ante 存档名不同时，回读要先用 `Ante::archive_of` 映射到存档（否则读的是不存在的目录，transcript 直接空）。
-  **客户端补两处**（见「首页 logo」那节补丁清单）：拉取不再丢掉「这次没提到的行」（idle / compaction / 切换 / 正在流的那一步都是客户端自己从事件折的），以及 `editText` 在缺 text part 时补建一个（重读恰好落在一步中间时，后续 delta 才不会无处可落）。**验证法**：`antex serve PORT` → `curl -s 'localhost:PORT/api/session/<存档 id>/message'`，一条多步会话应是「用户 → 每步 think/text/tool → …」，`TurnEnd` 那条带 `time.completed`；活会话再抓一遍 SSE 里 `session.step.started` 的 `assistantMessageID`，应与回读出的 id 逐条相等。**TUI 验证法**：`~/antecode-scratch/probe_transcript.py PORT '<标题片段>'`（``+`l` 开列表 → 过滤 → 回车 → 抓帧），帧里应看到 `+ Thought` 与 `✓ Bash [...]` 行
+  **客户端补两处**（见「首页 logo」那节补丁清单）：拉取不再丢掉「这次没提到的行」（idle / compaction / 切换 / 正在流的那一步都是客户端自己从事件折的），以及 `editText` 在缺 text part 时补建一个（重读恰好落在一步中间时，后续 delta 才不会无处可落）。**验证法**：`antex serve PORT` → `curl -s 'localhost:PORT/api/session/<存档 id>/message'`，一条多步会话应是「用户 → 每步 think/text/tool → …」，`TurnEnd` 那条带 `time.completed`；活会话再抓一遍 SSE 里 `session.step.started` 的 `assistantMessageID`，应与回读出的 id 逐条相等。**TUI 验证法**：`script/tui_drive.py --send '12:/sessions\r'`，帧里应列出真 Ante 标题；再手动选一条带工具的会话，帧里应看到 `+ Thought` 与 `✓ Bash [...]` 行（选择器里发键不落：中英文都试过，最终帧仍停在未过滤的列表上——这一步留给手）
 - [x] **恢复旧会话后继续对话** —— 从前垫片只认「本进程第一个 prompt」建的那一个 Ante 会话（进程级 `started` 标志），此后的 prompt 一律 `UpdateSession`+`UserInput`，**从不看 URL 里的会话 id，也从不发 `Op::ResumeSession`**——消息因此进了当时那个新会话，只是事件按 `active` 路由，**看着**留在旧会话里（磁盘上则是另一条会话）。现在 `Ante.live` 记住当前连接驱动的会话：prompt 指向别的会话、且 `~/.ante/sessions/<id>/` 有存档就 `ResumeSession`（真续写，Ante 把新内容写回该 id 的日志），没有存档才 `StartSession`。**顺带处理 ResumeSession 自带的整份历史重放**：`Ante.replay_turn` 守卫把它丢掉，直到我们自己那条 `UserInput` op 触发的 `TurnStart.turn_id` 出现（该值就是那条 op 的 id）；被拒或 20s 超时则放行并清掉绑定，下一条消息重新定位。**验证法（不必进 TUI）**：`antex serve PORT` 起服务 → `POST /api/session` 建会话并 prompt 一次（Ante 那边落一条新目录 `ses_A`）→ 再 prompt `ses_A`、以及另一个已有目录的会话 → 核对各自的 `.ante/sessions/<id>/events.jsonl` 有没有收到新 `UserInput`（判据：消息落进**被指向的那条**）；同时本轮 SSE 里 `session.step.started` 只能出现一次，多于一次就是重放没挡住。垫片日志出现 `ante: 切到旧会话 <id>（ResumeSession）` 即走了恢复路径——一体化模式看 `/tmp/antex.log`
 - [x] **删除会话（`Ctrl+D`，按两下确认）** —— `DELETE /api/session/{id}` → 删掉 `~/.ante/sessions/<id>/`（**Ante 自己的存档，删了所有前端都看不到**，返回 204）；id 必须是单一路径段（否则 400），没有存档回 404，正在跑的那条拒删（400，先 Esc 中断）。**要删的是 Ante 的存档名，而客户端新会话用的是它自己编的 id**（`StartSession` 不接收 id，Ante 自己铸 `ses_01M3…`）——靠 `Evt::SessionStart` 里带的 `session_id` 建立对应（`Ante.archives`），否则按客户端 id 删会 404。**顺带修掉两个「会话凭空消失」**：① 列表原先只读 `meta.json`，而 Ante **只在 `TurnEnd` 写它**——回合没跑完（卡在提问 / 被杀）的会话只剩 `events.jsonl`，于是从列表里消失；现在缺 `meta.json` 就从日志取首条 `UserInput` 当标题、首个事件时间当创建时间（模型回落到当前配置）。② 续写判据同样从「有 `meta.json`」改成「有目录」，否则这种会话被打开时会**另开一条新会话**、历史看着少一半。**已知边界**：删完若还有**孤儿 Ante 进程**（`fuser -k` 只杀垫片，`ante serve --stdio` 子进程还活着），它退出时会把 `meta.json`/`dialog.json` 写回目录（实测复现，`events.jsonl` 不会回来）——真要清干净就确认目录不在了。**验证法（不必进 TUI）**：`antex serve PORT` → （a）`curl -X DELETE localhost:PORT/api/session/<编的 id>` → 404；（b）`POST /api/session` 建会话 + prompt 一次 → 用**客户端那个 id** 删 → 204 且 Ante 目录消失、垫片日志出现 `session: 删除会话 <id>（存档 …）`；（c）挑一条没有 `meta.json` 的存档（`ls ~/.ante/sessions/*/meta.json` 比对）→ 列表能看到它，prompt 一次垫片日志出现 `切到旧会话 …（ResumeSession）` 且新事件落进**同一个**目录
 - [x] **插嘴 / 排队（`Ctrl+S`）** —— opencode 的提交带 `delivery`：`steer`（回车，默认）走 Ante 的 **`Op::Steer`**，插进正在跑的那一轮；`queue`（`<leader>return`）**由垫片自己持有**（`Store::pending`），到回合边界（`TurnEnd`）才作为 `Op::UserInput` 交给 Ante——Ante 撤不回已提交的输入，放在垫片手里「插嘴 / 删除」才都算数。补齐 inbox 三件套：`GET …/inbox`（列出持有的条目，字段含 `delivery`/`payload.text`）、`PATCH …/inbox/{id}`（`{"delivery":"steer"}` 插嘴、`"queue"` 保持；该条已交给 Ante 时回 **409**）、`DELETE …/inbox/{id}`（丢弃；同样对已交给 Ante 的回 409）。**客户端侧补了上游没有的键位**：`ctrl+s`（见「首页 logo」那节的三处补丁）
@@ -123,15 +123,17 @@ Ante（**你自己装的**：官方脚本装、`ante update` 升级）
   - **`Evt::UserInput` 的回显会变长**：Ante 会把提及展开（提到某目录时加一段 `<folder-structure>`），所以「消息送达没」的比对不能拿用户原文比——垫片另存「实际发给 Ante 的那份文本」（`Store::sent`，按 inbox id），比对时先剥掉展开段。
   - **`file://` 附件**（`@` 补全带上的文件）**不加提及**：客户端文本里本来就有 `@路径`，Ante 自己会读；只回显。
   - **历史回放**：Ante 日志里存的是带提及的文本，回放时把垫片自己暂存的提及（文件名前缀 `antex-`）反解回附件，并把提及与展开段从正文里去掉；缓存文件已被清掉就保留提及原文（对应 Ante 自己的「附件过期」语义）。名字里的时间戳在前（`antex-<纳秒>-<pid>-<原名>.<ext>`），所以原名的数字后缀不会被当成时间戳吃掉。
-  - **本机开关**：`~/.config/opencode/cli.json` 里 `session.image_preview`（转录区）与 `prompt.image_preview`（输入框上方）默认都是 off——本机已开；终端要支持 kitty 图形协议（本机 Ghostty 支持）。⚠ **这份文件会被客户端整份重写**：在配置对话框里改任何一项，它按内存里的配置写回文件，`image_preview` 若不在内存里就**被抹掉**（2026-10-01 撞到：14:02 那次重写后两处预览同时消失，现象是转录区只剩一个 ` file <名字> ` 标签、输入框上方空着，而垫片的回显一直是对的——别去查垫片）。**读不到文件 = 空配置**，于是两个「我们不想要的默认」一起回来：预览 off、**`tabs.mode` 缺失 ⇒ `auto` ⇒ 标签栏开**（`tui/config/index.tsx` 的 `resolve`；A/B 实测：`off` 无标签栏、`on` 顶栏出现会话名 + `+`）。
-  - **垫片兜底**：一体化模式启动客户端时，读 `$OPENCODE_CONFIG_DIR/cli.json`（再退 `$XDG_CONFIG_HOME/opencode/`、`$HOME/.config/opencode/`），**只补文件没说的键**——`tabs.mode:"off"`、`session.image_preview:true`、`prompt.image_preview:true`——拼成一份 JSON 放进 `OPENCODE_CLI_CONFIG_CONTENT`（客户端把这份内容**深合并、覆盖在文件之上**，见 `cli/src/config/config.ts` 的 `merge(file, env)`），所以改写/丢失文件都翻不了盘；文件里**写了**某个键（哪怕 `false`/`"on"`）或用户自己设了这个变量，垫片对该键不插手。手动连的客户端收不到注入，`antex serve` 的提示里会把这条前缀原样打出来。
+  - **本机开关**：`~/.config/opencode/cli.json` 里 `session.image_preview`（转录区）与 `prompt.image_preview`（输入框上方）默认都是 off——本机已开；终端要支持 kitty 图形协议（本机 Ghostty 支持）。⚠ **这份文件会被客户端整份重写**：在配置对话框里改任何一项，它按内存里的配置写回文件，**不在内存里的键就跟着没了**；而**读不到文件 = 空配置**（不是「回落到默认」，是什么都没有），于是两个不想要的默认同时回来——预览 off、**`tabs.mode` 缺失 ⇒ `resolve()` 判成 `auto` ⇒ 标签栏开**（`tui/config/index.tsx`；A/B：`off` 无标签栏、`on` 时顶栏出现会话名 + `+`）。**症状与判据**：转录区只剩一个 ` file <名字> ` 标签、输入框上方空着 ⇒ 先看这份文件里那几个键在不在，**不要去查垫片的回显**（回显一直是好的）。
+  - **垫片兜底（`.6` 起钉三层）**：一体化模式启动客户端前，读客户端那份 `cli.json`——`OPENCODE_CONFIG_DIR` **就是配置目录本身**（客户端把它直接当 `Global.Path.config`），`$XDG_CONFIG_HOME`、`$HOME/.config` 两个 fallback 才是它的父目录——把文件没说的键补进 `OPENCODE_CLI_CONFIG_CONTENT`（客户端把这份内容**深合并、覆盖在文件之上**，见 `cli/src/config/config.ts` 的 `merge(file, env)`），所以改写/丢失文件都翻不了盘；文件里**写了**某个键（哪怕 `false`/`"on"`）或用户自己设了这个变量，垫片对该键不插手。补的是三样：`tabs.mode:"off"`、两处 `image_preview:true`、以及「做不了的命令」那七个 `keybinds` 置 `"none"`；`plugins` 走**并集**——数组在合并里是整体替换，所以要把文件原有条目（如 `./herdr-opencode`）搬过来再补 `-opencode.*`。手动连的客户端收不到注入，`antex serve` 的提示会把这条前缀原样打出来。
+  - **附件被丢时不再静默（`.6` 起）**：`data:` 附件超过 20MB、base64 解不开、或类型 Ante 读不了时，垫片会把「附件没有发出去：<原因>」写进**交给 Ante 的那份文本**（模型不会当自己看过图），并在屏幕上弹一张 `omarchy-osd` 卡片（同剪贴板补丁那套；非 Omarchy 上就是没卡片，只剩日志）。**别指望客户端显示原因**：非 2xx 只有状态码能到客户端（`client/src/promise/generated/client.ts` 把正文丢了），而客户端可能用本地乐观副本盖掉服务端改写的正文——所以给人看的那条走卡片。
+  - **请求体上限（`.6` 起）**：客户端把**原始**图当 `data:` URL 塞进 prompt body，屏幕截图转成 base64 轻易到几 MB，而 axum `Json` 抽取器**默认只收 2MB**，超了回 `413 Payload Too Large`（`Failed to buffer the request body`）——客户端只报发送失败，垫片日志一行都没有，看着像随机（小图能过）。垫片把上限抬到 **32MB**（`src/main.rs` 的 `MAX_REQUEST_BYTES` + `DefaultBodyLimit`），解析之后再交给压缩阶梯。**验法**：`antex serve PORT` → 建会话 → `POST …/prompt` 带一个 3MB 左右的 `data:` URL（`delivery:"queue"` 就不会真的交给 Ante），应回 200 而不是 413。
   - **验证法**：`cargo test`（8 项：压缩达标、提及转义、回显形状、日志反解、未知类型丢弃）；端到端 —— `antex serve PORT` → `POST /api/session` 建会话 → `POST …/prompt` 带上 `files:[{uri:"data:image/jpeg;base64,…", name:…}]` → `~/.ante/sessions/<新目录>/events.jsonl` 里 `UserInput` 应带 `@…/ante-paste-cache/antex-…`，`AgentMessage` 应能复述图里的字（实测 510KB 的图压到 152KB 后模型仍读出「SHRINK-7」）
 - [x] **事件流（SSE）** —— `{id, type, created, data}` 帧，首帧 `server.connected`
 - [x] **断线重连（Ante 掉了自己爬起来）** —— 原来 `spawn_ante` 里事件流一断只写一行日志：`ops` 留着旧句柄、`health` 照答 `healthy: true`、之后的每条 prompt 静默丢弃。现在拆成「连接 / 泵事件 / 重连循环」三块：
   - **状态**：`Link::{Connecting,Up,Down{reason,since,attempt}}` 进 `/api/health`；转录里「后端没了」那行按 `OFFLINE_NOTICE_FLOOR = 20s` 节流（`notice_due()` 取槽，两个调用方不会各发一条）。
   - **退避**：`reconnect_delay()` 首次 1s（多数情况是主机刚被人重启），封顶 30s；连接**活过 `LINK_HEALTHY = 5s`** 才把失败计数清零，否则「一启动就死」的后端会被永久按 1s 重试。断线时 `forget_link_state()` 清掉「它驱动的会话 / 重放判定 / 挂着的审批 / 在跑的回合」——留下的会被当成新连接的事实。
   - **排队不丢**：断线期间提交的 prompt 不进 Ante，也不丢，留在 `Store::pending`（客户端看到的是那段 `session.step.failed` + 排队标记）；重连后 `flush_after_reconnect()` 先切回那条会话、再交队列；顺手把界面上那行 spinner 收掉。
-  - **回合进行中掉线是特例（本轮修）**：Ante **只在 `TurnEnd` 写 `meta.json`**，所以回合没跑完就被杀的会话在盘上**只有 `events.jsonl`**——目录在、`ResumeSession` 却回 `Failed to resume session: No such file or directory (os error 2)`。垫片原判据 `stored_session()` 只看目录存不存在，于是排队的消息被投进这条打不开的会话，Ante 回 `session not initialized`，**消息就没了**。现在：`resumable_archive_of()` 要求 `meta.json` 在场才算「能恢复的存档」（`archive_of()` 不动——历史回读与删除仍认这种半截会话，它还有救得回来的日志），这种会话直接走「新开一条」并把排队消息带走；`Replay::Unresumed`（Ante 拒绝，或等不到它自己那个 turn）时把已递出去的消息**退回队列**并在转录里说明——否则一次静默的上下文断档，用户只会看到「回复忽略了上文」。
+  - **回合进行中掉线是特例**：Ante **只在 `TurnEnd` 写 `meta.json`**，所以回合没跑完就被杀的会话在盘上**只有 `events.jsonl`**——目录在、`ResumeSession` 却回 `Failed to resume session: No such file or directory (os error 2)`。垫片原判据 `stored_session()` 只看目录存不存在，于是排队的消息被投进这条打不开的会话，Ante 回 `session not initialized`，**消息就没了**。现在：`resumable_archive_of()` 要求 `meta.json` 在场才算「能恢复的存档」（`archive_of()` 不动——历史回读与删除仍认这种半截会话，它还有救得回来的日志），这种会话直接走「新开一条」并把排队消息带走；`Replay::Unresumed`（Ante 拒绝，或等不到它自己那个 turn）时把已递出去的消息**退回队列**并在转录里说明——否则一次静默的上下文断档，用户只会看到「回复忽略了上文」。
   - **验证法**（不必进 TUI，端口别用 41999——那是本机 TUI 占的）：`antex serve PORT`（带 `ANTE_SHIM_TRACE=/tmp/trace.log` 更好）→ `POST /api/session` → prompt 一条**至少跑 8 秒**的（例如让它跑 `sleep 8`）→ 3 秒后 `kill $(pgrep -P <shim pid> -f 'ante serve --stdio')` → 掉线期间再 prompt 一条 → 期望日志：`事件流结束；1s 后重连（第 1 次）`、`未连接…排进队列等重连`、`已连接，开始转发事件`、**一个新存档 id**、`排队消息 … 交给 Ante`、`…已被 Ante 收下`、`…送达（模型开始读）`，SSE 里出现 `session_unresumed` 的失败行 + 新会话的 `session.execution.succeeded`。**回合之间**掉线（第一条跑完再 kill）应仍走 `切到旧会话 …（ResumeSession）`，上下文接着上——两条都要跑，只测一条会把另一边测坏。
 
 ### 未完成项的验证法
@@ -166,7 +168,7 @@ opencode2 --server http://127.0.0.1:41999     # 终端 B
 - `antex PORT` 指定端口（默认 41999）；`antex -h` 看用法。
 - **可以多开**：一体化模式下端口被占会**自动往后顺延**（并打印改用哪个），所以第二个、第三个 `antex` 直接跑就行。`serve` 模式相反——按你给的端口，被占就明确报错（换端口会让人连错服务）。
 - 环境变量：`ANTE_BIN` 指定 `ante` 可执行文件（默认 `$PATH`，再退到 `~/.ante/bin/ante`）；`ANTEX_CLIENT` 指定客户端（默认 `~/.local/bin/antex-tui`，再退到 `opencode2` → `opencode`）。**所以不必先 export PATH。**
-- **一体化模式下请求日志写 `/tmp/antex.log`**——写 stdout 会糊在 TUI 上（踩过）；`serve` 模式仍打在 stdout。
+- **一体化模式下请求日志写 `/tmp/antex.log`**——写 stdout 会糊在 TUI 上；`serve` 模式仍打在 stdout。
 - **启动自检**：`antex` 起来时先核对 Ante —— 找不到 `ante` 就直接报错退出（否则 TUI 能开、消息全石沉大海）；`ante --version` 与二进制里编进去的 `ante-sdk` 版本对不上就**警告**（这正是「界面在跑但没反应」最常见的成因）。运行期连不上、事件流断掉、消息被丢弃也都写同一处日志（`/tmp/antex.log`），不留哑谜。想看是否通过：`tail /tmp/antex.log`。
 
 ## 首页 logo（改过客户端）
@@ -177,7 +179,7 @@ opencode2 --server http://127.0.0.1:41999     # 终端 B
 ./script/build-tui.sh        # 编本机平台，产物 ~177MB，约 1 分钟
 ```
 
-- 补丁十一处：
+- 补丁清单（`packages/client/src/solid/data.ts` 那处是两改）：
   - `packages/tui/src/logo.ts` —— 首页大字 logo 换成 Ante 面具 + `ANTEX`；
   - `packages/tui/src/component/dialog-model.tsx` —— 模型选择器的条目**永远带供应商**（分组标题 + 过滤时行尾的供应商名）。上游把这一栏压在 `connected()` 后面，而那个判断看的是 integration 连接数；antex 没有 integration 概念、恒假，于是 81 个模型的列表里同名条目完全分不出来。
   - `packages/tui/src/config/keybind.ts` + `routes/session/index.tsx` —— 加 `queued_prompt.steer` = **`ctrl+s`**（对齐 Ante 自己的「把排队消息插进正在跑的回合」；上游 v2 没这个键位），命令体复用客户端的 `mutatePending("steer", queuedPrompts()[0].id)`。
@@ -200,38 +202,29 @@ Ante 没有 VCS/diff、MCP、revert、分享、PTY、provider OAuth。垫片对�
 | --- | --- | --- |
 | 上游插件 | `cli.json` 的 `plugins` 写 `"-opencode.<id>"` | `-opencode.diffs`（`/diff`）、`-opencode.stats`（`/stats`）、`-opencode.plugins`（`/plugins`）、`-opencode.btw`（`/btw`）、`-opencode.sidebar.mcp` |
 | 键位 | `cli.json` 的 `keybinds` 设 `"none"` | `session.undo`/`redo`/`export`/`background`、`terminal.toggle`/`select`/`close`（`diff.open`、`mcp.list`、`provider.connect`、`session.fork`、`session.share` 上游本来就是 `none`） |
-| 命令本体 | 客户端补丁 `context/keymap.tsx` 的黑名单 | 上游把内建斜杠命令**从 keymap 注册表直接摊出来**，配置里没有过滤字段，只能改源码（见「补丁九处」） |
-| 整块面板 | `cli.json` 的 `session.sidebar: "hide"` 可关掉侧栏 | 侧栏里那张 `Getting started / Connect provider` 卡片，由「补丁九处」里的 `sidebar/footer.tsx` 那处摘掉 |
+| 命令本体 | 客户端补丁 `context/keymap.tsx` 的黑名单 | 上游把内建斜杠命令**从 keymap 注册表直接摊出来**，配置里没有过滤字段，只能改源码（见「首页 logo」那节的补丁清单） |
+| 整块面板 | `cli.json` 的 `session.sidebar: "hide"` 可关掉侧栏 | 侧栏里那张 `Getting started / Connect provider` 卡片，由补丁清单里的 `sidebar/footer.tsx` 那处摘掉 |
 
-本机 `~/.config/opencode/cli.json` 现在长这样（改前备份在 `cli.json.bak-<时间戳>`）：
+本机 `~/.config/opencode/cli.json` 现在长这样（改前备份到 `~/.local/state/backups/.config/opencode/cli.json.bak-<后缀>`；**这份文件会被客户端整份重写**，见实现清单「贴图」那节）：
 
 ```json
 {
   "$schema": "https://opencode.ai/v2/cli.json",
-  "theme": { "name": "system" },
+  "diffs": { "wrap": "word" },
+  "session": { "sidebar": "auto", "scrollbar": false, "thinking": "hide", "image_preview": true },
   "tabs": { "mode": "off" },
-  "plugins": [
-    "-opencode.diffs",
-    "-opencode.stats",
-    "-opencode.plugins",
-    "-opencode.btw",
-    "-opencode.sidebar.mcp"
-  ],
-  "keybinds": {
-    "session.undo": "none",
-    "session.redo": "none",
-    "session.export": "none",
-    "session.background": "none",
-    "terminal.toggle": "none",
-    "terminal.select": "none",
-    "terminal.close": "none"
-  }
+  "animations": true,
+  "plugins": ["./herdr-opencode", "-opencode.diffs", "-opencode.stats", "-opencode.plugins", "-opencode.btw", "-opencode.sidebar.mcp"],
+  "prompt": { "image_preview": true },
+  "keybinds": { "session.undo": "none", "session.redo": "none", "session.export": "none", "session.background": "none", "terminal.toggle": "none", "terminal.select": "none", "terminal.close": "none" }
 }
 ```
 
+⚠ **靠文件的那两层丢了就回面板**（症状：`/diff`、`/stats`、`/plugins`、`/btw` 重新出现在面板里，`<leader>t`、`<leader>u` 这些键又活了）⇒ 文件里要有，垫片（`.6` 起）也把它们钉住。**`keybinds` 那层不是装饰**：`config/keybind.ts` 给 `session.undo/redo/export`、`terminal.toggle/select/close`、`session.background` 都配了默认键（`<leader>u/r/x/t/down/up`、`ctrl+b`），而客户端补丁的黑名单只把它们从**面板**里摘掉，**按键照样触发**——那些请求垫片一律答 200 + 空，点了就是静默无反应。
+
 **不摘的**：`/cd`（家目录下能用）、`/editor`、`/timeline`、`/variants`、`/themes`、`/settings`、`/debug`、`/open`、`/sessions`——要么纯客户端、要么垫片答得出真数据。
 
-**验收**：进 TUI 敲 `/un`、`/for`、`/mcps`、`/di`、`/st`、`/pl`、`/up` 应全是 `No matching commands`；`/` 列表里不该出现 `undo` `redo` `share` `unshare` `fork` `rename` `copy` `export` `skills` `worktrees` `terminal` `update`。**残留**：像 `/rename`、`/stats`、`/skills` 这种「其实做得到」（写 `meta.json` / 读 Ante 自己的 usage 与技能目录）先按做不了摘了，要恢复就照开头「状态」清单里对应那条的补法做。
+**验收**：进 TUI 敲 `/un`、`/for`、`/mcps`、`/up` 应全是 `No matching commands`；`/` 列表里不该出现 `undo` `redo` `share` `unshare` `fork` `rename` `copy` `export` `skills` `worktrees` `terminal` `update`（这些走客户端补丁的黑名单，与配置文件无关）。**靠 `cli.json` 那两层摘的**（`/di`、`/st`、`/pl`、`/btw`）同样不该出现，只是它们不在补丁黑名单里——文件里那批 `-opencode.*` 一旦丢了就回到面板，见上一节的 ⚠。**残留**：像 `/rename`、`/stats`、`/skills` 这种「其实做得到」（写 `meta.json` / 读 Ante 自己的 usage 与技能目录）先按做不了摘了，要恢复就照开头「状态」清单里对应那条的补法做。
 
 ## 依赖与版本
 
@@ -270,7 +263,7 @@ Cargo 依赖（`Cargo.lock` 实际解析值，非 `Cargo.toml` 的约束范围�
 | `~/.local/bin/antex-tui` | `vendor/opencode/packages/cli/dist/cli-linux-x64/bin/opencode` | **我们的构建**，`antex` 默认用它；版本显示 `0.0.0-master-<日期>`；随时可用 `./script/build-tui.sh` 重建 |
 | `opencode` / `opencode2` | `~/.opencode/bin/…` | 官方 2.0.18，**留作兜底**：`ANTEX_CLIENT=opencode2 antex`，或删掉 `antex-tui` 软链即回退 |
 
-- **官方那份别删**：`~/.opencode/bin` 是官方脚本的安装位置（删过，害得用户的 v2 消失）。
+- **官方那份别删**：`~/.opencode/bin` 是官方脚本的安装位置（删掉就没有官方 v2 可回退了）。
 - 升级官方用 `opencode upgrade`（自带）；我们那份随 `git subtree pull` + `./script/build-tui.sh` 跟上。
 注意：omarchy 的 `stable-mirror` 冻结在 2026-09-08，pacman 看不到 v2。
 
@@ -346,8 +339,8 @@ session.step.started → session.text.started → session.text.delta ×N → ses
 
 ## 验收与排错开关
 
-- **改完垫片必须重启进程**：`target/release/antex` 是产物，旧进程不会自更新（曾因此把已修好的功能当成没修）。
-- **别按端口杀 antex**：一体化模式端口被占会**自动顺延**，所以 `fuser -k <port>/tcp` 很可能杀掉的是**另一个正在用**的 antex（实测误杀过一次：现场是 `Connection lost · Reconnecting to the server automatically.` + 终端留一屏裸 SGR，看着像崩）。要停就按 PID、或先 `ss -ltnp | grep antex` 认清是谁。
+- **改完垫片必须重启进程**：`target/release/antex` 是产物，旧进程不会自更新——改动不上线，看着像「没修好」。
+- **别按端口杀 antex**：一体化模式端口被占会**自动顺延**，所以 `fuser -k <port>/tcp` 很可能杀掉的是**另一个正在用**的 antex（症状：`Connection lost · Reconnecting to the server automatically.` + 终端留一屏裸 SGR，看着像崩）。要停就按 PID、或先 `ss -ltnp | grep antex` 认清是谁。
 - **肉眼验收要加 `--print-logs --log-level debug`**——客户端抛异常只弹一个小 toast，正文里什么都不显示，「没反应」多半是它。
 - **TUI 自动化验收用 PTY + pyte 探针**：`script/tui_drive.py` 驱动客户端——`--send '18:文本\r'` 按**绝对秒数**发键（`\r` 提交、`\n` 换行、`\e` 转义），`--after` 是最后一次发键后再等多久，`--dump` 把最终屏文本写文件（不写就只打印；屏上空白行会被滤掉）。**本机没装 tmux，也没装 `uv`**（`shot-home.py` 那条 `uv run --with pyte` 在本机跑不了）：`python3 -m venv /tmp/tuivenv && /tmp/tuivenv/bin/pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pyte` 起一个一次性 venv，再用 `/tmp/tuivenv/bin/python script/tui_drive.py …`。表单渲染、`AskUser` 作答、首页版本号都是这么验的。
 - **接口级验证不必进 TUI**：`antex serve PORT` 后直接 `curl`，逐条对着「实现清单」的验证法做。
@@ -364,26 +357,23 @@ session.step.started → session.text.started → session.text.delta ×N → ses
 
 ## 下一步
 
-**v2026.10.01.5（2026-10-01 发）**——一处兜底：客户端的两个「不想要的默认」不再能自己回来。
+**这里只放手上的活与开放问题；功能缺口（空框）看开头「状态」清单。**
 
-- **来龙去脉**：`cli.json` 会被客户端**整份重写**（配置对话框按内存里的配置写回），不在内存里的键就跟着没了；而**读不到文件＝空配置**，于是两个默认同时回来——预览 off、**`tabs.mode` 缺失 ⇒ `resolve()` 里判成 `auto` ⇒ 标签栏开**。2026-10-01 连撞两次：14:02 那次重写抹掉 `image_preview`（两处预览一起消失，转录区只剩 ` file <名字> ` 标签），19:38 文件短暂缺失时重启（标签栏冒出来 + 预览又没）。
-- **修法**：一体化模式启动客户端时，垫片读 `$OPENCODE_CONFIG_DIR/cli.json`（再退 `$XDG_CONFIG_HOME/opencode/`、`$HOME/.config/opencode/`），**只补文件没说的键**——`tabs.mode:"off"`、`session.image_preview:true`、`prompt.image_preview:true`——拼成 JSON 放进 `OPENCODE_CLI_CONFIG_CONTENT`（客户端 `cli/src/config/config.ts` 的 `load` 是 `merge(file, env)`：这份内容**深合并、覆盖在文件之上**），所以文件被改写/丢失都翻不了盘。文件里写了某个键（哪怕 `false`/`"on"`）或用户自己设了这个变量 ⇒ 垫片对该键不插手；手动 `opencode2 --server …` 连的那种收不到注入，`antex serve` 会把前缀原样打出来。
-- **验法**：（a）`cargo test` 的 `the_client_override_fills_in_only_what_the_file_leaves_unsaid`（空文件/JSONC/读不到 ⇒ 三键都补；写明了 ⇒ 一个都不补；只写一半 ⇒ 只补另一半）；（b）端到端——拿一份**删掉 `tabs` 与 `image_preview`** 的配置目录起 `OPENCODE_CONFIG_DIR=<dir> antex`，`tr '\0' '\n' < /proc/<client pid>/environ` 里应出现 `{"…","tabs":{"mode":"off"}}`，且 `script/tui_drive.py` 抓屏**顶栏没有**「会话名 + `+`」的标签栏（对照：`tabs.mode:"on"` 时会出现），预览两处照旧（本机已按此实测）。
+**待发（`.6`，工作区已改完，等一次 tag）**
 
-**v2026.10.01.4（2026-10-01 发）**——一处修复 + 一处补实：
+- **prompt 请求体上限 2MB → 32MB**：客户端把**原始**图当 `data:` URL 塞进 body，屏幕截图转 base64 轻易超 2MB，而 axum `Json` 抽取器的默认上限就是 2MB，超了回 `413 Payload Too Large`——界面上只报发送失败、垫片日志一行都没有（小图能过，所以看着像随机）。垫片加 `DefaultBodyLimit::max(MAX_REQUEST_BYTES)`，解析后照旧走压缩阶梯。机制与验法见实现清单「贴图」那节。
+- **「做不了的入口」那两层钉死**：`plugins` 补成并集（文件原条目 + `-opencode.*`）、`keybinds` 补 `"none"`，放进同一份注入里；顺带修掉注入侧的配置查找——原先给 `OPENCODE_CONFIG_DIR` 又拼了一层 `opencode/`，读不到文件就当成「空配置」。
+- **附件被丢时说出来**：`attachments::stage` 把丢弃原因交回调用方，正文里加一句给 Ante（+弹卡片给用户），不再只写日志。
 
-- **`AskUser` 的选项列表没上屏（`.3` 里是坏的）**：垫片发得出 `form.created`、`GET …/form` 也取得到，但客户端 store 第二段 switch 的开头就是 `if (!event.location) return`——垫片所有事件都不带 `location`，于是这条被**静默丢掉**，界面上只有 `→ Asked 1 question` 那一格。现在 `form.created` / `form.replied` / `form.cancelled` 改走 `publish_located()` 带上 `{"directory":…}`，且 **form 对象自己也带一份**（客户端的 `removeForm` 对没有 location 的 form 一律放行＝永远摘不掉）。**验法**：见实现清单「提问（`AskUser`）—— 选项列表」那节——`script/tui_drive.py` 跑一遍真 TUI，选项列表与回车作答都要看得见（本机已实测）。
-- **`tui_drive.py` 进仓库**：README 里两处引用的 `~/antecode-scratch/tuiprobe/tui_drive.py` 早没了，补成 `script/tui_drive.py`（PTY + pyte，`--send '秒:文本\r'` 按绝对秒数发键、`--dump` 写屏文本）；本机既没 tmux 也没 `uv`，一次性 venv 的配方见文末。
+**开放问题**
 
-**v2026.10.01.3（2026-10-01 发）**——三处一起出的改动，机制与验法：
+- **压图目标值**：现固定 ≤160KB base64 / 长边 ≤1568，这个数是照 Ante 的接收上限定的（README 里记的「约 240KB base64」**没有源头**，是本机观察）。要榨质量就先量出真阈值：同一张图压到 120/160/200/240/300KB 各发一次，看从哪档开始被丢。
+- **客户端侧压缩**（粘贴时就压）能免掉请求体这一层，但要改 vendored 源码 + 重建客户端，且**发送前预览会变成压过的图**、压缩逻辑裂成两份——除非非压不可，不走这条路。
+- **多模态硬限只能换模型绕**：若那条接收上限真是 provider 的硬限，垫片够不着——唯一出路是让有视觉的模型先 OCR/描述，再把文字喂回当前模型。
 
-- **位置标签不再长 `:main`**：垫片 `/api/vcs` 原先恒答 `{provider:"git", branch:{current:"main", default:"main"}}`，于是每个会话的 `目录:分支` 都挂上假分支（垫片只有一个 location＝家目录，家目录不是仓库，真去读 git 也是空）。改成答空分支（`src/main.rs` 的 `vcs()`），客户端那行 `branch ? dir:branch : dir` 自己就只剩目录。**验法**：`antex serve PORT` 后 `curl -s localhost:PORT/api/vcs`，`data.branch` 应为空对象；界面上输入栏底部与侧栏都只剩目录。
-- **本地独有的行按时间归位**：`message.sync` 重拉 transcript 时，本机自己折出来的行（idle / compaction / 切换 / 正在流的那一步 / 待递送的 prompt）改为按 `time.created` 插回原位（`vendor/opencode/packages/client/src/solid/data.ts` 的 `mergeHeldRows`）。原先一律追加到末尾，会把还没被 Ante 读走的那条 prompt 挂在模型后续步骤**下面**，看着像顺序错（`Pending...` 挂多久，它就压多久）。**验法**：client 包 `bun test test/solid-data.test.ts` 的「slots a row the read did not mention in by its timestamp」——旧实现 fail、新实现 pass。
-- **`AskUser` 的选项列表**：工具单元格只会写 `→ Asked 1 question`——选项在客户端自己的表单提示里，而垫片从不发 `form.created`（`/api/session/{id}/form` 还恒答空），于是提问在界面上等于没有选项。现在 `ToolStart(AskUser)` 把它镜像成一张 question 表单，reply 把选中的 label 当**下一条用户消息**交给 Ante（Ante 没有作答 op，结掉提问的正是下一条用户输入），`DELETE` 只撤提示。**这一版验得不够**：`antex serve` + `curl` 只能验到垫片这一侧（缺 `location` 的坑就是这么漏过去的），真验法见 `.4` 那条。
+**发版一条线**：改 `PKGBUILD` 的 `pkgver`（日期 + 当日序号）→ 提交 → 打**同名** tag 推上去（流程见 `release-via-ci`）。
 
-下次发版：改 `PKGBUILD` 的 `pkgver`（日期 + 当日序号）→ 提交 → 打**同名** tag 推上去（流程见 `release-via-ci`）。
-
-**日常路径上没有已知缺陷**：过去列在缺口里的中断收尾、多轮消息落位、会话列表、agent 切换、`/compact`、恢复旧会话后继续对话都已实现并实测。
+**已装版本（`.5`）的已知缺陷**：prompt 请求体超 2MB 的图发不出去（`413`，修在 `.6`）。除此之外，过去列在缺口里的中断收尾、多轮消息落位、会话列表、agent 切换、`/compact`、恢复旧会话后继续对话都已实现并实测。
 
 要接着做，就挑开头「状态」清单里 **空框** 的那几条（`/rename`、`/copy`、`/export`、`/stats`、`/skills`、会话内 `/cd`、真多标签、断线时的终端还原）；**带删除线** 的一条都别再提议——Ante 底层没有那些概念。
 

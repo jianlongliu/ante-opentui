@@ -24,7 +24,7 @@ use ante_sdk::{
 };
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -1204,12 +1204,39 @@ async fn ante_version(bin: &std::path::Path) -> Option<String> {
     text.split_whitespace().last().map(str::to_string)
 }
 
-/// The client's own config has two answers we do not want as defaults: image
-/// previews off, and session tabs on (`tabs.mode` absent → `auto` → on). The
-/// client rewrites `cli.json` wholesale, so a key that is not in memory is gone
-/// with it, and an unreadable file counts as an empty one — either way the
-/// defaults come back (2026-10-01: previews vanished after a rewrite, tabs came
-/// back while the file was momentarily missing). The client reads
+/// Upstream plugins that front features Ante has no side for: VCS/diff, usage
+/// stats, the opencode plugin system, `/btw`, the sidebar's MCP card. The client
+/// takes `plugins` as an ordered list where an `-opencode.<id>` entry turns a
+/// builtin off (`tui/plugin/context.tsx`), matching by exact id or `<prefix>.*`.
+const DISABLED_PLUGINS: &[&str] = &[
+    "-opencode.diffs",
+    "-opencode.stats",
+    "-opencode.plugins",
+    "-opencode.btw",
+    "-opencode.sidebar.mcp",
+];
+
+/// Binds that ship live for commands with nothing behind them
+/// (`tui/config/keybind.ts`: `<leader>t`, `<leader>x`, `ctrl+b`, `<leader>u`,
+/// `<leader>r`, `<leader>down/up`). The command blacklist in the keymap patch
+/// only keeps them out of the palette — the keys still fire without this.
+const DEAD_KEYBINDS: &[&str] = &[
+    "session.undo",
+    "session.redo",
+    "session.export",
+    "session.background",
+    "terminal.toggle",
+    "terminal.select",
+    "terminal.close",
+];
+
+/// The client's own config has three answers we do not want: image previews off,
+/// session tabs on (`tabs.mode` absent → `auto` → on), and live entries/keys for
+/// commands with nothing behind them. The client rewrites `cli.json` wholesale,
+/// so a key that is not in memory is gone with it, and an unreadable file counts
+/// as an empty one — either way the defaults come back (2026-10-01: previews
+/// vanished after a rewrite, tabs came back while the file was momentarily
+/// missing, the `-opencode.*` list was gone too). The client reads
 /// `OPENCODE_CLI_CONFIG_CONTENT` and merges it **over** the file
 /// (`cli/config/config.ts`), so filling in just the keys the file leaves unsaid
 /// is the durable fix: nothing the file does can flip them again.
@@ -1242,28 +1269,73 @@ fn client_config_override(file: Option<&str>, env_set: bool) -> Option<String> {
             fill[section] = json!({ "image_preview": true });
         }
     }
+    // `plugins` and `keybinds` are the "hide what Ante cannot serve" layers, and
+    // both were dropped from this file once already, so pin them here too.
+    let mut plugins: Vec<Value> = config
+        .as_ref()
+        .and_then(|config| config.get("plugins"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let carried = plugins.len();
+    for entry in DISABLED_PLUGINS {
+        if !plugins.iter().any(|existing| existing.as_str() == Some(entry)) {
+            plugins.push(json!(entry));
+        }
+    }
+    // The merge replaces arrays instead of appending to them, so the file's own
+    // entries only survive because they were carried into this list by hand.
+    if plugins.len() > carried {
+        fill["plugins"] = json!(plugins);
+    }
+    let mut keybinds = serde_json::Map::new();
+    for key in DEAD_KEYBINDS {
+        if !said(config.as_ref(), &["keybinds", key]) {
+            keybinds.insert((*key).to_string(), json!("none"));
+        }
+    }
+    if !keybinds.is_empty() {
+        fill["keybinds"] = Value::Object(keybinds);
+    }
     if fill.as_object().is_some_and(serde_json::Map::is_empty) {
         return None;
     }
     Some(fill.to_string())
 }
 
-/// `client_config_override` against the real filesystem: the client reads
-/// `$OPENCODE_CONFIG_DIR/cli.json`, else `$XDG_CONFIG_HOME/opencode/`, else
-/// `$HOME/.config/opencode/`; follow the same order so the two agree.
+/// Where the client's `cli.json` lives, resolved the way the client resolves it:
+/// `OPENCODE_CONFIG_DIR` **is** the config directory (the client hands it
+/// straight to `Global.Path.config`), while the XDG/HOME fallbacks name its
+/// parent. Reading a different file is not harmless — a miss looks like "no
+/// opinion", which costs the file's own entries.
+fn client_config_path(getenv: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
+    if let Some(dir) = getenv("OPENCODE_CONFIG_DIR") {
+        return Some(std::path::PathBuf::from(dir).join("cli.json"));
+    }
+    getenv("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| getenv("HOME").map(|home| std::path::PathBuf::from(home).join(".config")))
+        .map(|base| base.join("opencode").join("cli.json"))
+}
+
+/// `client_config_override` against the real filesystem.
 fn client_config_from_disk() -> Option<String> {
     if std::env::var_os("OPENCODE_CLI_CONFIG_CONTENT").is_some() {
         return None;
     }
-    let dir = std::env::var_os("OPENCODE_CONFIG_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from))
-        .or_else(|| std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config")));
-    let text = dir
-        .map(|dir| dir.join("opencode").join("cli.json"))
+    let text = client_config_path(|key| std::env::var_os(key))
         .and_then(|file| std::fs::read_to_string(file).ok());
     client_config_override(text.as_deref(), false)
 }
+
+/// Pasted images ride in the prompt body as a `data:` URL, and a screenshot's
+/// base64 runs to several megabytes — past axum's 2 MB default, which answers
+/// 413 `Failed to buffer the request body: length limit exceeded` and reaches
+/// the user as a bare "发不出去" with nothing in the log (2026-10-01; small
+/// pastes kept working, which is what made it look random). Only the wire limit
+/// needs to be generous: `attachments::stage` still caps the decoded bytes at
+/// 20 MB and says so in the log.
+const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 
 /// Which opencode client to hand the terminal to. `~/.local/bin/antex-tui` is
 /// **our** build (vendored source + the Ante logo) and wins when present; the
@@ -3527,6 +3599,30 @@ async fn session_form_reply(
     axum::http::StatusCode::NO_CONTENT
 }
 
+/// Fire-and-forget card in the corner of the shell — the same channel the
+/// clipboard shim uses, and the one surface a notice reaches the user through
+/// without the client having to draw it. `omarchy-osd` only exists on Omarchy:
+/// a spawn that fails is simply no card, and the log line is the whole record.
+fn osd_notice(message: &str) {
+    const DURATION_MS: &str = "6000";
+    let args = ["-m", message, "-d", DURATION_MS];
+    let run = |bin: std::path::PathBuf| {
+        std::process::Command::new(bin)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    };
+    if run(std::path::PathBuf::from("omarchy-osd")).is_ok() {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME") else { return };
+    let bin = std::path::PathBuf::from(home).join(".local/share/omarchy/bin/omarchy-osd");
+    if let Err(err) = run(bin) {
+        log_line(&format!("attachments: 卡片弹不出来：{err}"));
+    }
+}
+
 /// The prompt the user typed. opencode has two deliveries for it — `steer` (into
 /// the turn in flight, or a new turn when idle) and `queue` (held here until the
 /// turn boundary) — and Ante has the matching ops: `Steer` and `UserInput`.
@@ -3555,7 +3651,21 @@ async fn session_prompt(
     // `@path` appended to the text we hand over. The client keeps its own text;
     // the attachments it draws come from the echo below.
     let attachments_in = body.get("files").and_then(Value::as_array).cloned().unwrap_or_default();
-    let (staged, files) = attachments::stage(&text, &attachments_in);
+    let (staged, files, dropped) = attachments::stage(&text, &attachments_in);
+    let (mut text, mut staged) = (text, staged);
+    if !dropped.is_empty() {
+        // An attachment that could not be staged has no channel of its own: the
+        // client turns a failed send into a bare status code, and a pushed
+        // transcript row is not drawn. So the sentence rides in the message —
+        // Ante is told the image never arrived instead of guessing — and the
+        // user gets a card in the corner.
+        for reason in &dropped {
+            let note = format!("\n【附件没有发出去：{reason}】");
+            text.push_str(&note);
+            staged.push_str(&note);
+        }
+        osd_notice(&format!("附件没有发出去：{}", dropped.join("；")));
+    }
     if !files.is_empty() {
         log_line(&format!("attachments: 暂存 {} 个附件，随消息提及给 Ante", files.len()));
     }
@@ -3834,6 +3944,7 @@ async fn main() {
         .route("/api/session/{id}/view", post(no_content))
         .route("/api/event", get(events))
         .fallback(fallback)
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(axum::middleware::from_fn(log_request))
         .with_state(store);
 
@@ -3875,7 +3986,7 @@ async fn main() {
         // A manual client misses the override the one-command mode adds, so hand
         // it over as a paste-ready prefix when the user has no opinion of their own.
         if let Some(config) = client_config_from_disk() {
-            println!("（让贴图能预览、标签栏关着：在前面加上 OPENCODE_CLI_CONFIG_CONTENT='{config}'）");
+            println!("（贴图预览、标签栏、以及做不了的那些入口与键位，都在这一份里：在前面加上 OPENCODE_CLI_CONFIG_CONTENT='{config}'）");
         }
         axum::serve(listener, app).await.expect("serve");
         return;
@@ -4093,7 +4204,10 @@ mod tests {
         assert!(client_config_override(Some("{ // comment\n}"), false).is_some());
 
         // Every key can be spoken for, and then there is nothing to inject.
-        let mine = r#"{"tabs":{"mode":"on"},"session":{"image_preview":false},"prompt":{"image_preview":false}}"#;
+        let mine = r#"{"tabs":{"mode":"on"},"session":{"image_preview":false},"prompt":{"image_preview":false},
+            "plugins":["-opencode.diffs","-opencode.stats","-opencode.plugins","-opencode.btw","-opencode.sidebar.mcp"],
+            "keybinds":{"session.undo":"none","session.redo":"none","session.export":"none","session.background":"none",
+                        "terminal.toggle":"none","terminal.select":"none","terminal.close":"none"}}"#;
         assert_eq!(client_config_override(Some(mine), false), None);
 
         // …and one key being theirs does not silence the others.
@@ -4104,5 +4218,78 @@ mod tests {
         assert_eq!(value["session"]["image_preview"], json!(true));
 
         assert_eq!(client_config_override(Some("{}"), true), None, "the variable itself wins");
+    }
+
+    #[test]
+    fn the_config_path_follows_the_clients_own_lookup() {
+        let env = |pairs: Vec<(&'static str, &'static str)>| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, value)| std::ffi::OsString::from(*value))
+            }
+        };
+        let path = |path: Option<std::path::PathBuf>| path.map(|path| path.to_string_lossy().into_owned());
+
+        // The variable names the directory itself; the fallbacks name its parent.
+        assert_eq!(
+            path(client_config_path(env(vec![("OPENCODE_CONFIG_DIR", "/cfg")]))),
+            Some("/cfg/cli.json".to_string())
+        );
+        assert_eq!(
+            path(client_config_path(env(vec![("XDG_CONFIG_HOME", "/xdg")]))),
+            Some("/xdg/opencode/cli.json".to_string())
+        );
+        assert_eq!(
+            path(client_config_path(env(vec![("HOME", "/home/u")]))),
+            Some("/home/u/.config/opencode/cli.json".to_string())
+        );
+        assert_eq!(path(client_config_path(env(vec![]))), None);
+        assert_eq!(
+            path(client_config_path(env(vec![("OPENCODE_CONFIG_DIR", "/cfg"), ("HOME", "/home/u")]))),
+            Some("/cfg/cli.json".to_string()),
+            "the most specific one wins"
+        );
+    }
+
+    #[test]
+    fn the_plugin_list_keeps_the_files_own_entries_and_gains_the_disables() {
+        // An array is replaced, not merged, so the file's plugin has to be
+        // carried through by hand or the injection would be what breaks it.
+        let kept = client_config_override(Some(r#"{"plugins":["./herdr-opencode"]}"#), false)
+            .expect("the disables are missing");
+        let value: Value = serde_json::from_str(&kept).expect("valid JSON");
+        let plugins: Vec<&str> = value["plugins"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .map(|entry| entry.as_str().expect("a string"))
+            .collect();
+        assert_eq!(plugins[0], "./herdr-opencode");
+        for entry in ["-opencode.diffs", "-opencode.sidebar.mcp", "-opencode.btw"] {
+            assert!(plugins.contains(&entry), "{entry} is pinned");
+        }
+
+        // A file that already says them is left alone: no duplicates, no key.
+        let mine = r#"{"plugins":["-opencode.diffs","-opencode.stats","-opencode.plugins","-opencode.btw","-opencode.sidebar.mcp"]}"#;
+        let filled = client_config_override(Some(mine), false).expect("the keybinds are still unsaid");
+        let value: Value = serde_json::from_str(&filled).expect("valid JSON");
+        assert!(value.get("plugins").is_none(), "nothing to add means nothing to inject");
+    }
+
+    #[test]
+    fn the_dead_keybinds_are_switched_off_unless_the_file_binds_them() {
+        let filled = client_config_override(Some("{}"), false).expect("both layers");
+        let value: Value = serde_json::from_str(&filled).expect("valid JSON");
+        assert_eq!(value["keybinds"]["terminal.toggle"], json!("none"));
+        assert_eq!(value["keybinds"]["session.background"], json!("none"));
+
+        // A deliberate bind in the file wins, and the rest are still filled in.
+        let filled = client_config_override(Some(r#"{"keybinds":{"terminal.toggle":"<leader>t"}}"#), false)
+            .expect("the other keys are unsaid");
+        let value: Value = serde_json::from_str(&filled).expect("valid JSON");
+        assert!(value["keybinds"].get("terminal.toggle").is_none());
+        assert_eq!(value["keybinds"]["terminal.select"], json!("none"));
     }
 }

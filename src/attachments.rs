@@ -41,12 +41,20 @@ const MAX_EDGE: u32 = 1568;
 const STAGE_PREFIX: &str = "antex-";
 
 /// Stage a prompt's attachments. Answers the text to hand Ante — the user's own,
-/// plus one `@path` mention per staged file — and the attachment list to echo
-/// back, which is what the client renders (its optimistic copy carries no file
-/// bodies: those are server-loaded in opencode).
-pub fn stage(text: &str, files: &[Value]) -> (String, Vec<Value>) {
+/// plus one `@path` mention per staged file — the attachment list to echo back,
+/// which is what the client renders (its optimistic copy carries no file bodies:
+/// those are server-loaded in opencode), and a notice naming every attachment
+/// the reason each attachment that had to be dropped was dropped for.
+///
+/// The reasons are handed back rather than folded in here because they have two
+/// audiences: the model, which should not answer as if it had seen the image it
+/// is told about, and the user, who gets a shell card (`crate::osd_notice`) —
+/// a failed response reaches the client as a bare status code
+/// (`client/src/promise/generated/client.ts`), so it cannot carry a sentence.
+pub fn stage(text: &str, files: &[Value]) -> (String, Vec<Value>, Vec<String>) {
     let mut sent = text.to_string();
     let mut echo = Vec::new();
+    let mut dropped = Vec::new();
     for file in files {
         match stage_one(file) {
             Ok(Some((entry, mention))) => {
@@ -57,10 +65,13 @@ pub fn stage(text: &str, files: &[Value]) -> (String, Vec<Value>) {
                 echo.push(entry);
             }
             Ok(None) => {}
-            Err(err) => crate::log_line(&format!("attachments: 附件被丢弃：{err}")),
+            Err(err) => {
+                crate::log_line(&format!("attachments: 附件被丢弃：{err}"));
+                dropped.push(err);
+            }
         }
     }
-    (sent, echo)
+    (sent, echo, dropped)
 }
 
 /// `Ok(None)` is "nothing to do with this one" — a URI we are not meant to
@@ -541,7 +552,8 @@ mod tests {
 
     #[test]
     fn an_image_becomes_a_mention_and_an_entry() {
-        let (sent, echo) = stage("看这张图", &[data_url("image/png", &png(64, 48))]);
+        let (sent, echo, dropped) = stage("看这张图", &[data_url("image/png", &png(64, 48))]);
+        assert!(dropped.is_empty(), "nothing was dropped");
         let token = sent.split_whitespace().last().expect("mention");
         assert!(token.starts_with("@/"), "{token}");
         let path = PathBuf::from(token.trim_start_matches('@'));
@@ -587,7 +599,7 @@ mod tests {
         std::fs::create_dir_all(paste_cache()).expect("cache dir");
         std::fs::write(&path, png(32, 32)).expect("write");
         let file = json!({ "uri": uri_of(&path) });
-        let (sent, echo) = stage("看图", std::slice::from_ref(&file));
+        let (sent, echo, _) = stage("看图", std::slice::from_ref(&file));
         assert_eq!(sent, "看图");
         assert_eq!(echo.len(), 1);
         assert_eq!(echo[0]["source"]["type"], "uri");
@@ -595,10 +607,16 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_type_is_dropped() {
-        let file = json!({ "uri": "data:application/zip;base64,AAAA" });
-        let (sent, echo) = stage("附件", std::slice::from_ref(&file));
-        assert_eq!(sent, "附件");
+    fn a_dropped_attachment_says_so_in_the_message() {
+        // Nothing else carries the reason: the client keeps only the status code
+        // of a failed response, so the sentence has to travel in the text.
+        let file = json!({ "uri": "data:application/zip;base64,AAAA", "name": "a.zip" });
+        let (sent, echo, dropped) = stage("附件", std::slice::from_ref(&file));
+        assert_eq!(sent, "附件", "the caller adds the notice, not `stage`");
+        assert_eq!(dropped.len(), 1);
+        let reason = &dropped[0];
+        assert!(reason.contains("a.zip") && reason.contains("Ante 读不了"), "{reason}");
+        assert!(!sent.contains('@'), "no mention for something Ante cannot read");
         assert!(echo.is_empty());
     }
 
@@ -606,7 +624,7 @@ mod tests {
     fn a_logged_message_comes_back_as_text_plus_attachment() {
         let mut file = data_url("image/png", &png(64, 48));
         file["name"] = json!("ANTEX-42");
-        let (sent, _) = stage("看这张图", std::slice::from_ref(&file));
+        let (sent, _, _) = stage("看这张图", std::slice::from_ref(&file));
         let token = sent.split_whitespace().last().expect("mention").to_string();
         let recorded = format!("{sent}\n\n<folder-structure>\n- /tmp/\n  - x.png\n\n");
         let (shown, files) = from_log(&recorded);
