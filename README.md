@@ -9,7 +9,7 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 
 ![antex 首页](docs/home.png)
 
-首页（本仓库自编客户端的默认界面）：顶栏是 Ante 面具 + `ANTEX`，composer 下是权限模式与模型，右下角是 `ante <后端版本> · antex <构建日期>`。**这张图由 `script/shot-home.py` 生成**（PTY + pyte 抓屏 → Pango 渲染，可复现）。
+首页（本仓库自编客户端的默认界面）：顶栏是 Ante 面具 + `ANTEX`，composer 下是权限模式，右下角是 `ante <后端版本> · antex <构建日期>`。**这张图由 `script/shot-home.py` 生成**（PTY + pyte 抓屏 → Pango 渲染）：`ANTE_HOME=<空目录> ANTEX_MODEL= ANTEX_PROVIDER= uv run --with pyte script/shot-home.py --out docs/home.png`——截图里刻意只留 `Auto`，不带任何模型 / 供应商名（模型名是本机 catalog 的事，不该进仓库）。
 
 ## 状态：已实现 / 待定 / 遗弃
 
@@ -342,9 +342,9 @@ session.step.started → session.text.started → session.text.delta ×N → ses
 - **改完垫片必须重启进程**：`target/release/antex` 是产物，旧进程不会自更新——改动不上线，看着像「没修好」。
 - **别按端口杀 antex**：一体化模式端口被占会**自动顺延**，所以 `fuser -k <port>/tcp` 很可能杀掉的是**另一个正在用**的 antex（症状：`Connection lost · Reconnecting to the server automatically.` + 终端留一屏裸 SGR，看着像崩）。要停就按 PID、或先 `ss -ltnp | grep antex` 认清是谁。
 - **肉眼验收要加 `--print-logs --log-level debug`**——客户端抛异常只弹一个小 toast，正文里什么都不显示，「没反应」多半是它。
-- **TUI 自动化验收用 PTY + pyte 探针**：`script/tui_drive.py` 驱动客户端——`--send '18:文本\r'` 按**绝对秒数**发键（`\r` 提交、`\n` 换行、`\e` 转义），`--after` 是最后一次发键后再等多久，`--dump` 把最终屏文本写文件（不写就只打印；屏上空白行会被滤掉）。**本机没装 tmux，也没装 `uv`**（`shot-home.py` 那条 `uv run --with pyte` 在本机跑不了）：`python3 -m venv /tmp/tuivenv && /tmp/tuivenv/bin/pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pyte` 起一个一次性 venv，再用 `/tmp/tuivenv/bin/python script/tui_drive.py …`。表单渲染、`AskUser` 作答、首页版本号都是这么验的。
+- **TUI 自动化验收用 PTY + pyte 探针**：`script/tui_drive.py` 驱动客户端——`--send '18:文本\r'` 按**绝对秒数**发键（`\r` 提交、`\n` 换行、`\e` 转义），`--after` 是最后一次发键后再等多久，`--dump` 把最终屏文本写文件（不写就只打印；屏上空白行会被滤掉）。**本机没装 tmux**；`uv` 已装（本机那条 `shot-home.py` / `tui_drive.py` 直接 `uv run --with pyte …` 就能跑）——不想用 uv 时另起一次性 venv：`python3 -m venv /tmp/tuivenv && /tmp/tuivenv/bin/pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pyte`，再用 `/tmp/tuivenv/bin/python script/tui_drive.py …`。表单渲染、`AskUser` 作答、首页版本号都是这么验的。
 - **接口级验证不必进 TUI**：`antex serve PORT` 后直接 `curl`，逐条对着「实现清单」的验证法做。
-- **重新出首页截图**（README 顶部那张）：`uv run --with pyte script/shot-home.py --cmd "./target/release/antex 41994" --out docs/home.png`（本机没装 `uv`，改用上条的一次性 venv：`/tmp/tuivenv/bin/python`）。它跑 PTY、用 pyte 把屏幕（含 24 位色）还原出来，再交给 ImageMagick 的 Pango 渲染；字体取 ghostty 的 `GoogleSansCode Nerd Font Mono`，底色取 `ghostty +show-config`（TUI 把页面底色留给终端，硬编码就会跟真实观感对不上）。**方块字要贴死**：`-interline-spacing` 默认 `-4`（负值收掉行缝），否则 logo 会出现横纹。**另一个坑**：pyte 的 24 位色是**不带 `#` 的裸十六进制**（`ffffff`），当成颜色名解析会全部落空、整张图退化成单色——看着像「主题没生效」，其实是解析写错了。
+- **重新出首页截图**（README 顶部那张）：`uv run --with pyte script/shot-home.py --cmd "./target/release/antex 41994" --out docs/home.png`（`uv` 已装，直接跑；不用 uv 就走上条的一次性 venv：`/tmp/tuivenv/bin/python`）。它跑 PTY、用 pyte 把屏幕（含 24 位色）还原出来，再交给 ImageMagick 的 Pango 渲染；字体取 ghostty 的 `GoogleSansCode Nerd Font Mono`，底色取 `ghostty +show-config`（TUI 把页面底色留给终端，硬编码就会跟真实观感对不上）。**方块字要贴死**：`-interline-spacing` 默认 `-4`（负值收掉行缝），否则 logo 会出现横纹。**另一个坑**：pyte 的 24 位色是**不带 `#` 的裸十六进制**（`ffffff`），当成颜色名解析会全部落空、整张图退化成单色——看着像「主题没生效」，其实是解析写错了。
 - 垫片自己的开关：`ANTE_SHIM_TRACE=<文件>`（记 Ante 事件全文 + 垫片发布的事件）、`SHIM_PERMISSION_MODE=strict|auto|yolo`、`SHIM_SKIP_EVENTS=`、`SHIM_TOOL_EVENTS=`。
 
 ## 权威出处
