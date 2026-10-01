@@ -11,7 +11,7 @@
 # `opencode2` / `opencode`（src/main.rs 的 resolve client）。所以这里除了装 antex-tui，
 # 还放一个 opencode2 软链让它能从 PATH 找到。
 pkgname=antex
-pkgver=2026.10.01.4
+pkgver=2026.10.01.5
 pkgrel=1
 pkgdesc="Ante agent, driven by the opencode v2 TUI (antex)"
 arch=('x86_64')

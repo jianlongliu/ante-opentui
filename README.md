@@ -123,7 +123,8 @@ Ante（**你自己装的**：官方脚本装、`ante update` 升级）
   - **`Evt::UserInput` 的回显会变长**：Ante 会把提及展开（提到某目录时加一段 `<folder-structure>`），所以「消息送达没」的比对不能拿用户原文比——垫片另存「实际发给 Ante 的那份文本」（`Store::sent`，按 inbox id），比对时先剥掉展开段。
   - **`file://` 附件**（`@` 补全带上的文件）**不加提及**：客户端文本里本来就有 `@路径`，Ante 自己会读；只回显。
   - **历史回放**：Ante 日志里存的是带提及的文本，回放时把垫片自己暂存的提及（文件名前缀 `antex-`）反解回附件，并把提及与展开段从正文里去掉；缓存文件已被清掉就保留提及原文（对应 Ante 自己的「附件过期」语义）。名字里的时间戳在前（`antex-<纳秒>-<pid>-<原名>.<ext>`），所以原名的数字后缀不会被当成时间戳吃掉。
-  - **本机开关**：`~/.config/opencode/cli.json` 里 `session.image_preview`（转录区）与 `prompt.image_preview`（输入框上方）默认都是 off——已开；终端要支持 kitty 图形协议（本机 Ghostty 支持）。
+  - **本机开关**：`~/.config/opencode/cli.json` 里 `session.image_preview`（转录区）与 `prompt.image_preview`（输入框上方）默认都是 off——本机已开；终端要支持 kitty 图形协议（本机 Ghostty 支持）。⚠ **这份文件会被客户端整份重写**：在配置对话框里改任何一项，它按内存里的配置写回文件，`image_preview` 若不在内存里就**被抹掉**（2026-10-01 撞到：14:02 那次重写后两处预览同时消失，现象是转录区只剩一个 ` file <名字> ` 标签、输入框上方空着，而垫片的回显一直是对的——别去查垫片）。**读不到文件 = 空配置**，于是两个「我们不想要的默认」一起回来：预览 off、**`tabs.mode` 缺失 ⇒ `auto` ⇒ 标签栏开**（`tui/config/index.tsx` 的 `resolve`；A/B 实测：`off` 无标签栏、`on` 顶栏出现会话名 + `+`）。
+  - **垫片兜底**：一体化模式启动客户端时，读 `$OPENCODE_CONFIG_DIR/cli.json`（再退 `$XDG_CONFIG_HOME/opencode/`、`$HOME/.config/opencode/`），**只补文件没说的键**——`tabs.mode:"off"`、`session.image_preview:true`、`prompt.image_preview:true`——拼成一份 JSON 放进 `OPENCODE_CLI_CONFIG_CONTENT`（客户端把这份内容**深合并、覆盖在文件之上**，见 `cli/src/config/config.ts` 的 `merge(file, env)`），所以改写/丢失文件都翻不了盘；文件里**写了**某个键（哪怕 `false`/`"on"`）或用户自己设了这个变量，垫片对该键不插手。手动连的客户端收不到注入，`antex serve` 的提示里会把这条前缀原样打出来。
   - **验证法**：`cargo test`（8 项：压缩达标、提及转义、回显形状、日志反解、未知类型丢弃）；端到端 —— `antex serve PORT` → `POST /api/session` 建会话 → `POST …/prompt` 带上 `files:[{uri:"data:image/jpeg;base64,…", name:…}]` → `~/.ante/sessions/<新目录>/events.jsonl` 里 `UserInput` 应带 `@…/ante-paste-cache/antex-…`，`AgentMessage` 应能复述图里的字（实测 510KB 的图压到 152KB 后模型仍读出「SHRINK-7」）
 - [x] **事件流（SSE）** —— `{id, type, created, data}` 帧，首帧 `server.connected`
 - [x] **断线重连（Ante 掉了自己爬起来）** —— 原来 `spawn_ante` 里事件流一断只写一行日志：`ops` 留着旧句柄、`health` 照答 `healthy: true`、之后的每条 prompt 静默丢弃。现在拆成「连接 / 泵事件 / 重连循环」三块：
@@ -362,6 +363,12 @@ session.step.started → session.text.started → session.text.delta ×N → ses
 | 真 server 形状对照 | 起一个真 server 当 oracle：`opencode2 serve --hostname 127.0.0.1 --port 41998`（日志打印 `server password <PW>`；API 用 HTTP Basic，用户名 `opencode`），再订阅 `/api/event` 抓权威事件序列 |
 
 ## 下一步
+
+**v2026.10.01.5（2026-10-01 发）**——一处兜底：客户端的两个「不想要的默认」不再能自己回来。
+
+- **来龙去脉**：`cli.json` 会被客户端**整份重写**（配置对话框按内存里的配置写回），不在内存里的键就跟着没了；而**读不到文件＝空配置**，于是两个默认同时回来——预览 off、**`tabs.mode` 缺失 ⇒ `resolve()` 里判成 `auto` ⇒ 标签栏开**。2026-10-01 连撞两次：14:02 那次重写抹掉 `image_preview`（两处预览一起消失，转录区只剩 ` file <名字> ` 标签），19:38 文件短暂缺失时重启（标签栏冒出来 + 预览又没）。
+- **修法**：一体化模式启动客户端时，垫片读 `$OPENCODE_CONFIG_DIR/cli.json`（再退 `$XDG_CONFIG_HOME/opencode/`、`$HOME/.config/opencode/`），**只补文件没说的键**——`tabs.mode:"off"`、`session.image_preview:true`、`prompt.image_preview:true`——拼成 JSON 放进 `OPENCODE_CLI_CONFIG_CONTENT`（客户端 `cli/src/config/config.ts` 的 `load` 是 `merge(file, env)`：这份内容**深合并、覆盖在文件之上**），所以文件被改写/丢失都翻不了盘。文件里写了某个键（哪怕 `false`/`"on"`）或用户自己设了这个变量 ⇒ 垫片对该键不插手；手动 `opencode2 --server …` 连的那种收不到注入，`antex serve` 会把前缀原样打出来。
+- **验法**：（a）`cargo test` 的 `the_client_override_fills_in_only_what_the_file_leaves_unsaid`（空文件/JSONC/读不到 ⇒ 三键都补；写明了 ⇒ 一个都不补；只写一半 ⇒ 只补另一半）；（b）端到端——拿一份**删掉 `tabs` 与 `image_preview`** 的配置目录起 `OPENCODE_CONFIG_DIR=<dir> antex`，`tr '\0' '\n' < /proc/<client pid>/environ` 里应出现 `{"…","tabs":{"mode":"off"}}`，且 `script/tui_drive.py` 抓屏**顶栏没有**「会话名 + `+`」的标签栏（对照：`tabs.mode:"on"` 时会出现），预览两处照旧（本机已按此实测）。
 
 **v2026.10.01.4（2026-10-01 发）**——一处修复 + 一处补实：
 

@@ -1204,6 +1204,67 @@ async fn ante_version(bin: &std::path::Path) -> Option<String> {
     text.split_whitespace().last().map(str::to_string)
 }
 
+/// The client's own config has two answers we do not want as defaults: image
+/// previews off, and session tabs on (`tabs.mode` absent → `auto` → on). The
+/// client rewrites `cli.json` wholesale, so a key that is not in memory is gone
+/// with it, and an unreadable file counts as an empty one — either way the
+/// defaults come back (2026-10-01: previews vanished after a rewrite, tabs came
+/// back while the file was momentarily missing). The client reads
+/// `OPENCODE_CLI_CONFIG_CONTENT` and merges it **over** the file
+/// (`cli/config/config.ts`), so filling in just the keys the file leaves unsaid
+/// is the durable fix: nothing the file does can flip them again.
+fn client_config_override(file: Option<&str>, env_set: bool) -> Option<String> {
+    if env_set {
+        return None;
+    }
+    // Unreadable or hand-edited JSONC counts as no opinion — the injection is
+    // additive, so the worst case is the same two defaults we started from.
+    let config: Option<Value> = file.and_then(|text| serde_json::from_str(text).ok());
+    fn said<'a>(config: Option<&'a Value>, keys: &[&str]) -> bool {
+        let mut node = match config {
+            Some(node) => node,
+            None => return false,
+        };
+        for key in keys {
+            match node.get(key) {
+                Some(next) => node = next,
+                None => return false,
+            }
+        }
+        true
+    }
+    let mut fill = json!({});
+    if !said(config.as_ref(), &["tabs", "mode"]) {
+        fill["tabs"] = json!({ "mode": "off" });
+    }
+    for section in ["session", "prompt"] {
+        if !said(config.as_ref(), &[section, "image_preview"]) {
+            fill[section] = json!({ "image_preview": true });
+        }
+    }
+    if fill.as_object().is_some_and(serde_json::Map::is_empty) {
+        return None;
+    }
+    Some(fill.to_string())
+}
+
+/// `client_config_override` against the real filesystem: the client reads
+/// `$OPENCODE_CONFIG_DIR/cli.json`, else `$XDG_CONFIG_HOME/opencode/`, else
+/// `$HOME/.config/opencode/`; follow the same order so the two agree.
+fn client_config_from_disk() -> Option<String> {
+    if std::env::var_os("OPENCODE_CLI_CONFIG_CONTENT").is_some() {
+        return None;
+    }
+    let dir = std::env::var_os("OPENCODE_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from))
+        .or_else(|| std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config")));
+    let text = dir
+        .map(|dir| dir.join("opencode").join("cli.json"))
+        .and_then(|file| std::fs::read_to_string(file).ok());
+    client_config_override(text.as_deref(), false)
+}
+
 /// Which opencode client to hand the terminal to. `~/.local/bin/antex-tui` is
 /// **our** build (vendored source + the Ante logo) and wins when present; the
 /// stock binary is the fallback.
@@ -3811,6 +3872,11 @@ async fn main() {
     if args.serve_only {
         println!("antex 服务已起在 http://127.0.0.1:{port}");
         println!("客户端这样连：opencode2 --server http://127.0.0.1:{port}");
+        // A manual client misses the override the one-command mode adds, so hand
+        // it over as a paste-ready prefix when the user has no opinion of their own.
+        if let Some(config) = client_config_from_disk() {
+            println!("（让贴图能预览、标签栏关着：在前面加上 OPENCODE_CLI_CONFIG_CONTENT='{config}'）");
+        }
         axum::serve(listener, app).await.expect("serve");
         return;
     }
@@ -3828,12 +3894,15 @@ async fn main() {
     let directory =
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(default_directory()));
     let client = client_executable();
-    match std::process::Command::new(&client)
+    let mut command = std::process::Command::new(&client);
+    command
         .arg("--server")
         .arg(format!("http://127.0.0.1:{port}"))
-        .arg(&directory)
-        .status()
-    {
+        .arg(&directory);
+    if let Some(config) = client_config_from_disk() {
+        command.env("OPENCODE_CLI_CONFIG_CONTENT", config);
+    }
+    match command.status() {
         // The TUI owns the terminal; when it exits, so do we.
         Ok(status) => {
             // Hand the pane back before we go. Herdr would clear it anyway once
@@ -4007,5 +4076,33 @@ mod tests {
         // branch is behind that gate too, and it must not start firing.
         store.publish("message.updated", json!({ "sessionID": "ses_1" }));
         assert!(feed.try_recv().expect("the second frame").get("location").is_none());
+    }
+
+    #[test]
+    fn the_client_override_fills_in_only_what_the_file_leaves_unsaid() {
+        // Injected keys are merged *over* `cli.json`, so a deliberate choice in
+        // the file has to win — otherwise the fix would be as bad as the bug.
+        let filled = client_config_override(Some("{}"), false).expect("an empty file gets both");
+        let value: Value = serde_json::from_str(&filled).expect("valid JSON");
+        assert_eq!(value["tabs"]["mode"], json!("off"));
+        assert_eq!(value["session"]["image_preview"], json!(true));
+        assert_eq!(value["prompt"]["image_preview"], json!(true));
+
+        // An unreadable or JSONC file is no opinion at all: same two defaults.
+        assert!(client_config_override(None, false).is_some());
+        assert!(client_config_override(Some("{ // comment\n}"), false).is_some());
+
+        // Every key can be spoken for, and then there is nothing to inject.
+        let mine = r#"{"tabs":{"mode":"on"},"session":{"image_preview":false},"prompt":{"image_preview":false}}"#;
+        assert_eq!(client_config_override(Some(mine), false), None);
+
+        // …and one key being theirs does not silence the others.
+        let partial = client_config_override(Some(r#"{"tabs":{"mode":"on"}}"#), false)
+            .expect("the preview keys are still unsaid");
+        let value: Value = serde_json::from_str(&partial).expect("valid JSON");
+        assert!(value.get("tabs").is_none(), "an explicit mode is left alone");
+        assert_eq!(value["session"]["image_preview"], json!(true));
+
+        assert_eq!(client_config_override(Some("{}"), true), None, "the variable itself wins");
     }
 }
