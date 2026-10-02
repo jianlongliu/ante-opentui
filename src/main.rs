@@ -18,8 +18,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ante_sdk::{
     ConnectOptions, EventReceiver, OpSender, connect,
     protocol::{
-        Evt, Id, Op, PermissionMode, ReviewDecision, SessionRequest, SessionUpdate, ToolDecision,
-        ToolUse, TurnPauseReason,
+        Evt, Id, Op, PermissionMode, ReviewDecision, SessionRequest, SessionUpdate, SkillMetadata,
+        ToolDecision, ToolUse, TurnPauseReason,
     },
 };
 use axum::{
@@ -245,6 +245,12 @@ struct Ante {
     /// without it a delete aimed at a session the client just created names no
     /// directory at all.
     archives: Arc<Mutex<HashMap<String, String>>>,
+    /// The skills Ante announced for the session it is driving, in the client's
+    /// `Skill.Info` shape. `/skills` answers from here rather than off the disk:
+    /// the announced list is already the one Ante can actually invoke (`no_skills`,
+    /// project scope and all), so the dialog cannot offer a skill the session
+    /// does not have.
+    skills: Arc<Mutex<Vec<Value>>>,
     /// Where the connection to Ante stands. See [`Link`].
     link: Arc<Mutex<Link>>,
     /// When the last "backend is gone" row went into the transcript.
@@ -338,6 +344,7 @@ impl Ante {
             last_user: Arc::new(Mutex::new(String::new())),
             busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             archives: Arc::new(Mutex::new(HashMap::new())),
+            skills: Arc::new(Mutex::new(Vec::new())),
             link: Arc::new(Mutex::new(Link::Connecting)),
             notice_at: Arc::new(Mutex::new(None)),
         }
@@ -410,6 +417,18 @@ impl Ante {
         if let Ok(mut archives) = self.archives.lock() {
             archives.insert(client_id.to_string(), archive);
         }
+    }
+
+    /// Keep the skills the session announced. Ante repeats the whole list on
+    /// every announcement, so this replaces rather than merges.
+    fn remember_skills(&self, skills: &[SkillMetadata]) {
+        if let Ok(mut slot) = self.skills.lock() {
+            *slot = skills.iter().map(skill_info).collect();
+        }
+    }
+
+    fn announced_skills(&self) -> Vec<Value> {
+        self.skills.lock().map(|slot| slot.clone()).unwrap_or_default()
     }
 
     /// The archive [`attach_session`] may hand to `ResumeSession`: the one Ante
@@ -884,6 +903,123 @@ fn assistant_content(text: &str) -> Value {
     json!([{ "type": "text", "text": text }])
 }
 
+/// One announced skill in the client's `Skill.Info` shape.
+///
+/// `id` is Ante's own name for the skill, which is also what the client inserts
+/// as `@<id>` — Ante resolves that mention itself from the listing it already
+/// has in context. The dialog draws `name` and `description`; `path`/`content`
+/// are carried for the type's sake, filled from the skill's own file when the
+/// disk still has it.
+fn skill_info(skill: &SkillMetadata) -> Value {
+    let (path, content) = skill_file(&skill.name).unwrap_or_default();
+    let mut info = json!({
+        "id": skill.name,
+        "name": skill.name,
+        "path": path,
+        "content": content,
+        // Ante's listing is the model's menu as much as the user's, so a skill
+        // is invocable both ways; the client only ever reads name/id/description.
+        "autoinvoke": true,
+    });
+    if let Some(description) = skill.description.as_ref().filter(|text| !text.trim().is_empty()) {
+        info["description"] = json!(description);
+    }
+    info
+}
+
+/// The directories Ante discovers skills from: the user's own, its system scope,
+/// and the working directory's. `/skills` reads the same three when a session has
+/// not announced its list yet (nothing is announced until the first prompt).
+fn skill_roots() -> Vec<std::path::PathBuf> {
+    vec![
+        ante_home().join("skills"),
+        ante_home().join(".system").join("skills"),
+        std::path::Path::new(&default_directory()).join(".ante").join("skills"),
+    ]
+}
+
+/// A skill's file, as `(path, body)` with the frontmatter stripped: `<root>/<name>/SKILL.md`.
+fn skill_file(name: &str) -> Option<(String, String)> {
+    if name.is_empty() || name.contains('/') || name.contains("..") {
+        return None;
+    }
+    for root in skill_roots() {
+        let file = root.join(name).join("SKILL.md");
+        if let Ok(text) = std::fs::read_to_string(&file) {
+            return Some((file.to_string_lossy().into_owned(), skill_body(&text)));
+        }
+    }
+    None
+}
+
+/// `SKILL.md` opens with a `---` YAML block; the client wants the body, and the
+/// two fields here are the ones its dialog draws.
+fn skill_body(text: &str) -> String {
+    let (_, body) = split_frontmatter(text);
+    body
+}
+
+fn split_frontmatter(text: &str) -> (String, String) {
+    let rest = text.strip_prefix("---").unwrap_or("");
+    if rest.is_empty() {
+        return (String::new(), text.to_string());
+    }
+    match rest.split_once("\n---") {
+        Some((head, body)) => (head.to_string(), body.trim_start_matches(['\n', '\r']).to_string()),
+        None => (String::new(), text.to_string()),
+    }
+}
+
+/// One `key: value` field out of a frontmatter block, unquoted and unwrapped.
+fn frontmatter_field(head: &str, key: &str) -> Option<String> {
+    for line in head.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim() != key {
+            continue;
+        }
+        let value = value.trim().trim_matches(['"', '\'']).trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+/// Skills read off the disk, for the window before a session has announced any.
+fn disk_skills() -> Vec<Value> {
+    let mut found: Vec<Value> = Vec::new();
+    for root in skill_roots() {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Ok(text) = std::fs::read_to_string(entry.path().join("SKILL.md")) else {
+                continue;
+            };
+            if found.iter().any(|skill| skill["id"] == json!(name)) {
+                continue;
+            }
+            let (head, body) = split_frontmatter(&text);
+            let skill = SkillMetadata {
+                name: name.clone(),
+                description: frontmatter_field(&head, "description"),
+                scope: ante_sdk::protocol::Scope::User,
+                argument_hint: None,
+            };
+            let mut info = skill_info(&skill);
+            info["name"] = json!(frontmatter_field(&head, "name").unwrap_or(name));
+            info["path"] = json!(entry.path().join("SKILL.md").to_string_lossy());
+            info["content"] = json!(body);
+            found.push(info);
+        }
+    }
+    found.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    found
+}
+
 /// Every request, so the client's own behaviour is the specification.
 /// One-command mode hands the terminal to the TUI, so request logs must not go to
 /// stdout — they would scribble over the interface. `None` (serve mode) keeps
@@ -1216,20 +1352,22 @@ async fn ante_version(bin: &std::path::Path) -> Option<String> {
 /// builtin off (`tui/plugin/context.tsx`), matching by exact id or `<prefix>.*`.
 const DISABLED_PLUGINS: &[&str] = &[
     "-opencode.diffs",
-    "-opencode.stats",
     "-opencode.plugins",
     "-opencode.btw",
     "-opencode.sidebar.mcp",
 ];
+// `-opencode.stats` is gone from this list: `/stats` is served now, off Ante's own
+// session summaries (`/api/experimental/session/stats`).
 
 /// Binds that ship live for commands with nothing behind them
-/// (`tui/config/keybind.ts`: `<leader>t`, `<leader>x`, `ctrl+b`, `<leader>u`,
-/// `<leader>r`, `<leader>down/up`). The command blacklist in the keymap patch
-/// only keeps them out of the palette — the keys still fire without this.
+/// (`tui/config/keybind.ts`: `<leader>t`, `ctrl+b`, `<leader>u`, `<leader>r`,
+/// `<leader>down/up`). The command blacklist in the keymap patch only keeps them
+/// out of the palette — the keys still fire without this. `session.export` left
+/// this list: `/export` and `/copy` read the shim's own export endpoint, so
+/// `<leader>x` is a working key again.
 const DEAD_KEYBINDS: &[&str] = &[
     "session.undo",
     "session.redo",
-    "session.export",
     "session.background",
     "terminal.toggle",
     "terminal.select",
@@ -1893,12 +2031,47 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
             // This is the one event that carries Ante's id, so remember the pair
             // while the client's id is the active one.
             Evt::SessionStart(info) => {
+                store.ante.remember_skills(&info.skills);
                 if let Some(client) = store.ante.active.lock().ok().and_then(|slot| slot.clone()) {
                     let archive = info.session_id.to_string();
                     if archive != client {
                         log_line(&format!("ante: 会话 {client} 的存档是 {archive}"));
-                        store.ante.remember_archive(&client, archive);
+                        store.ante.remember_archive(&client, archive.clone());
                     }
+                    // A title Ante already has — one set from its own front end, or
+                    // by a rename this shim asked for — is what the picker should
+                    // read back, so keep the shim's copy in step with it.
+                    if let Some(title) = info.title.as_deref().map(str::trim).filter(|text| !text.is_empty()) {
+                        write_title(&archive, Some(title));
+                    }
+                }
+            }
+            // Ante echoing a settings change back; for this shim the one that
+            // matters is a title, since it is the only field the TUI can set here.
+            Evt::SessionUpdated(info) => {
+                store.ante.remember_skills(&info.skills);
+                let archive = info.session_id.to_string();
+                if let Some(title) = info.title.as_deref().map(str::trim).filter(|text| !text.is_empty()) {
+                    write_title(&archive, Some(title));
+                    let client = store
+                        .ante
+                        .active
+                        .lock()
+                        .ok()
+                        .and_then(|slot| slot.clone())
+                        .unwrap_or_else(|| archive.clone());
+                    if let Ok(mut sessions) = store.sessions.lock()
+                        && let Some(entry) = sessions
+                            .iter_mut()
+                            .find(|session| session["id"].as_str() == Some(client.as_str()))
+                    {
+                        entry["title"] = json!(title);
+                    }
+                    store.publish_durable(
+                        "session.renamed",
+                        json!({ "sessionID": client, "title": title }),
+                        &client,
+                    );
                 }
             }
             // Ante took an input. It is *not* delivered yet: `Op::UserInput` and
@@ -2823,6 +2996,61 @@ async fn active_session() -> Json<Value> {
     Json(json!({ "data": {} }))
 }
 
+/// The title a rename wrote, and the file it lives in.
+///
+/// Ante has titles of its own (`SessionUpdate.title`, echoed back in `SessionInfo`),
+/// but it only tells us about them while it is driving the session — the session
+/// *picker* is built off the directory, so a rename writes this file next to
+/// Ante's own. Ante neither reads nor rewrites it: it owns `meta.json`,
+/// `events.jsonl` and its snapshot, and this is not one of those.
+fn title_file(dir: &str) -> std::path::PathBuf {
+    ante_home().join("sessions").join(dir).join("title.txt")
+}
+
+fn title_override(dir: &str) -> Option<String> {
+    let text = std::fs::read_to_string(title_file(dir)).ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| short(&text.replace(['\n', '\r'], " "), 60))
+}
+
+/// Set the title, or (`None`) drop the override so the derived one shows again.
+///
+/// Nothing is written for a session Ante has not opened yet: a directory holding
+/// only `title.txt` would show up as an archive with nothing in it, while a rename
+/// before the first prompt has nothing to persist anyway (the name shows in the
+/// open session either way).
+fn write_title(dir: &str, title: Option<&str>) {
+    let dir = ante_home().join("sessions").join(dir);
+    if !dir.is_dir() {
+        log_line(&format!("rename: {} 还没有存档目录，标题只留在内存里", dir.display()));
+        return;
+    }
+    let path = dir.join("title.txt");
+    match title.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(title) => {
+            let _ = std::fs::write(&path, format!("{title}\n"));
+        }
+        None => {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// What the session is called with no rename to go on: Ante's own summary of the
+/// first thing asked, or the same fact read back off the log when the turn that
+/// would have written the summary never ended.
+fn derived_title(dir: &str) -> String {
+    if let Some(title) = title_override(dir) {
+        return title;
+    }
+    if let Some(title) = session_meta(dir)
+        .and_then(|meta| meta.get("first_user_message").and_then(|v| v.as_str()).map(str::to_string))
+    {
+        return short(&title.replace(['\n', '\r'], " "), 60);
+    }
+    log_title(dir).unwrap_or_else(|| "untitled".into())
+}
+
 /// When a session started and what was first asked, read off its event log.
 ///
 /// `meta.json` is Ante's own summary and Ante writes it when a turn *ends* — so a
@@ -2833,36 +3061,43 @@ async fn active_session() -> Json<Value> {
 fn events_head(id: &str) -> Option<(i64, String)> {
     let raw = std::fs::read_to_string(ante_home().join("sessions").join(id).join("events.jsonl")).ok()?;
     let mut created = None;
-    let mut title = None;
     for line in raw.lines() {
         let Ok(wrapper) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if created.is_none() {
-            created = wrapper
-                .get("timestamp")
-                .and_then(|v| v.as_str())
-                .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
-                .map(|when| when.timestamp_millis());
-        }
-        if title.is_none() {
-            title = wrapper
-                .get("event")
-                .and_then(|event| event.get("UserInput"))
-                .and_then(|v| v.as_str())
-                .map(|text| {
-                    // The log keeps the staged mentions and Ante's expansion of
-                    // them; a title is the message, not the paths.
-                    let (shown, _) = attachments::from_log(text);
-                    let shown = if shown.trim().is_empty() { text.to_string() } else { shown };
-                    short(&shown.replace(['\n', '\r'], " "), 60)
-                });
-        }
-        if created.is_some() && title.is_some() {
+        created = wrapper
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+            .map(|when| when.timestamp_millis());
+        if created.is_some() {
             break;
         }
     }
-    Some((created.unwrap_or_else(now_ms), title.unwrap_or_else(|| "untitled".into())))
+    Some((created.unwrap_or_else(now_ms), derived_title(id)))
+}
+
+/// The title the *log* implies: the first thing the user asked.
+fn log_title(id: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(ante_home().join("sessions").join(id).join("events.jsonl")).ok()?;
+    for line in raw.lines() {
+        let Ok(wrapper) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(text) = wrapper
+            .get("event")
+            .and_then(|event| event.get("UserInput"))
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        // The log keeps the staged mentions and Ante's expansion of them; a title
+        // is the message, not the paths.
+        let (shown, _) = attachments::from_log(text);
+        let shown = if shown.trim().is_empty() { text.to_string() } else { shown };
+        return Some(short(&shown.replace(['\n', '\r'], " "), 60));
+    }
+    None
 }
 
 /// Whether Ante has this session on disk. `meta.json` is the stricter test and
@@ -2902,11 +3137,7 @@ fn ante_sessions() -> Vec<Value> {
                         .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
                         .map(|when| when.timestamp_millis())
                         .unwrap_or_else(now_ms);
-                    let title = meta
-                        .get("first_user_message")
-                        .and_then(|v| v.as_str())
-                        .map(|text| short(&text.replace(['\n', '\r'], " "), 60))
-                        .unwrap_or_else(|| "untitled".into());
+                    let title = derived_title(&dir);
                     let usage = meta.get("usage").cloned().unwrap_or_else(|| json!({}));
                     let tokens = tokens_json(
                         usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
@@ -3097,11 +3328,10 @@ fn ante_session_info(id: &str) -> Option<Value> {
         .map(|when| when.timestamp_millis())
         .unwrap_or_else(now_ms);
     let usage = meta.get("usage").cloned().unwrap_or_else(|| json!({}));
-    let title = meta
-        .get("first_user_message")
-        .and_then(|v| v.as_str())
-        .map(|text| short(&text.replace(['\n', '\r'], " "), 60))
-        .unwrap_or_else(|| "Ante session".into());
+    let title = {
+        let derived = derived_title(id);
+        if derived == "untitled" { "Ante session".to_string() } else { derived }
+    };
     Some(json!({
         "id": id,
         "projectID": "prj_shim",
@@ -3452,6 +3682,263 @@ async fn session_messages(
         data.truncate(limit);
     }
     Json(json!({ "data": data, "cursor": {} }))
+}
+
+/// A refusal the client shows verbatim: `message` is what it puts in the toast.
+fn bad_request(message: String) -> Response {
+    (axum::http::StatusCode::BAD_REQUEST, Json(json!({ "message": message }))).into_response()
+}
+
+/// `PATCH /api/session/{id}` — the client's `/rename`, and the only one of the
+/// route's three body keys Ante has a field for.
+///
+/// The title is Ante's own (`SessionUpdate.title`): it travels with the session,
+/// so a resume brings it back and Ante's other front ends show it too. Only the
+/// session Ante is *driving* can be renamed through it — there is no "rename that
+/// one over there" op, and resuming a session merely to rename it would hijack the
+/// connection the TUI is watching, replay and all. So a rename aimed elsewhere
+/// lands in the shim's own `title.txt` and is honoured by the picker, which is
+/// where the client reads titles from anyway.
+async fn session_update(
+    State(store): State<Store>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    if !safe_id(&id) {
+        return bad_request(format!("不认识的会话 id：{id}"));
+    }
+    // `metadata` and `permissions` are the route's other two keys: neither is
+    // something Ante has, and the client only ever sends them beside a title.
+    let Some(title) = body.get("title").and_then(Value::as_str) else {
+        return axum::http::StatusCode::NO_CONTENT.into_response();
+    };
+    let title = title.trim().to_string();
+    let archive = store.ante.archive_of(&id).unwrap_or_else(|| id.clone());
+    let shown = if title.is_empty() {
+        // Empty clears it, as Ante's own contract says; the derived title is what
+        // both sides fall back to.
+        write_title(&archive, None);
+        derived_title(&archive)
+    } else {
+        write_title(&archive, Some(&title));
+        title
+    };
+    if let Ok(mut sessions) = store.sessions.lock()
+        && let Some(info) = sessions.iter_mut().find(|session| session["id"].as_str() == Some(id.as_str()))
+    {
+        info["title"] = json!(shown);
+    }
+    if store.ante.live_id().as_deref() == Some(id.as_str())
+        && let Some(ops) = store.ante.ops.lock().await.clone()
+    {
+        let update = SessionUpdate { title: Some(shown.clone()), ..Default::default() };
+        if let Err(err) = ops.send(ante_sdk::protocol::op_msg(Op::UpdateSession(update))).await {
+            log_line(&format!("rename: 发送失败：{err}"));
+        }
+    } else {
+        log_line(&format!("rename: {id} 不是当前会话，标题只落在 title.txt"));
+    }
+    store.publish_durable("session.renamed", json!({ "sessionID": id, "title": shown }), &id);
+    axum::http::StatusCode::NO_CONTENT.into_response()
+}
+
+/// `POST /api/session/{id}/move` — the client's in-session `/cd`.
+///
+/// Ante fixes a session's directory at `StartSession` (`SessionRequest.cwd`) and
+/// `SessionUpdate` carries none, so there is nothing to move *to*: the honest
+/// answer is a refusal that says so. The generic fallback used to answer 200 here,
+/// which the client reports as `UnexpectedStatus: 200` — true, but unreadable.
+async fn session_move(Path(_id): Path<String>, Json(_body): Json<Value>) -> Response {
+    bad_request(
+        "Ante 的会话目录在建会话时就定死了，没有换目录的接口。要换目录请开一条新会话（/new）"
+            .to_string(),
+    )
+}
+
+/// `GET /api/experimental/session/{id}/export` — what `/copy` and `/export` read.
+///
+/// The same transcript the message route serves, wrapped with the session it
+/// belongs to. Upstream's `sanitize` flag strips absolute paths; this payload is
+/// Ante's own log and is not rewritten, so both spellings answer alike.
+async fn session_export(State(store): State<Store>, Path(id): Path<String>) -> Json<Value> {
+    let archive = store.ante.archive_of(&id).unwrap_or_else(|| id.clone());
+    let info = store
+        .session(&id)
+        .or_else(|| ante_session_info(&id))
+        .unwrap_or_else(|| session_info(&id, &derived_title(&archive), store.current_model()));
+    let messages = replay_session(&archive, &store.handed());
+    Json(json!({ "data": { "info": info, "messages": messages } }))
+}
+
+/// One session as the stats fold wants it: when it started, Ante's own summary of
+/// it, and how many prompts its log recorded.
+struct SessionRow {
+    created: i64,
+    meta: Value,
+    prompts: u64,
+}
+
+/// How many prompts Ante's log recorded (`Evt::UserInput` is written per input).
+fn count_prompts(dir: &str) -> u64 {
+    let Ok(raw) = std::fs::read_to_string(ante_home().join("sessions").join(dir).join("events.jsonl"))
+    else {
+        return 0;
+    };
+    raw.lines().filter(|line| line.contains("\"UserInput\"")).count() as u64
+}
+
+/// The local calendar day of a millisecond timestamp, which is what the client's
+/// activity calendar buckets by.
+fn day_of(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|when| when.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
+
+/// Fold Ante's session summaries into the client's `SessionStatsInfo`.
+///
+/// Every number is Ante's own: sessions and tokens out of `usage`, activity by the
+/// day each session started, prompts by counting the inputs its log recorded.
+/// Anything Ante does not write down is reported as zero rather than guessed —
+/// there is no cost accounting (the protocol carries no prices) and no subagent
+/// tally (a subagent is a tool call inside its parent's turn).
+fn stats_from_rows(rows: &[SessionRow], from: Option<i64>, to: i64) -> Value {
+    let mut sessions = 0u64;
+    let mut prompts = 0u64;
+    let mut steps = 0u64;
+    let mut input = 0u64;
+    let mut output = 0u64;
+    let mut cache_read = 0u64;
+    let mut cache_write = 0u64;
+    let mut earliest = None;
+    let mut days: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut models: Vec<(String, String, u64, u64, u64, u64, u64)> = Vec::new();
+
+    for row in rows {
+        if from.is_some_and(|from| row.created < from) || row.created > to {
+            continue;
+        }
+        sessions += 1;
+        prompts += row.prompts;
+        earliest = Some(earliest.map_or(row.created, |first: i64| first.min(row.created)));
+        let count = row.meta.get("message_count").and_then(Value::as_u64).unwrap_or(0);
+        steps += count;
+        *days.entry(day_of(row.created)).or_default() += count;
+        let usage = row.meta.get("usage").cloned().unwrap_or_else(|| json!({}));
+        let field = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+        let (cue, coutput, cread, cwrite) = (
+            field("input_tokens"),
+            field("output_tokens"),
+            field("cache_read_tokens"),
+            field("cache_creation_tokens"),
+        );
+        input += cue;
+        output += coutput;
+        cache_read += cread;
+        cache_write += cwrite;
+        let (provider, model) = meta_model(&row.meta);
+        match models
+            .iter_mut()
+            .find(|entry| entry.0 == provider && entry.1 == model)
+        {
+            Some(entry) => {
+                entry.2 += count;
+                entry.3 += cue;
+                entry.4 += coutput;
+                entry.5 += cread;
+                entry.6 += cwrite;
+            }
+            None => models.push((provider, model, count, cue, coutput, cread, cwrite)),
+        }
+    }
+
+    // Best streak: the longest run of consecutive days that saw a session.
+    let mut streak = 0u64;
+    let mut run = 0u64;
+    let mut previous: Option<chrono::NaiveDate> = None;
+    for date in days.keys().filter_map(|date| chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()) {
+        run = match previous {
+            Some(last) if last.succ_opt() == Some(date) => run + 1,
+            _ => 1,
+        };
+        streak = streak.max(run);
+        previous = Some(date);
+    }
+
+    models.sort_by(|a, b| b.2.cmp(&a.2));
+    let activity: Vec<Value> =
+        days.iter().map(|(date, steps)| json!({ "date": date, "steps": steps })).collect();
+    let models: Vec<Value> = models
+        .into_iter()
+        .map(|(provider, model, steps, input, output, cache_read, cache_write)| {
+            json!({
+                "model": { "id": model, "providerID": provider, "variant": "default" },
+                "steps": steps,
+                "tokens": { "input": input, "output": output, "reasoning": 0,
+                            "cache": { "read": cache_read, "write": cache_write } },
+                "cost": 0,
+            })
+        })
+        .collect();
+
+    json!({
+        "range": { "from": from.or(earliest).unwrap_or(to), "to": to },
+        "sessions": sessions,
+        "subagents": 0,
+        "prompts": prompts,
+        "steps": steps,
+        "tokens": { "input": input, "output": output, "reasoning": 0,
+                    "cache": { "read": cache_read, "write": cache_write } },
+        "cost": 0,
+        "tools": { "mode": "none" },
+        "activeDays": days.len(),
+        "streak": streak,
+        "activity": activity,
+        "models": models,
+    })
+}
+
+/// `GET /api/experimental/session/stats` — `/stats`.
+async fn session_stats(
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Json<Value> {
+    let from = params.get("from").and_then(|value| value.parse::<i64>().ok());
+    let to = now_ms();
+    let mut rows = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(ante_home().join("sessions")) {
+        for entry in entries.flatten() {
+            let dir = entry.file_name().to_string_lossy().into_owned();
+            // Only sessions Ante wrote a summary for carry numbers at all.
+            let Some(meta) = session_meta(&dir) else {
+                continue;
+            };
+            let created = meta
+                .get("started_time")
+                .and_then(Value::as_str)
+                .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+                .map(|when| when.timestamp_millis())
+                .unwrap_or_else(now_ms);
+            // Out of range sessions are skipped before their log is read: this is
+            // one file per session, and the client asks for a year at a time.
+            if from.is_some_and(|from| created < from) {
+                continue;
+            }
+            rows.push(SessionRow { created, prompts: count_prompts(&dir), meta });
+        }
+    }
+    Json(json!({ "data": stats_from_rows(&rows, from, to) }))
+}
+
+/// `GET /api/skill` — `/skills`.
+///
+/// Ante announces the skills a session has, so that list is the answer: it is
+/// already the set that can actually be invoked (`no_skills`, project scope and
+/// all). The disk is read only before a session has announced anything, which is
+/// the window between opening the TUI and sending the first prompt.
+async fn skills(State(store): State<Store>) -> Json<Value> {
+    let announced = store.ante.announced_skills();
+    let list = if announced.is_empty() { disk_skills() } else { announced };
+    envelope(json!(list))
 }
 
 /// Hand the oldest queued prompt to Ante. A queued prompt belongs at the turn
@@ -3940,14 +4427,17 @@ async fn main() {
         .route("/api/model", get(models))
         .route("/api/vcs", get(vcs))
         .route("/api/plugin", get(plugins))
-        .route("/api/skill", get(empty_reads))
+        .route("/api/skill", get(skills))
         .route("/api/command", get(empty_reads))
         .route("/api/mcp", get(empty_reads))
         .route("/api/experimental/migration/v1", get(migration))
         .route("/api/experimental/capabilities", get(empty_reads))
+        .route("/api/experimental/session/stats", get(session_stats))
+        .route("/api/experimental/session/{id}/export", get(session_export))
         .route("/api/session", get(sessions_list).post(session_create))
         .route("/api/session/active", get(active_session))
-        .route("/api/session/{id}", get(session_get).delete(session_delete))
+        .route("/api/session/{id}", get(session_get).delete(session_delete).patch(session_update))
+        .route("/api/session/{id}/move", post(session_move))
         .route("/api/session/{id}/message", get(session_messages))
         .route("/api/session/{id}/prompt", post(session_prompt))
         .route("/api/session/{id}/interrupt", post(session_interrupt))
@@ -4229,8 +4719,8 @@ mod tests {
 
         // Every key can be spoken for, and then there is nothing to inject.
         let mine = r#"{"tabs":{"mode":"on"},"session":{"image_preview":false},"prompt":{"image_preview":false},
-            "plugins":["-opencode.diffs","-opencode.stats","-opencode.plugins","-opencode.btw","-opencode.sidebar.mcp"],
-            "keybinds":{"session.undo":"none","session.redo":"none","session.export":"none","session.background":"none",
+            "plugins":["-opencode.diffs","-opencode.plugins","-opencode.btw","-opencode.sidebar.mcp"],
+            "keybinds":{"session.undo":"none","session.redo":"none","session.background":"none",
                         "terminal.toggle":"none","terminal.select":"none","terminal.close":"none"}}"#;
         assert_eq!(client_config_override(Some(mine), false), None);
 
@@ -4296,7 +4786,7 @@ mod tests {
         }
 
         // A file that already says them is left alone: no duplicates, no key.
-        let mine = r#"{"plugins":["-opencode.diffs","-opencode.stats","-opencode.plugins","-opencode.btw","-opencode.sidebar.mcp"]}"#;
+        let mine = r#"{"plugins":["-opencode.diffs","-opencode.plugins","-opencode.btw","-opencode.sidebar.mcp"]}"#;
         let filled = client_config_override(Some(mine), false).expect("the keybinds are still unsaid");
         let value: Value = serde_json::from_str(&filled).expect("valid JSON");
         assert!(value.get("plugins").is_none(), "nothing to add means nothing to inject");
@@ -4315,5 +4805,96 @@ mod tests {
         let value: Value = serde_json::from_str(&filled).expect("valid JSON");
         assert!(value["keybinds"].get("terminal.toggle").is_none());
         assert_eq!(value["keybinds"]["terminal.select"], json!("none"));
+    }
+
+    #[test]
+    fn the_commands_that_got_an_endpoint_are_no_longer_hidden() {
+        // `/stats` was dark only because its plugin was switched off, `/export`
+        // because its key was; `/rename` while `session.update` answered 200 with
+        // nothing. All three are served now, so the layers that hid them must not
+        // come back — this is the regression that would silently undo the work.
+        assert!(!DISABLED_PLUGINS.contains(&"-opencode.stats"));
+        assert!(!DEAD_KEYBINDS.contains(&"session.export"));
+        assert!(!DEAD_KEYBINDS.contains(&"session.rename"));
+    }
+
+    #[test]
+    fn the_stats_fold_counts_only_what_ante_wrote_down() {
+        let row = |created: i64, prompts: u64, messages: u64| SessionRow {
+            created,
+            prompts,
+            meta: json!({
+                "provider": "example",
+                "model": "example-model",
+                "message_count": messages,
+                "usage": { "input_tokens": 10, "output_tokens": 4,
+                           "cache_read_tokens": 2, "cache_creation_tokens": 1 },
+            }),
+        };
+        let day = 86_400_000i64;
+        let rows = vec![row(day * 10, 2, 3), row(day * 11, 1, 5), row(day * 20, 9, 9)];
+        let stats = stats_from_rows(&rows, Some(day * 10), day * 12);
+        assert_eq!(stats["sessions"], json!(2), "the third row is out of range");
+        assert_eq!(stats["prompts"], json!(3));
+        assert_eq!(stats["steps"], json!(8));
+        assert_eq!(stats["tokens"]["input"], json!(20));
+        assert_eq!(stats["tokens"]["cache"]["write"], json!(2));
+        assert_eq!(stats["activeDays"], json!(2));
+        assert_eq!(stats["streak"], json!(2), "two days in a row");
+        assert_eq!(stats["range"]["from"], json!(day * 10));
+        assert_eq!(stats["models"][0]["model"]["id"], json!("example-model"));
+        assert_eq!(stats["models"][0]["steps"], json!(8));
+        // Ante has no prices and no subagent tally, so those read as zero.
+        assert_eq!(stats["cost"], json!(0));
+        assert_eq!(stats["subagents"], json!(0));
+        assert_eq!(stats["tools"], json!({ "mode": "none" }));
+
+        // An empty range still answers the shape the client validates.
+        let empty = stats_from_rows(&[], None, day);
+        assert_eq!(empty["sessions"], json!(0));
+        assert_eq!(empty["range"]["from"], json!(day), "no sessions, so now");
+        assert_eq!(empty["activity"], json!([]));
+    }
+
+    #[test]
+    fn an_announced_skill_becomes_the_shape_the_client_reads() {
+        let skill = SkillMetadata {
+            name: "no-such-skill-on-disk".into(),
+            description: Some("一句话说明".into()),
+            scope: ante_sdk::protocol::Scope::User,
+            argument_hint: None,
+        };
+        let info = skill_info(&skill);
+        assert_eq!(info["id"], json!("no-such-skill-on-disk"));
+        assert_eq!(info["name"], json!("no-such-skill-on-disk"));
+        assert_eq!(info["description"], json!("一句话说明"));
+        assert_eq!(info["autoinvoke"], json!(true));
+        assert_eq!(info["path"], json!(""), "no file on disk, so nothing to point at");
+
+        // A skill with no description leaves the key out rather than sending null.
+        let bare = SkillMetadata { description: None, ..skill };
+        assert!(skill_info(&bare).get("description").is_none());
+    }
+
+    #[test]
+    fn skill_frontmatter_is_split_from_the_body() {
+        let text = "---\nname: writing-docs\ndescription: \"记下来\"\n---\n\n# 正文\n";
+        let (head, body) = split_frontmatter(text);
+        assert_eq!(frontmatter_field(&head, "name").as_deref(), Some("writing-docs"));
+        assert_eq!(frontmatter_field(&head, "description").as_deref(), Some("记下来"));
+        assert!(body.starts_with("# 正文"));
+
+        // No frontmatter at all: the whole file is the body.
+        let (head, body) = split_frontmatter("# 没有 frontmatter\n");
+        assert!(head.is_empty());
+        assert!(body.starts_with("# 没有"));
+    }
+
+    #[test]
+    fn a_session_with_no_name_at_all_still_has_one() {
+        // The title chain ends here: a rename that clears the title falls back to
+        // the derived one, and a session with nothing to derive from gets this.
+        assert_eq!(derived_title("no-such-session-dir"), "untitled");
+        assert_eq!(title_override("no-such-session-dir"), None);
     }
 }

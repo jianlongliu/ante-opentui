@@ -1,6 +1,6 @@
 # antex（项目 ante-opentui）
 
-> 最后核对：2026-10-01 · 目标客户端 opencode 2.0.18 · Rust 1.98.1
+> 最后核对：2026-10-02 · 目标客户端 opencode 2.0.18 · Rust 1.98.1
 
 把 **opencode v2 自带的 TUI** 接到 **Ante** 后端上运行。
 
@@ -21,6 +21,10 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 - [x] 会话：列表、恢复、恢复后继续、删除（`Ctrl+D` 两下）—— 删的是 Ante 自己那条存档目录；**打开一条会话即从它的 `events.jsonl` 重建整份记录**（每一步的思考、回答、工具都在，见 [docs/implementation.md](docs/implementation.md) 的「记录回读」）
 - [x] 插嘴与排队（`Ctrl+S`）+ 斜体 `Pending...` 标记 —— 送到时机按 Ante 的真实边界判：**收下不算，下一个 step 开始才算模型读到**
 - [x] `/compact`、模型选择、`shift+tab` 权限模式、`@` 文件补全、贴图、herdr 上报、boot 接口全套
+- [x] `/rename` —— 走 Ante 自己的 `SessionUpdate.title`（真标题：别的前端也看得到）；只有**当前这条**会话能这样改，别的会话改名落垫片自己的 `title.txt`，会话列表读的就是它
+- [x] `/copy`、`/export` —— `GET …/experimental/session/{id}/export` 直接回垫片手上那份转录（回读自 `events.jsonl`）；`sanitize` 忽略——载荷本来就是 Ante 的日志，不重写路径
+- [x] `/stats` —— 数字全部来自 Ante 自己的 `meta.json`：会话数、token、活动日历、按 provider/model 分组；Ante 没写的报 0（协议里没有报价，也没有子代理计数）
+- [x] `/skills` —— 优先用 Ante 播报的技能清单（那是真能调用的集合，含项目域与 `no_skills`），首轮提示词之前才退到磁盘扫描
 - [x] 多标签**临时**关掉（`tabs.mode = "off"`，只是个配置项，不是能力）—— 它要服务端同时驱动多条会话，垫片只有一条连接；真做多标签见「待定」那条
 - [x] 做不了的入口从界面摘掉 —— 插件 / 键位 / 命令黑名单 / 侧栏卡片四层，见 [docs/client-patches.md](docs/client-patches.md) 的「屏蔽做不了的入口」
 - [x] 断线重连，且掉线期间排队的消息不丢 —— 退避重连 + `health` 说真话 + 转录里一行说明；**回合没跑完就被杀掉的会话（盘上只有 `events.jsonl`）Ante 打不开**，这种会话会新开一条继续，见 [docs/implementation.md](docs/implementation.md) 那条
@@ -31,7 +35,11 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 - [ ] `/copy`、`/export` —— 隐藏中；补法：垫片用 `GET …/message` 拼一份导出载荷
 - [ ] `/stats` —— 隐藏中；补法：Ante 的 `meta.json` 里有 usage，够算 token / 成本
 - [ ] `/skills` —— 隐藏中；补法：列出 Ante 自己的技能目录（`~/.agents/skills`、`~/.ante/.system/skills`）
-- [ ] 会话内 `/cd` —— 家目录下能用，会话里是空操作；退一步可「按新目录重开会话」
+- [ ] 会话内 `/cd` —— **Ante 没有换目录的接口**：目录在建会话时由 `SessionRequest.cwd` 定死，`SessionUpdate` 里没有这个字段，所以现在会明确报错（400 + 原因）而不是静默；退一步是「按新目录重开会话」（丢历史、会话列表多一行）
+- [ ] `/rename` —— 隐藏中；补法：写 Ante 那条会话的 `meta.json` 标题
+- [ ] `/copy`、`/export` —— 隐藏中；补法：垫片用 `GET …/message` 拼一份导出载荷
+- [ ] `/stats` —— 隐藏中；补法：Ante 的 `meta.json` 里有 usage，够算 token / 成本
+- [ ] `/skills` —— 隐藏中；补法：列出 Ante 自己的技能目录（`~/.agents/skills`、`~/.ante/.system/skills`）
 - [ ] 真多标签（session tabs）—— **待定**：先验证 Ante 侧能否并发驱动多条会话，再谈垫片改造（现在只是把入口临时关掉）
 - [ ] 断线时的终端还原 —— TUI 只弹 `Connection lost · Reconnecting to the server automatically.`，终端留一屏裸 SGR；抓原始字节：用 PTY 跑一次（`script/tui_drive.py` 就是这条路子），把读到的 chunk **先原样落盘再喂 `pyte`**——SGR 序列只在原始字节里看得见
 

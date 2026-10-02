@@ -20,7 +20,7 @@
 - [x] **多轮消息落位** —— 三条连发实测：用户与回复正确交错（前两条因排队相邻属正常）
 - [x] **中断收尾** —— Esc 两下（第一下上膛、第二下中断）后 Ante 正常收尾：工具单元格变 `✗`、转轮停止
 - [x] **失败可见** —— Ante 那轮失败时补发 `session.step.failed` + `session.execution.failed`（两者都必带 `error`），TUI 显示 `Error: …` 而不是空转
-- [x] **会话列表 / `/sessions`** —— `GET /api/session` 列 `~/.ante/sessions/*/`（实测 209 条 = `ls ~/.ante/sessions | wc -l`、时间倒序、标题=首条用户消息）。**优先读 `meta.json`；缺失时从 `events.jsonl` 兜底**——Ante 只在 `TurnEnd` 写 `meta.json`，回合没跑完的会话只有日志（见下条）。**选择器实测已列出真 Ante 会话**；**每条都报垫片自己的 location**（`prj_shim` @ `default_directory()`）——报 Ante 的真实 `dir` 会让选择器去 sync 一个 `/api/location` 答不出的目录，于是第二次打开变成 "Could not load sessions."
+- [x] **会话列表 / `/sessions`** —— `GET /api/session` 列 `~/.ante/sessions/*/`（实测 209 条 = `ls ~/.ante/sessions | wc -l`、时间倒序、标题=首条用户消息；用户改过名的读 `title.txt`，见 `/rename`）。**优先读 `meta.json`；缺失时从 `events.jsonl` 兜底**——Ante 只在 `TurnEnd` 写 `meta.json`，回合没跑完的会话只有日志（见下条）。**选择器实测已列出真 Ante 会话**；**每条都报垫片自己的 location**（`prj_shim` @ `default_directory()`）——报 Ante 的真实 `dir` 会让选择器去 sync 一个 `/api/location` 答不出的目录，于是第二次打开变成 "Could not load sessions."
 - [x] **恢复会话：历史渲染** —— `/sessions` 选中一条即加载历史（用户消息 + 助手回复 + 工具块）。**病根：`GET /api/session/{id}` 少了 `data` 信封**（该路由 schema 是 `{data: Session.Info}` 且 `additionalProperties:false`），客户端读 `response.data.id` 得 undefined，抛 `undefined is not an object (evaluating 'Ae.id')`，**只在界面上弹个小 toast、不换视图**——所以看着像「点了没反应」
 - [x] **记录回读（打开会话时那份 transcript）** —— 打开一条会话，客户端会 `GET /api/session/{id}/message`（`limit=20&order=desc`），拿到后**按 id reconcile 整份替换**本地记录。垫片这份数据原先有两个毛病：① 会话正在跑时它回的是自己的内存副本，**而那份只有用户自己发的提示词**（助手内容一律由客户端自己从事件里折）——于是再读一次，回答、思考、工具全被抹掉，只剩一串光秃秃的用户消息（顺序看着也就错了）；② 不在跑时走的是 v1 折叠，**只认 `UserInput` / `TurnStart` / 最终文本**：思考块、工具调用、多步全丢，且 `AgentMessage` 只认「上一条是 assistant」——**插嘴一条之后，后面每一步的回答都被静默丢掉**。现在改成**一律从 Ante 的 `events.jsonl` 重放**，按 opencode 的真实形状折：**一个 step（一次模型调用）一条 assistant 消息**，内含 `reasoning` / `text` / `tool` 三种 part，工具由 `ToolEnd` 收尾成 `completed`/`error`、`UsageUpdate` 填 tokens、`TurnEnd` 收尾（失败的回合单独落一条带 `error` 的 assistant 消息）。两处 id 必须和客户端对得上，否则一次重读要么翻倍要么丢：
   - **assistant**：id = `msg_<turn_id>_<第几步>`（`step_message_id`）。活会话的 pump 与日志重放**用同一个函数算**，所以同一 step 在哪边都是同一个 id；
@@ -39,7 +39,13 @@
 - [x] **`shift+tab` 切权限模式** —— 三项**直接用 Ante 自己的说法**（`auto`/`strict`/`yolo`，不经过 opencode 的 build/plan 再翻译），实测 composer 循环 `Auto → Strict → Yolo`，且**以 `settings.json` 里配的那个打头**；切换是真差别（`strict` 下危险命令弹审批）。**agent 是在「建会话」的 body 里传的**（`{agent, id, model, location}`），不是发消息时
 - [x] **boot 接口全套** —— `health` `location` `fs/list` `agent` `provider` `model` `config` `vcs` `project` `plugin` `migration` …。**`/api/health`（同 `/api/info`）的版本自报**：`version` = **Ante 后端版本**（启动自检时 `ante --version` 读到的，如 `0.2.5`；读不到则 `unknown`），`antex` = **构建日期**（`build.rs` 烤进去，如 `2026-09-29`——垫片自己没有发布节奏，跟着 Ante 和 opencode 走，日期就是它的版本）。响应还带 `urls`/`paths`，凑齐客户端 `ServerInfo` schema 声明的字段。**首页右下角就渲染这两项**（见 [client-patches.md](client-patches.md) 的第五处补丁）。**验证法**：`antex serve 41999` 后 `curl -s localhost:41999/api/health`，与 `ante --version` 对照
 - [x] **`@` 文件补全** —— 垫片**自己读文件系统**（Ante 无文件 API）：`/api/fs/list` 列目录、`/api/fs/find` 递归搜索（跳过 `.git`/`node_modules`，深度≤6、limit≤50）。实测敲 `@` 列出家目录、输入 `main.rs` 命中真文件
-- [x] **次要事件** —— `session.step.streamed`（每个 step 一次，`ensure_streamed!`）、`session.renamed`（新会话首条消息定标题）、`session.model.selected`（切模型，带 `previous`，读旧值在覆写之前）。`instructions.updated` 不适用（Ante 无此概念）
+- [x] **`/rename`** —— `PATCH /api/session/{id}`，body 里三个键只有 `title` 是 Ante 真有对应的：对**当前那条**会话发 Ante 的 `SessionUpdate{title}`（真标题——Ante 自己的前端也看得见，resume 也带回来）；别的会话 Ante 没有「改那一条」的 op（只有 `StartSession` 时定目录、`UpdateSession` 改当前），**不为改名去 resume**（那条路会把整份历史重放灌进正在看的会话），于是改名只落**垫片自己的 `title.txt`**。会话列表与选择器读的正是它：`derived_title()` = `title.txt` → `meta.json` 的 `first_user_message` → 日志首条 `UserInput`。**不写 `meta.json`**——Ante 会整份重写它，而且它本来就没有 title 字段（实读一份：id/provider/model/enable_auto_memory/dir/first_user_message/message_count/usage/duration/started_time）。Ante 那边报来的 title（`Evt::SessionStart`/`SessionUpdated`，含别的前端改的）会镜像进 `title.txt`，两边不打架；改名收尾发 `session.renamed`。**验证法**：`antex serve PORT` → 建会话 → `curl -X PATCH localhost:PORT/api/session/<id> -H 'content-type: application/json' -d '{"title":"改名了"}'` 应回 **204**；`GET /api/session` 里那条 title 变成「改名了」；再 `-d '{"title":""}'` 清掉，标题回到首条消息；改当前会话时 `ANTE_SHIM_TRACE` 里应出现 `Op::UpdateSession` 与 Ante 回的 `SessionUpdated`。**回退**：删掉 `~/.ante/sessions/<存档>/title.txt` 就回到派生标题（Ante 的文件一个没动）
+- [x] **`/copy`、`/export`** —— `GET /api/experimental/session/{id}/export` → `{data:{info, messages}}`：`messages` 就是「记录回读」那份重放（同一个 `replay_session`，客户端 `formatSessionTranscript` 直接吃得下），`info` 复用会话信息但 **`time.created` 必须是数字**（字符串会让客户端抛 RangeError）。`sanitize` 查询参数**有意忽略**：载荷是 Ante 的日志原文，垫片不改写路径。**验证法**：`curl localhost:PORT/api/experimental/session/<id>/export` 应拿到非空 `data.messages`，与同一条的 `/message` 逐条相等
+- [x] **`/stats`** —— `GET /api/experimental/session/stats`，数字全部来自 Ante 自己写的 `meta.json`：`sessions`、`tokens`（input/output/cache read/cache write；Ante 不单列 reasoning，所以那一项是 0）、`activity`（按会话开始那天的**本地**日期，客户端日历按天分桶）、`models`（按 provider+model 分组）、`streak`（`activity` 里最长连续天）。两处是近似/派生，写明：`prompts` 数 `events.jsonl` 里 `UserInput` 出现次数（meta 里没有这个数），`steps` = Σ`message_count`（一次模型调用 ≈ 一条助手消息）。**Ante 没写的报 0，不猜**：协议里没有报价 ⇒ `cost: 0`；子代理只是父回合里一次 `Agent` 调用 ⇒ `subagents: 0`；工具明细 `{mode:"none"}`（客户端会传 `tools` 查询参数，垫片不做那几种模式）。只统计**Ante 写过 meta 的会话**，且先按 `from` 过滤再读日志（客户端一次要一年，读 159MB 日志不划算）。**验证法**：`curl 'localhost:PORT/api/experimental/session/stats?from=0'`，与 `ls ~/.ante/sessions | wc -l`、任取一条 `meta.json` 的 usage 对照；把 `from` 设成未来应回全 0 且 `activity: []`
+- [x] **`/skills`** —— `GET /api/skill` 优先回 **Ante 播报的清单**（`SessionInfo.skills`，随 `SessionStart`/`SessionUpdated` 来）——那才是真能调用的集合（含项目域与 `no_skills`）；首轮提示词之前 Ante 还没播报，退到**磁盘扫描**兜底（`~/.ante/skills`、`~/.ante/.system/skills`、`<cwd>/.ante/skills`，取 `<name>/SKILL.md` 的 frontmatter）。客户端只用 `id`/`name`/`description`、选中插入 `@<name>`，而技能清单本来就在 Ante 的 system prompt 里，所以 `Op::UserInput` 纯文本就够、不用额外传参。**验证法**：`curl localhost:PORT/api/skill` 应列出本机真技能（`release-via-ci`、`writing-docs` 等，各带 description）；进 TUI 敲 `/skills` 应弹选择框、选中后输入框出现 `@名字 `
+- [x] **会话内 `/cd`：明确报错而非静默** —— Ante 的目录在 `StartSession` 时由 `SessionRequest.cwd` 定死，`SessionUpdate` 里没有目录字段，`~/Projects/ante` 全仓也没有换目录的 op。原先这条路由落通用 fallback（200 + 空 data），客户端把它显示成 `UnexpectedStatus: 200`（`POST /api/session/{id}/move` 的 schema 要 204）；现在回 **400 + 人话**（「Ante 的会话目录在建会话时就定死了…要换目录请开一条新会话」），TUI 放进 toast。**没做「按新目录重开会话」的退化**：历史留在旧会话、列表里多一条，代价比收益大（只在 README 待定里留着）
+- [x] **次要事件** —— `session.step.streamed`（每个 step 一次，`ensure_streamed!`）、`session.renamed`（新会话首条消息定标题；`/rename` 与 Ante 自己报来的改名也发这条）、`session.model.selected`（切模型，带 `previous`，读旧值在覆写之前）。`instructions.updated` 不适用（Ante 无此概念）
+
 - [x] **命令行参数** —— `[PORT]` / `--port PORT` / `-h|--help`；不认识的参数打印用法并以 2 退出；**端口被占给明确提示、不再 panic**
 - [x] **`/compact` 压缩** —— `POST …/compact` → Ante 的 **`Op::Compact`**（真压缩，不是假动作）。**Ante 不用 `CompactStart/CompactEnd` 报进度**（那只在真做了缩减时才发），日常走 **`InfoBlockStart`/`InfoBlockAppend`（id 以 `compact` 开头）** → 映射成 `compaction.started/delta/ended`；另补 **inbox 握手**（`enqueued`+`delivered`），否则客户端把队列项一直挂在底部不落正文。实测：Ante 回「Context is already within budget; nothing to compact.」，UI 出 `Compaction` 块
 - [x] **客户端实际调用的接口全覆盖** —— 对照一次完整使用过程收集到的 **32 条请求**，补齐了原先漏掉的 9 个：`/api/form`、`/api/shell`（GET+POST）、`/api/reference`、`/api/integration`、`/api/project`（**裸数组**，同 `/api/config`）、`/api/mcp/resource`（`{resources,templates}`）、`/api/vcs/base`（`data: null`）、`/api/vcs/diff`、`/api/experimental/session/{id}/terminal`（`{data}`）。Ante 没有这些数据，**但形状严格照 schema**——原先落到通用 fallback，它多带一个 `info` 字段，恰好违反这些路由的 `additionalProperties:false`，客户端会把整个响应校验掉、面板**静默为空**
@@ -67,6 +73,8 @@
 
 **不在这张表里了**：遗弃项不用验（Ante 没有这个概念），待定项不用验（没做就是没做）。判断某个入口该不该留在界面上，看 [README](../README.md) 的「状态」清单，再用 [client-patches.md](client-patches.md) 的验收法复核一次即可。
 
+**待定现在只剩三条**，两条都在 README「状态」里：真多标签（要先证 Ante 能并发驱动多会话）、断线时的终端还原（要抓 PTY 原始字节），加上会话内 `/cd` 的退化方案（`/cd` 本身已经会明确报错）。
+
 ## 审批
 
 Ante 暂停时（`TurnPause{Approval}`）垫片发 `permission.asked`，TUI 弹窗；用户在 TUI 里选
@@ -90,11 +98,12 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 
 **这里只放手上的活与开放问题；功能缺口（空框）看 [README](../README.md)「状态」清单。**
 
-**待发（`.6`，工作区已改完，等一次 tag）**
+**待发（`2026.10.02`，工作区已改完，等一次 tag）**
 
-- **prompt 请求体上限 2MB → 32MB**：客户端把**原始**图当 `data:` URL 塞进 body，屏幕截图转 base64 轻易超 2MB，而 axum `Json` 抽取器的默认上限就是 2MB，超了回 `413 Payload Too Large`——界面上只报发送失败、垫片日志一行都没有（小图能过，所以看着像随机）。垫片加 `DefaultBodyLimit::max(MAX_REQUEST_BYTES)`，解析后照旧走压缩阶梯。机制与验法见实现清单「贴图」那节。
-- **「做不了的入口」那两层钉死**：`plugins` 补成并集（文件原条目 + `-opencode.*`）、`keybinds` 补 `"none"`，放进同一份注入里；顺带修掉注入侧的配置查找——原先给 `OPENCODE_CONFIG_DIR` 又拼了一层 `opencode/`，读不到文件就当成「空配置」。
-- **附件被丢时说出来**：`attachments::stage` 把丢弃原因交回调用方，正文里加一句给 Ante（+弹卡片给用户），不再只写日志。
+- **五条命令放开**：`/rename`、`/copy`、`/export`、`/stats`、`/skills` 从「隐藏」转「已实现」；会话内 `/cd` 从静默转明确报错。机制与验法见实现清单那五条。
+- **要同时动四处，缺一处就不一致**：客户端黑名单 `ANTE_MISSING`（`vendor/…/tui/src/context/keymap.tsx`）去掉 `rename`/`copy`/`export`/`skills`；垫片 `DISABLED_PLUGINS` 去掉 `-opencode.stats`、`DEAD_KEYBINDS` 去掉 `session.export`；**本机 `~/.config/opencode/cli.json` 里那两项也要去**——注入只补文件没说的键，文件说了算，不去掉就还是隐藏（`stats` 插件 id 是 `opencode.stats`，命令 `stats.open` 本身不在黑名单里，禁掉插件即整条隐藏）。
+- **改客户端源码必须重建 TUI**（`script/build-tui.sh`，首次先手动 `bun install`）；发版由 CI 重编，本机只需 `cargo test` 保证能编过。
+- 回归线：`cargo test` 里 `the_commands_that_got_an_endpoint_are_no_longer_hidden` 钉的就是这四处的互相一致。
 
 **开放问题**
 
@@ -104,8 +113,8 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 
 **发版一条线**：改 `PKGBUILD` 的 `pkgver`（日期 + 当日序号）→ 提交 → 打**同名** tag 推上去（流程见 `release-via-ci`）。
 
-**已装版本（`.5`）的已知缺陷**：prompt 请求体超 2MB 的图发不出去（`413`，修在 `.6`）。除此之外，过去列在缺口里的中断收尾、多轮消息落位、会话列表、agent 切换、`/compact`、恢复旧会话后继续对话都已实现并实测。
+**已发布**：`.6`（prompt 请求体上限 2MB → 32MB、「做不了的入口」两层钉死、附件被丢时说出来）→ `2026.10.02`（上面这批）。过去列在缺口里的中断收尾、多轮消息落位、会话列表、agent 切换、`/compact`、恢复旧会话后继续对话都已实现并实测。
 
-要接着做，就挑 [README](../README.md)「状态」清单里 **空框** 的那几条（`/rename`、`/copy`、`/export`、`/stats`、`/skills`、会话内 `/cd`、真多标签、断线时的终端还原）；**带删除线** 的一条都别再提议——Ante 底层没有那些概念。
+要接着做，就挑 [README](../README.md)「状态」清单里 **空框** 的那几条（会话内 `/cd` 的退化方案、真多标签、断线时的终端还原）；**带删除线** 的一条都别再提议——Ante 底层没有那些概念。
 
 **已知瑕疵（不影响使用）**：TUI 新建会话时 id 是**客户端本地发号**的（`packages/tui/src/component/prompt/index.tsx` 的乐观创建），Ante 那边则按自己的 id 另建一条同格式目录。于是刚建的会话在重启前只以客户端 id 存在于内存里（本进程内就按它跟踪），重启后要从列表里按 Ante 的 id 恢复——内容一直在 Ante 那条目录里，不会丢，两个 id 也不会互相冒充。
