@@ -1736,10 +1736,14 @@ async fn attach_session(store: &Store, ops: &OpSender, id: &str, mode: Permissio
             if known.is_some() {
                 announce_unresumed(store, id);
             }
+            // The client does not always name a model, and the compiled
+            // placeholder is in nobody's catalog — starting on it fails the
+            // first turn with a provider error while the picker shows the right
+            // pair. Fall back to the chain the picker reads (`active_model`:
+            // Ante's own settings.json, then `ANTEX_*`, then the placeholder),
+            // so what the TUI displays and what Ante runs are the same thing.
             let chosen = store.ante.model.lock().ok().and_then(|slot| slot.clone());
-            let (provider, model) = chosen.unwrap_or_else(|| {
-                (env_or("ANTEX_PROVIDER", PROVIDER), env_or("ANTEX_MODEL", MODEL))
-            });
+            let (provider, model) = chosen.unwrap_or_else(active_model);
             let request = SessionRequest {
                 permission_mode: Some(mode),
                 provider: Some(provider),
@@ -2650,16 +2654,20 @@ async fn session_model(
     Json(body): Json<Value>,
 ) -> axum::http::StatusCode {
     let model = body.get("model").cloned().unwrap_or_default();
+    // A half-filled switch (or none at all) keeps Ante's own pair rather than
+    // the compiled placeholder — see `attach_session` for why the placeholder
+    // is never a runnable fallback.
+    let (fallback_provider, fallback_model) = active_model();
     let id = model
         .get("id")
         .and_then(|v| v.as_str())
         .map(str::to_string)
-        .unwrap_or_else(|| env_or("ANTEX_MODEL", MODEL));
+        .unwrap_or(fallback_model);
     let provider = model
         .get("providerID")
         .and_then(|v| v.as_str())
         .map(str::to_string)
-        .unwrap_or_else(|| env_or("ANTEX_PROVIDER", PROVIDER));
+        .unwrap_or(fallback_provider);
     // Read the outgoing pair before overwriting it, or `previous` ends up
     // reporting the new model.
     let previous = store

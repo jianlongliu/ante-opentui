@@ -35,9 +35,9 @@ dependencies = [
 
 [[package]]
 name = "ante-protocol-shape"
-version = "0.2.5"
+version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5315354105db07f8e9339bf16b9c749bc0a04d6878ee89f0adfbaba6712f285"
+checksum = "eb530b4db38f230e71a1e5f8402e666b4376cbcad6d5f478227b34d6d5bab23f"
 dependencies = [
  "chrono",
  "serde",
@@ -47,9 +47,9 @@ dependencies = [
 
 [[package]]
 name = "ante-sdk"
-version = "0.2.5"
+version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2fd01c00fa4ac64541e35fdc48f48734d1b27a04afee1797c109a9ac5063dda"
+checksum = "e0efc81494de2072e98dcb9decb75a7285cfebc7b980fdc117aa1019c9f0b35d"
 dependencies = [
  "ante-protocol-shape",
  "futures-util",

@@ -10,7 +10,7 @@ name = "antex"
 path = "src/main.rs"
 
 [dependencies]
-ante-sdk = "0.2.5"
+ante-sdk = "0.2.7"
 base64 = "0.22"
 chrono = "0.4"
 axum = "0.8"

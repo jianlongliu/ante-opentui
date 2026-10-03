@@ -98,7 +98,15 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 
 **这里只放手上的活与开放问题；功能缺口（空框）看 [README](../README.md)「状态」清单。**
 
-**待发（`2026.10.02`，工作区已改完，等一次 tag）**
+**待发（`2026.10.03`，工作区已改完，等一次 tag）**
+
+- **跟上 Ante 0.2.8（两处）**：
+  1. **`ante-sdk` 0.2.5 → 0.2.7**（crates.io 上最新；0.2.8 还没发）。协议 crate `ante-protocol-shape` 0.2.5→0.2.7 是**纯新增**：`Op::RewindSession` / `ForkSession`、`Evt::SessionRewound` / `SessionForked`、`SessionInfo.forked_from`，对应 Ante 0.2.8 的 `/rewind` 与 `/fork`。垫片不吃这些事件，**没有一处改动旧变体**，所以旧二进制照样能跑——升它是为了不落后。
+  2. **模型兜底**：客户端建会话时**没带 `model`**（或只带一半），垫片从前拿**编译期占位符** `example/example-model` 去起 Ante 会话——界面却按 `settings.json` 显示真 pair，于是第一轮必以 `No API key for OPENAI_COMPATIBLE_API_KEY` 收场。现在两个决定「跑哪个模型」的地方（`attach_session`、`POST /api/session/{id}/model` 的半截请求）都退到 `active_model()`，与界面同一条链：`settings.json` → `ANTEX_PROVIDER`/`ANTEX_MODEL` → 占位符。
+- **验法**：`cargo build --release` → `./target/release/antex serve <空闲端口>` → `POST /api/session` **故意不带 `model`** → 发一条 prompt：应正常回话，且 `~/.ante/logs/<日期>/` 里那条后端日志出现 `model_provider=command-code`（升之前同法必失败，这就是回归线）。测完删掉 `~/.ante/sessions/` 下新建的那条。
+- **版本对齐提醒**：`ante --version` 是 `0.2.8`、crates.io 上 `ante-sdk` 最高只到 `0.2.7`，而启动自检比的是**版本串相等** ⇒ 那行「协议可能对不上」**仍会打**，属预期；等 Ante 发出 sdk 0.2.8 再对齐一次即可。
+
+**`2026.10.02` 那批（已出）：改动要点**
 
 - **五条命令放开**：`/rename`、`/copy`、`/export`、`/stats`、`/skills` 从「隐藏」转「已实现」；会话内 `/cd` 从静默转明确报错。机制与验法见实现清单那五条。
 - **要同时动四处，缺一处就不一致**：客户端黑名单 `ANTE_MISSING`（`vendor/…/tui/src/context/keymap.tsx`）去掉 `rename`/`copy`/`export`/`skills`；垫片 `DISABLED_PLUGINS` 去掉 `-opencode.stats`、`DEAD_KEYBINDS` 去掉 `session.export`；**本机 `~/.config/opencode/cli.json` 里那两项也要去**——注入只补文件没说的键，文件说了算，不去掉就还是隐藏（`stats` 插件 id 是 `opencode.stats`，命令 `stats.open` 本身不在黑名单里，禁掉插件即整条隐藏）。
@@ -113,7 +121,7 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 
 **发版一条线**：改 `PKGBUILD` 的 `pkgver`（日期 + 当日序号）→ 提交 → 打**同名** tag 推上去（流程见 `release-via-ci`）。
 
-**已发布**：`.6`（prompt 请求体上限 2MB → 32MB、「做不了的入口」两层钉死、附件被丢时说出来）→ `2026.10.02`（上面这批）。过去列在缺口里的中断收尾、多轮消息落位、会话列表、agent 切换、`/compact`、恢复旧会话后继续对话都已实现并实测。
+**已发布**：`.6`（prompt 请求体上限 2MB → 32MB、「做不了的入口」两层钉死、附件被丢时说出来）→ `2026.10.02`（五条命令放开，见上）→ `2026.10.03`（`ante-sdk` 0.2.7；模型兜底改读 `settings.json`）。过去列在缺口里的中断收尾、多轮消息落位、会话列表、agent 切换、`/compact`、恢复旧会话后继续对话都已实现并实测。
 
 要接着做，就挑 [README](../README.md)「状态」清单里 **空框** 的那几条（会话内 `/cd` 的退化方案、真多标签、断线时的终端还原）；**带删除线** 的一条都别再提议——Ante 底层没有那些概念。
 
