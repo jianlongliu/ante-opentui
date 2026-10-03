@@ -219,10 +219,10 @@ struct Ante {
     /// other id has to switch it over first.
     live: Arc<Mutex<Option<String>>>,
     /// While a resume is in flight: the op id of the `UserInput` that will
-    /// start the turn we are actually waiting for, plus when the guard was
-    /// armed. Everything the pump sees until then is the replay. See
-    /// [`Ante::dropping`].
-    replay_turn: Arc<Mutex<Option<(String, std::time::Instant)>>>,
+    /// start the turn we are actually waiting for, which prompt that op carries,
+    /// and when the guard was armed. Everything the pump sees until then is the
+    /// replay. See [`Ante::dropping`].
+    replay_turn: Arc<Mutex<Option<ReplayArm>>>,
     /// Which opencode session the events belong to. One Ante session is
     /// mirrored, so this is the most recent one the TUI opened.
     active: Arc<Mutex<Option<String>>>,
@@ -462,10 +462,13 @@ impl Ante {
     }
 
     /// Arm the replay guard for a resume: the next turn this op id starts is
-    /// ours, everything before it is history coming back.
-    fn expect_turn(&self, turn_id: String) {
+    /// ours, everything before it is history coming back. The arm names the
+    /// prompt that op carries — Ante echoes it just before the turn it starts,
+    /// and that echo is swallowed with the replay, so the guard is where the
+    /// hand-over gets acknowledged instead (see [`Ante::dropping`]).
+    fn expect_turn(&self, arm: ReplayArm) {
         if let Ok(mut slot) = self.replay_turn.lock() {
-            *slot = Some((turn_id, std::time::Instant::now()));
+            *slot = Some(arm);
         }
     }
 
@@ -474,17 +477,28 @@ impl Ante {
     /// the turn it was armed for; a refusal or a timeout lifts it too, and
     /// drops the session binding so the next prompt resolves again rather than
     /// talking into the wrong session.
+    ///
+    /// Lifting on our own turn also settles the prompt that turn was started by:
+    /// Ante echoes the text back (`Evt::UserInput`) immediately *before*
+    /// `TurnStart`, so the echo is always swallowed by the replay. Waiting for it
+    /// was why a prompt handed over on a resume stayed un-acknowledged for the
+    /// whole turn — and the turn-end sweep then announced `delivered` after the
+    /// reply, which the client answers by moving that prompt to the end of the
+    /// transcript: under its own answer.
     fn dropping(&self, event: &Evt) -> Replay {
         let Ok(mut slot) = self.replay_turn.lock() else {
             return Replay::Pass;
         };
-        let Some((expected, armed)) = slot.as_ref() else {
+        let Some(arm) = slot.as_ref() else {
             return Replay::Pass;
         };
-        let ours = matches!(event, Evt::TurnStart { turn_id } if turn_id.to_string() == *expected);
-        if ours {
-            *slot = None;
-            return Replay::Pass;
+        let (expected, armed) = (arm.turn.clone(), arm.armed);
+        if matches!(event, Evt::TurnStart { turn_id } if turn_id.to_string() == expected) {
+            let arm = slot.take();
+            return match arm {
+                Some(arm) => Replay::Ours { session: arm.session, inbox: arm.inbox },
+                None => Replay::Pass,
+            };
         }
         let refused = matches!(event, Evt::Error(_));
         if refused || armed.elapsed() > REPLAY_GUARD {
@@ -502,6 +516,16 @@ impl Ante {
     }
 }
 
+/// A resume in flight: the op id of the `UserInput` we handed over, the prompt
+/// that op carries (as the client names it), the session it went to, and when
+/// the guard was armed.
+struct ReplayArm {
+    turn: String,
+    session: String,
+    inbox: String,
+    armed: std::time::Instant,
+}
+
 /// What [`Ante::dropping`] decided about an event that arrived while a resume
 /// was in flight.
 #[derive(PartialEq, Eq, Debug)]
@@ -511,6 +535,9 @@ enum Replay {
     /// Part of the conversation Ante replayed — the client already has it, and
     /// drawing it again would double the transcript.
     Replay,
+    /// The turn we were waiting for has started, so the resume took: that turn is
+    /// the prompt we handed over being read, and it is owed its acknowledgement.
+    Ours { session: String, inbox: String },
     /// The resume never took: Ante refused it, or its own turn never came. This
     /// is not a replay, and whatever was handed to that connection is still
     /// owed to the user.
@@ -701,6 +728,17 @@ impl Store {
             acked.entry(session.to_string()).or_default().push(id.clone());
         }
         Some(id)
+    }
+
+    /// Note a prompt *we* handed over as taken, without waiting for Ante's echo
+    /// of the text. The one caller is a resume's guard lifting on its own turn:
+    /// the echo arrives just before that turn and is swallowed with the replay,
+    /// so the text never gets a chance to match. `delivered` goes out at the step
+    /// boundary like any other acknowledgement.
+    fn ack_handed(&self, session: &str, inbox_id: &str) {
+        if let Ok(mut acked) = self.acked.lock() {
+            acked.entry(session.to_string()).or_default().push(inbox_id.to_string());
+        }
     }
 
     /// Prompts whose step boundary has arrived (or whose turn is over), cleared
@@ -1710,18 +1748,32 @@ async fn flush_after_reconnect(store: &Store) {
 /// Point the live connection at `id`: resume its archive when Ante has one on
 /// disk, otherwise start a fresh session with the client's chosen model.
 ///
-/// `expect` is the op id of the `UserInput` that follows: a resume hands the
-/// whole conversation back, and the replay guard drops that until the turn that
-/// op starts shows up. Both the prompt route and the reconnect path go through
-/// here, so a conversation survives the backend dying.
-async fn attach_session(store: &Store, ops: &OpSender, id: &str, mode: PermissionMode, expect: &Id) {
+/// `expect` is the op id of the `UserInput` that follows, and `inbox` the prompt
+/// it carries: a resume hands the whole conversation back, and the replay guard
+/// drops that until the turn that op starts shows up — including the echo that
+/// would acknowledge the prompt, so the guard carries it instead. Both the prompt
+/// route and the reconnect path go through here, so a conversation survives the
+/// backend dying.
+async fn attach_session(
+    store: &Store,
+    ops: &OpSender,
+    id: &str,
+    mode: PermissionMode,
+    expect: &Id,
+    inbox: &str,
+) {
     // The client's id and Ante's archive name are not the same thing, so the
     // archive is looked up by mapping, not by guessing.
     let known = store.ante.archive_of(id);
     let archive = store.ante.resumable_archive_of(id).and_then(|archive| archive.parse::<Id>().ok());
     match archive {
         Some(session_id) => {
-            store.ante.expect_turn(expect.to_string());
+            store.ante.expect_turn(ReplayArm {
+                turn: expect.to_string(),
+                session: id.to_string(),
+                inbox: inbox.to_string(),
+                armed: std::time::Instant::now(),
+            });
             let op = Op::ResumeSession { session_id, unattended: false };
             if let Err(err) = ops.send(ante_sdk::protocol::op_msg(op)).await {
                 log_line(&format!("ante: 恢复会话 {id} 发送失败：{err}"));
@@ -1906,6 +1958,14 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
             Replay::Replay => continue,
             Replay::Pass => false,
             Replay::Unresumed => true,
+            // Our own turn, which is the prompt we handed over being read: the
+            // echo that would have said so was swallowed with the replay, so the
+            // guard says it instead. The step boundary publishes `delivered`.
+            Replay::Ours { session, inbox } => {
+                log_line(&format!("ante: 消息 {inbox} 随恢复的回合被收下（回显被重放吞了）"));
+                store.ack_handed(&session, &inbox);
+                false
+            }
         };
         let Some(session) = store.ante.active.lock().ok().and_then(|s| s.clone()) else {
             continue;
@@ -3967,7 +4027,8 @@ async fn flush_queue(store: &Store, session: &str) {
     };
     let input = ante_sdk::protocol::op_msg(Op::UserInput(text));
     if store.ante.live_id().as_deref() != Some(session) {
-        attach_session(store, &ops, session, current_permission_mode(store), &input.id).await;
+        attach_session(store, &ops, session, current_permission_mode(store), &input.id, &inbox_id)
+            .await;
     }
     if let Err(err) = ops.send(input).await {
         log_line(&format!("ante: 排队消息发送失败：{err}"));
@@ -4252,7 +4313,7 @@ async fn session_prompt(
                 // the guard drops that replay until the turn this op id starts.
                 let input = ante_sdk::protocol::op_msg(Op::UserInput(staged.clone()));
                 let fresh = store.ante.resumable_archive_of(&id).is_none();
-                attach_session(&store, &ops, &id, mode, &input.id).await;
+                attach_session(&store, &ops, &id, mode, &input.id, &user_id).await;
                 if fresh {
                     // The real server announces the title once; Ante titles from
                     // the first message too, so mirror it here.

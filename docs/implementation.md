@@ -98,12 +98,17 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 
 **这里只放手上的活与开放问题；功能缺口（空框）看 [README](../README.md)「状态」清单。**
 
-**待发（`2026.10.03`，工作区已改完，等一次 tag）**
+**待发（`2026.10.03.2`，工作区已改完，等一次 tag）**
+
+- **恢复会话时，提问会掉到它自己的回复下面**。`ResumeSession` 的重放守卫只在「我们那条 `Op::UserInput` 触发的 `TurnStart`」上抬起，而 Ante 的回显 `Evt::UserInput` 紧贴在 `TurnStart` **之前**（同一毫秒、先输入后回合）⇒ 回显被当成重放吞掉，这条 prompt 整轮都没被「收下」；回合收尾的扫尾只能补发 `delivered`，而客户端收到它就是**把那条提问移到转录末尾**（`packages/client/src/solid/data.ts` 的 `draft.splice`+`draft.push`），于是落到回复下面。**修法**：守卫武装时把「这次交出去的那条 prompt」一起记进 `ReplayArm`（turn / session / inbox / 时间），抬起来时直接 `ack_handed` 认它已收下——不等回显、也不做文本匹配；`delivered` 照旧在 step 边界、排在 `step.started` 之前发出。只在「prompt 指向的会话不是当前连接在驱动的那条」（重开会话/切会话/重启后端）时才走这条路，所以平时看不出来。
+- **验法（不必进 TUI）**：`ANTE_SHIM_TRACE=/tmp/t.log antex serve PORT` → 建会话 `sesA` 并 prompt 一轮 → 用垫片日志里那句「存档是 `ses_…`」的名字当会话 id **再 prompt 一次**（这一步必然走 ResumeSession）→ `/tmp/t.log` 里那条 `PUB session.inbox.delivered` 必须排在**同一轮** `PUB session.step.started` 之前；垫片日志里不该再出现「回合结束时 … 仍未送达，按已送达处理」。**修前同法必失败**，可直接当回归线。
+
+**`2026.10.03` 那批（已出）：改动要点**
 
 - **跟上 Ante 0.2.8（两处）**：
   1. **`ante-sdk` 0.2.5 → 0.2.7**（crates.io 上最新；0.2.8 还没发）。协议 crate `ante-protocol-shape` 0.2.5→0.2.7 是**纯新增**：`Op::RewindSession` / `ForkSession`、`Evt::SessionRewound` / `SessionForked`、`SessionInfo.forked_from`，对应 Ante 0.2.8 的 `/rewind` 与 `/fork`。垫片不吃这些事件，**没有一处改动旧变体**，所以旧二进制照样能跑——升它是为了不落后。
   2. **模型兜底**：客户端建会话时**没带 `model`**（或只带一半），垫片从前拿**编译期占位符** `example/example-model` 去起 Ante 会话——界面却按 `settings.json` 显示真 pair，于是第一轮必以 `No API key for OPENAI_COMPATIBLE_API_KEY` 收场。现在两个决定「跑哪个模型」的地方（`attach_session`、`POST /api/session/{id}/model` 的半截请求）都退到 `active_model()`，与界面同一条链：`settings.json` → `ANTEX_PROVIDER`/`ANTEX_MODEL` → 占位符。
-- **验法**：`cargo build --release` → `./target/release/antex serve <空闲端口>` → `POST /api/session` **故意不带 `model`** → 发一条 prompt：应正常回话，且 `~/.ante/logs/<日期>/` 里那条后端日志出现 `model_provider=command-code`（升之前同法必失败，这就是回归线）。测完删掉 `~/.ante/sessions/` 下新建的那条。
+- **验法**：`antex serve <空闲端口>`（源码树里直接跑即可，不必专门编 release）→ `POST /api/session` **故意不带 `model`** → 发一条 prompt：应正常回话，且 `~/.ante/logs/<日期>/` 里那条后端日志出现 `model_provider=command-code`（升之前同法必失败，这就是回归线）。测完删掉 `~/.ante/sessions/` 下新建的那条。
 - **版本对齐提醒**：`ante --version` 是 `0.2.8`、crates.io 上 `ante-sdk` 最高只到 `0.2.7`，而启动自检比的是**版本串相等** ⇒ 那行「协议可能对不上」**仍会打**，属预期；等 Ante 发出 sdk 0.2.8 再对齐一次即可。
 
 **`2026.10.02` 那批（已出）：改动要点**
@@ -121,7 +126,7 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 
 **发版一条线**：改 `PKGBUILD` 的 `pkgver`（日期 + 当日序号）→ 提交 → 打**同名** tag 推上去（流程见 `release-via-ci`）。
 
-**已发布**：`.6`（prompt 请求体上限 2MB → 32MB、「做不了的入口」两层钉死、附件被丢时说出来）→ `2026.10.02`（五条命令放开，见上）→ `2026.10.03`（`ante-sdk` 0.2.7；模型兜底改读 `settings.json`）。过去列在缺口里的中断收尾、多轮消息落位、会话列表、agent 切换、`/compact`、恢复旧会话后继续对话都已实现并实测。
+**已发布**：`.6`（prompt 请求体上限 2MB → 32MB、「做不了的入口」两层钉死、附件被丢时说出来）→ `2026.10.02`（五条命令放开，见上）→ `2026.10.03`（`ante-sdk` 0.2.7；模型兜底改读 `settings.json`）→ `2026.10.03.2`（恢复会话时提问落位）。过去列在缺口里的中断收尾、多轮消息落位、会话列表、agent 切换、`/compact`、恢复旧会话后继续对话都已实现并实测。
 
 要接着做，就挑 [README](../README.md)「状态」清单里 **空框** 的那几条（会话内 `/cd` 的退化方案、真多标签、断线时的终端还原）；**带删除线** 的一条都别再提议——Ante 底层没有那些概念。
 
