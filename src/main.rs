@@ -1358,7 +1358,7 @@ async fn ante_selfcheck() {
         let _ = ANTE_VERSION.set(found.clone());
     }
     match found {
-        Some(found) if found != built => {
+        Some(found) if !same_series(&found, built) => {
             let msg = format!(
                 "自检：协议可能对不上——antex 是按 ante-sdk {built} 编的，本机 {} 是 ante {found}。\n\
                  若发消息没反应，就是这个：改 Cargo.toml 的 ante-sdk 版本后 `cargo build --release`。",
@@ -1367,7 +1367,7 @@ async fn ante_selfcheck() {
             report_startup(&msg);
         }
         Some(found) => log_line(&format!(
-            "自检：{} → ante {found}；antex 编译于 ante-sdk {built}，版本一致",
+            "自检：{} → ante {found}；antex 编译于 ante-sdk {built}，同一版本系列（协议按系列走）",
             bin.display()
         )),
         None => log_line(&format!(
@@ -1375,6 +1375,18 @@ async fn ante_selfcheck() {
             bin.display()
         )),
     }
+}
+
+/// Ante's own version and the `ante-sdk` it ships do not move in lockstep —
+/// 0.2.8 ships `ante-sdk` 0.2.7 — and the protocol only changes between release
+/// series, so compare the first two components and let the patch digit drift.
+/// Anything unparsable counts as a mismatch: the warning is the safe answer.
+fn same_series(left: &str, right: &str) -> bool {
+    fn series(version: &str) -> Option<(&str, &str)> {
+        let mut parts = version.split('.');
+        Some((parts.next()?, parts.next()?))
+    }
+    matches!((series(left), series(right)), (Some(a), Some(b)) if a == b)
 }
 
 /// `ante --version` → `ante 0.2.5` → `0.2.5`.
@@ -4965,5 +4977,20 @@ mod tests {
         // the derived one, and a session with nothing to derive from gets this.
         assert_eq!(derived_title("no-such-session-dir"), "untitled");
         assert_eq!(title_override("no-such-session-dir"), None);
+    }
+
+    #[test]
+    fn the_self_check_tolerates_the_version_the_backend_ships() {
+        // Ante 0.2.8 ships `ante-sdk` 0.2.7 — its own version and the SDK's never
+        // move in lockstep, so the check is on the release series. Comparing the
+        // whole string would warn on every launch about a protocol that matches.
+        assert!(same_series("0.2.8", "0.2.7"));
+        assert!(same_series("0.2.7", "0.2.7"));
+        // Two components are enough to name a series; more than the patch digit
+        // being absent is not a mismatch.
+        assert!(same_series("0.2", "0.2.7"));
+        assert!(!same_series("0.3.0", "0.2.7"));
+        // Unparsable reads as a mismatch: the warning is the safe answer.
+        assert!(!same_series("unknown", "0.2.7"));
     }
 }

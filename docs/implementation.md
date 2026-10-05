@@ -98,7 +98,11 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 
 **这里只放手上的活与开放问题；功能缺口（空框）看 [README](../README.md)「状态」清单。**
 
-**待发（`2026.10.03.2`，工作区已改完，等一次 tag）**
+**待发（`2026.10.05`）：启动自检按版本系列判**
+
+- **版本对齐：判据从「版本串相等」改成「版本系列相同」**。Ante 自己的版本与它发的 `ante-sdk` 从不同步（后端 `0.2.8` 发的是 sdk `0.2.7`，协议面又是纯新增），比全等只会每次启动打一行「协议可能对不上」——说的是假话，还会把真警告淹掉。现在 `same_series()` 只比前两段（`0.2.x` 对 `0.2.x` 即通过），拿不到可解析版本号时仍按不一致处理（保守）。**验法**：`antex serve <空闲端口>`，启动首行应为 `自检：… → ante 0.2.8；antex 编译于 ante-sdk 0.2.7，同一版本系列（协议按系列走）` 而不是那段警告；`cargo test` 里 `the_self_check_tolerates_the_version_the_backend_ships` 钉死四种情形。
+
+**`2026.10.03.2`（已出）：恢复会话时的提问落位**
 
 - **恢复会话时，提问会掉到它自己的回复下面**。`ResumeSession` 的重放守卫只在「我们那条 `Op::UserInput` 触发的 `TurnStart`」上抬起，而 Ante 的回显 `Evt::UserInput` 紧贴在 `TurnStart` **之前**（同一毫秒、先输入后回合）⇒ 回显被当成重放吞掉，这条 prompt 整轮都没被「收下」；回合收尾的扫尾只能补发 `delivered`，而客户端收到它就是**把那条提问移到转录末尾**（`packages/client/src/solid/data.ts` 的 `draft.splice`+`draft.push`），于是落到回复下面。**修法**：守卫武装时把「这次交出去的那条 prompt」一起记进 `ReplayArm`（turn / session / inbox / 时间），抬起来时直接 `ack_handed` 认它已收下——不等回显、也不做文本匹配；`delivered` 照旧在 step 边界、排在 `step.started` 之前发出。只在「prompt 指向的会话不是当前连接在驱动的那条」（重开会话/切会话/重启后端）时才走这条路，所以平时看不出来。
 - **验法（不必进 TUI）**：`ANTE_SHIM_TRACE=/tmp/t.log antex serve PORT` → 建会话 `sesA` 并 prompt 一轮 → 用垫片日志里那句「存档是 `ses_…`」的名字当会话 id **再 prompt 一次**（这一步必然走 ResumeSession）→ `/tmp/t.log` 里那条 `PUB session.inbox.delivered` 必须排在**同一轮** `PUB session.step.started` 之前；垫片日志里不该再出现「回合结束时 … 仍未送达，按已送达处理」。**修前同法必失败**，可直接当回归线。
@@ -109,7 +113,6 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
   1. **`ante-sdk` 0.2.5 → 0.2.7**（crates.io 上最新；0.2.8 还没发）。协议 crate `ante-protocol-shape` 0.2.5→0.2.7 是**纯新增**：`Op::RewindSession` / `ForkSession`、`Evt::SessionRewound` / `SessionForked`、`SessionInfo.forked_from`，对应 Ante 0.2.8 的 `/rewind` 与 `/fork`。垫片不吃这些事件，**没有一处改动旧变体**，所以旧二进制照样能跑——升它是为了不落后。
   2. **模型兜底**：客户端建会话时**没带 `model`**（或只带一半），垫片从前拿**编译期占位符** `example/example-model` 去起 Ante 会话——界面却按 `settings.json` 显示真 pair，于是第一轮必以 `No API key for OPENAI_COMPATIBLE_API_KEY` 收场。现在两个决定「跑哪个模型」的地方（`attach_session`、`POST /api/session/{id}/model` 的半截请求）都退到 `active_model()`，与界面同一条链：`settings.json` → `ANTEX_PROVIDER`/`ANTEX_MODEL` → 占位符。
 - **验法**：`antex serve <空闲端口>`（源码树里直接跑即可，不必专门编 release）→ `POST /api/session` **故意不带 `model`** → 发一条 prompt：应正常回话，且 `~/.ante/logs/<日期>/` 里那条后端日志出现 `model_provider=command-code`（升之前同法必失败，这就是回归线）。测完删掉 `~/.ante/sessions/` 下新建的那条。
-- **版本对齐提醒**：`ante --version` 是 `0.2.8`、crates.io 上 `ante-sdk` 最高只到 `0.2.7`，而启动自检比的是**版本串相等** ⇒ 那行「协议可能对不上」**仍会打**，属预期；等 Ante 发出 sdk 0.2.8 再对齐一次即可。
 
 **`2026.10.02` 那批（已出）：改动要点**
 
