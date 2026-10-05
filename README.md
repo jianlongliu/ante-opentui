@@ -31,22 +31,14 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 
 ### 待定
 
-- [ ] `/rename` —— 隐藏中；补法：写 Ante 那条会话的 `meta.json` 标题
-- [ ] `/copy`、`/export` —— 隐藏中；补法：垫片用 `GET …/message` 拼一份导出载荷
-- [ ] `/stats` —— 隐藏中；补法：Ante 的 `meta.json` 里有 usage，够算 token / 成本
-- [ ] `/skills` —— 隐藏中；补法：列出 Ante 自己的技能目录（`~/.agents/skills`、`~/.ante/.system/skills`）
 - [ ] 会话内 `/cd` —— **Ante 没有换目录的接口**：目录在建会话时由 `SessionRequest.cwd` 定死，`SessionUpdate` 里没有这个字段，所以现在会明确报错（400 + 原因）而不是静默；退一步是「按新目录重开会话」（丢历史、会话列表多一行）
-- [ ] `/rename` —— 隐藏中；补法：写 Ante 那条会话的 `meta.json` 标题
-- [ ] `/copy`、`/export` —— 隐藏中；补法：垫片用 `GET …/message` 拼一份导出载荷
-- [ ] `/stats` —— 隐藏中；补法：Ante 的 `meta.json` 里有 usage，够算 token / 成本
-- [ ] `/skills` —— 隐藏中；补法：列出 Ante 自己的技能目录（`~/.agents/skills`、`~/.ante/.system/skills`）
+- [ ] `/undo`、`/redo`、消息菜单的 Revert —— **从「遗弃」转回「待定」**：Ante 0.2.8 已经有 `Op::RewindSession` / `Evt::SessionRewound`（`ante-sdk` 0.2.7 起，就是它自己的 `/rewind`），只是垫片还没接。**接法**：客户端是 stage → commit 两段（`/api/session/{id}/revert/stage|clear|commit`），所以垫片要「stage 只记边界、commit 才发 `RewindSession`」，`clear`＝丢掉边界（正好对上 `/redo`）。**已知偏差**：Ante 只回退对话，不动文件——上游那条「N files reverted」的卡片在这里恒为空；`to` 取不到（会话是 resume 来的、或中间被压缩/换过 provider）时后端会**拒绝**，得如实回给界面
+- [ ] `/fork` —— **同样从「遗弃」转回「待定」**：Ante 0.2.8 有 `Op::ForkSession` / `Evt::SessionForked`（附带 `SessionInfo.forked_from`）。客户端走 `POST /api/session/{id}/fork`（`before` ＝ 从哪条输入切），对应 op 的 `at`；fork 出来的是**新会话、不自动开始**，界面要跳到它（`/fork` 的导航语义）
 - [ ] 真多标签（session tabs）—— **待定**：先验证 Ante 侧能否并发驱动多条会话，再谈垫片改造（现在只是把入口临时关掉）
 - [ ] 断线时的终端还原 —— TUI 只弹 `Connection lost · Reconnecting to the server automatically.`，终端留一屏裸 SGR；抓原始字节：用 PTY 跑一次（`script/tui_drive.py` 就是这条路子），把读到的 chunk **先原样落盘再喂 `pyte`**——SGR 序列只在原始字节里看得见
 
 ### 遗弃
 
-- [ ] ~~`/undo`、`/redo`、消息菜单的 Revert~~ —— Ante 协议 18 个 op（`StartSession`…`Shutdown`）没有 revert/undo/rewind，`~/Projects/ante` 全仓 grep 零命中；硬做只剩重写 `events.jsonl` 截断历史——只对以后 resume 生效、对当前会话无效、还可能被 Ante 覆写
-- [ ] ~~`/fork`~~ —— 无分叉 op
 - [ ] ~~`/share`、`/unshare`~~ —— 云端分享，Ante 无此概念（客户端自己也直接报 "Sharing is not implemented for V2 sessions yet"）
 - [ ] ~~`/mcps`、`/status`、MCP 面板~~ —— 无 MCP
 - [ ] ~~`/connect`、`/pair`~~ —— 无 provider OAuth、无设备配对（`/api/integration` 恒空）
