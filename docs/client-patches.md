@@ -18,7 +18,8 @@
   - `packages/tui/src/feature-plugins/home/footer.tsx` —— 首页**右下角的版本号**改成 `ante <后端版本> · antex <构建日期>`，取自 `/api/info`（`createResource` 拉一次；拉不到才回落到客户端自己的版本）。上游那行画的是 `app.version`＝客户端二进制的版本，既不是 Ante 的也不是 antex 的，而它又是写死在界面里的，所以同样只能改源码。**验证法**：`script/tui_drive.py --dump /tmp/x.txt` 抓首页帧（不发键就只等 `--after`），右下角出 `ante 0.2.5 · antex 2026-09-29`。
   - `packages/cli/src/services/server-connection.ts` —— `--server` 模式下**不再对垫片报版本不匹配**。垫片答的是 Ante 的版本（`0.2.5`）、还带一个 `antex` 字段，跟客户端版本永远不等；上游那行 warning 会直接打在 TUI 首行、常驻不退（截图和日常观感都被它毁掉）。判断改成「带 `antex` 字段就静默」，只有连到真 server 且版本确实不同才警告。
   - `packages/tui/src/routes/session/index.tsx` —— 待递送的消息在正文下方挂一枚**斜体 `Pending...`** 角标（`ctx.pendingDelivery(id)` 有值就是还没送到），队列 dock 的 `N queued` 改成 `N Pending... · 内容`。**判据在垫片那边**（见 [implementation.md](implementation.md)），客户端只负责画。
-  - `packages/tui/src/context/keymap.tsx` —— `useCommands()` 里加一张黑名单（按 slash 名 / 命令 id 匹配），把 Ante 做不了的命令从**命令面板与斜杠补全一次摘掉**（两处都从这份 entry 列表生成，所以只改这一处）。名单：`mcps` `connect` `status` `pair` `reload` `share` `fork` `unshare` `undo` `redo` `worktrees` `terminal` `update` `restart` `session.background`。（`rename`/`copy`/`export`/`skills` 2026-10-02 起撤出名单——垫片有真接口了。）
+  - `packages/tui/src/context/keymap.tsx` —— `useCommands()` 里加一张黑名单（按 slash 名 / 命令 id 匹配），把 Ante 做不了的命令从**命令面板与斜杠补全一次摘掉**（两处都从这份 entry 列表生成，所以只改这一处）。名单：`mcps` `status` `pair` `reload` `share` `fork` `unshare` `undo` `redo` `worktrees` `terminal` `update` `restart` `session.background`。（`rename`/`copy`/`export`/`skills` 2026-10-02 起撤出名单——垫片有真接口了；`connect` 2026-10-14 起撤出，理由见下。）
+  - `packages/tui/src/component/dialog-integration.tsx` —— `INTEGRATION_PRIORITY` 里补上 Ante 的 provider id（`openai-subscription` / `anthropic-subscription` / `antix`）。上游那张表只认它自己的 id，于是「Popular」被 API key 那些占满，**真正要登录的两项（ChatGPT、Antix）被压到「Services」里按字母排序**；补完就在最上面。只动这张表一行，不改逻辑。
   - `packages/client/src/solid/data.ts`（两处，见 [implementation.md](implementation.md) 的「记录回读」）—— ① `message.sync` 不再把「这次 read 没提到的行」删掉，保留后**按 `time.created` 插回原位**（`mergeHeldRows`：一律追加到末尾会把还没被 Ante 读走的那条挂在模型后续步骤**下面**，看着像顺序错）；垫片那份 transcript 来自 Ante 的日志，客户端自己从事件折出来的行（idle / compaction / 切换 / 正在流的那一步 / 待递送的 prompt）不在里面，原先的 reconcile 一读就抹。② `editText` 在没有 text part 时补建一个空 part，使重读忽然插进「一句话正流到一半」时后续 delta 仍有处可落（否则那一步的回答永远不显示）。
   - `packages/tui/src/feature-plugins/sidebar/footer.tsx` —— 侧栏那张 `Getting started / Connect provider` 卡片不再渲染：它读 `/api/integration`（垫片空），点「Connect provider」进的是空对话框，纯死路（同文件里那个工作目录行是好的，留着）
 - 编出来的客户端装在 `~/.local/bin/antex-tui`，**`antex` 默认就用它**（源码模式启动不慢，且底部没有 dev 模式的 `✓ Server ○ UI…` 那行）。
@@ -27,7 +28,9 @@
 
 ## 屏蔽做不了的入口
 
-Ante 没有 VCS/diff、MCP、revert、分享、PTY、provider OAuth。垫片对这些一律答 **200 + 空**（落进通用 fallback 也是 200），**不报错**——所以它们的坏法是「点了没反应」或空面板，不是弹错误框。这类入口分四层摘：
+Ante 没有 VCS/diff、MCP、revert、分享、PTY。垫片对这些一律答 **200 + 空**（落进通用 fallback 也是 200），**不报错**——所以它们的坏法是「点了没反应」或空面板，不是弹错误框。这类入口分四层摘：
+
+**`/connect` 不在其列**（2026-10-14 起）：垫片接了 integration 接口与供应商登录，命令从黑名单里撤掉了。**唯一还挂在「Ante 没有」上的登录**是 Anthropic 订阅——它的按钮照样在，点了会明确报「还没实现」，不是静默。
 
 | 层 | 怎么摘 | 覆盖 |
 | --- | --- | --- |
@@ -55,7 +58,7 @@ Ante 没有 VCS/diff、MCP、revert、分享、PTY、provider OAuth。垫片对�
 
 **不摘的**：`/cd`、`/editor`、`/timeline`、`/variants`、`/themes`、`/settings`、`/debug`、`/open`、`/sessions`——要么纯客户端、要么垫片答得出真数据；`/cd` 现在会明确报「Ante 没有换目录接口」而不是静默。
 
-**验收**：进 TUI 敲 `/un`、`/for`、`/mcps`、`/up` 应全是 `No matching commands`；`/` 列表里不该出现 `undo` `redo` `share` `unshare` `fork` `worktrees` `terminal` `update`（这些走客户端补丁的黑名单，与配置文件无关）。**靠 `cli.json` 那两层摘的**（`/di`、`/pl`、`/btw`）同样不该出现，只是它们不在补丁黑名单里——文件里那批 `-opencode.*` 一旦丢了就回到面板，见上一节的 ⚠。**已转正**（2026-10-02）：`/rename`、`/copy`、`/export`、`/stats`、`/skills` 四处屏蔽都撤了，`/` 列表里**应该**能看到它们，点进去有真效果（见 [implementation.md](implementation.md) 那五条）。
+**验收**：进 TUI 敲 `/un`、`/for`、`/mcps`、`/up` 应全是 `No matching commands`；`/` 列表里不该出现 `undo` `redo` `share` `unshare` `fork` `worktrees` `terminal` `update`（这些走客户端补丁的黑名单，与配置文件无关）。**靠 `cli.json` 那两层摘的**（`/di`、`/pl`、`/btw`）同样不该出现，只是它们不在补丁黑名单里——文件里那批 `-opencode.*` 一旦丢了就回到面板，见上一节的 ⚠。**已转正**（2026-10-02）：`/rename`、`/copy`、`/export`、`/stats`、`/skills` 四处屏蔽都撤了，`/` 列表里**应该**能看到它们，点进去有真效果（见 [implementation.md](implementation.md) 那五条）。**`/connect` 同日转正**（2026-10-14）：`/` 列表里能看到，选中后应弹出 `Connect an integration`，`Popular` 里第一屏就是 `OpenAI Subscription` / `Antix OAuth`，已连着凭证的行带 `✓`（env key 显示 `$NAME`，`auth/api_keys.json` 里的另算一条）。**PTY 验收法**：`uv run --with pyte script/tui_drive.py --cmd "./target/release/antex" --send '7:/connect' --send '9:\r' --after 5`（第一次回车是提交斜杠命令、第二次才是选中 integration）。
 
 ## 客户端现状（本机）
 

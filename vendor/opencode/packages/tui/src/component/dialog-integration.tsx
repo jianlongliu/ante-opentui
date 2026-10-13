@@ -37,13 +37,19 @@ import {
   type FormAnswerField,
 } from "../util/form"
 
+// antex patch: Ante's own provider ids lead the list too, so the two sign-ins
+// Ante supports by name — the ChatGPT subscription and Antix — are not buried
+// under "Services" while the API-key entries take all of "Popular".
 const INTEGRATION_PRIORITY: Record<string, number> = {
   "opencode-go": 0,
   opencode: 1,
   openai: 2,
-  "github-copilot": 3,
-  anthropic: 4,
-  google: 5,
+  "openai-subscription": 3,
+  "github-copilot": 4,
+  anthropic: 5,
+  "anthropic-subscription": 6,
+  antix: 7,
+  google: 8,
 }
 
 type ConnectMethod = Exclude<IntegrationInfo["methods"][number], { type: "env" }>

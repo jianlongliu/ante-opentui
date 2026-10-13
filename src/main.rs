@@ -37,6 +37,8 @@ use tokio::sync::broadcast;
 
 /// Pasted images: opencode's inline `data:` URL → Ante's `@path` mention.
 mod attachments;
+/// `/connect`: Ante's provider sign-in, served as opencode integrations.
+mod integrations;
 
 /// Where the shim settles a request when the client does not say. The client
 /// normally passes `location[directory]` on every call, so this is only a
@@ -82,15 +84,10 @@ fn ante_home() -> std::path::PathBuf {
 }
 
 /// Ante's catalog is the source of truth for what can actually be run, so the
-/// picker is fed from it: every provider and model configured in Ante shows up,
-/// instead of the one the shim used to hard-code.
-fn catalog() -> Value {
-    std::fs::read_to_string(ante_home().join("catalog.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .unwrap_or_else(|| json!({ "providers": {} }))
-}
-
+/// picker is fed from it: every provider Ante can *reach* (see
+/// [`integrations::connected_providers`]) shows up, instead of the one the shim
+/// used to hard-code. The user's own `catalog.json` is only part of that list —
+/// the built-ins, and anything `/connect` signs into, live in the merge.
 fn settings() -> Value {
     std::fs::read_to_string(ante_home().join("settings.json"))
         .ok()
@@ -118,16 +115,16 @@ fn active_model() -> (String, String) {
     (provider, model)
 }
 
-fn catalog_models() -> Vec<Value> {
-    let catalog = catalog();
-    let Some(providers) = catalog.get("providers").and_then(|v| v.as_object()) else {
-        return Vec::new();
-    };
+async fn catalog_models() -> Vec<Value> {
     let (active_provider, active_model) = active_model();
-    let mut out = Vec::new();
-    let mut providers: Vec<(&String, &Value)> = providers.iter().collect();
+    let mut providers: Vec<(String, Value)> = integrations::connected_providers()
+        .await
+        .into_iter()
+        .filter_map(|spec| Some((spec.get("id")?.as_str()?.to_string(), spec)))
+        .collect();
     // Active provider's models lead, and the active model leads among them.
-    providers.sort_by_key(|(id, _)| if **id == active_provider { 0 } else { 1 });
+    providers.sort_by_key(|(id, _)| if id == &active_provider { 0 } else { 1 });
+    let mut out = Vec::new();
     for (provider, spec) in providers {
         let Some(models) = spec.get("preferred_models").and_then(|v| v.as_array()) else {
             continue;
@@ -143,7 +140,7 @@ fn catalog_models() -> Vec<Value> {
                 "id": id,
                 "modelID": id,
                 "providerID": provider,
-                "preferred": provider == &active_provider && id == active_model,
+                "preferred": provider == active_provider && id == active_model,
                 "name": name,
                 "capabilities": {},
                 "variants": [],
@@ -164,21 +161,21 @@ fn catalog_models() -> Vec<Value> {
     out
 }
 
-fn catalog_providers() -> Vec<Value> {
-    let catalog = catalog();
-    let Some(providers) = catalog.get("providers").and_then(|v| v.as_object()) else {
-        return Vec::new();
-    };
+async fn catalog_providers() -> Vec<Value> {
     let (active_provider, _) = active_model();
-    let mut providers: Vec<(&String, &Value)> = providers.iter().collect();
-    providers.sort_by_key(|(id, _)| if **id == active_provider { 0 } else { 1 });
+    let mut providers: Vec<(String, Value)> = integrations::connected_providers()
+        .await
+        .into_iter()
+        .filter_map(|spec| Some((spec.get("id")?.as_str()?.to_string(), spec)))
+        .collect();
+    providers.sort_by_key(|(id, _)| if id == &active_provider { 0 } else { 1 });
     providers
         .into_iter()
         .map(|(id, spec)| {
             let name = spec
                 .get("display_name")
                 .and_then(|v| v.as_str())
-                .unwrap_or(id)
+                .unwrap_or(&id)
                 .to_string();
             json!({ "id": id, "name": name, "activation": "auto", "package": id })
         })
@@ -3013,7 +3010,7 @@ async fn agents() -> Json<Value> {
 }
 
 async fn models() -> Json<Value> {
-    let mut list = catalog_models();
+    let mut list = catalog_models().await;
     if list.is_empty() {
         // No readable catalog: still show the model Ante is actually on.
         let (provider, model) = active_model();
@@ -3042,7 +3039,7 @@ async fn config_providers() -> Json<Value> {
 }
 
 async fn providers() -> Json<Value> {
-    let mut list = catalog_providers();
+    let mut list = catalog_providers().await;
     if list.is_empty() {
         let provider = env_or("ANTEX_PROVIDER", PROVIDER);
         list.push(json!({
@@ -4490,7 +4487,24 @@ async fn main() {
         .route("/api/form", get(empty_reads))
         .route("/api/shell", get(empty_reads).post(empty_reads))
         .route("/api/reference", get(empty_reads))
-        .route("/api/integration", get(empty_reads))
+        .route("/api/integration", get(integrations::list))
+        .route("/api/integration/{id}", get(integrations::get))
+        .route("/api/integration/{id}/connect/key", post(integrations::connect_key))
+        .route("/api/integration/{id}/connect/oauth", post(integrations::connect_oauth))
+        .route(
+            "/api/integration/{id}/connect/oauth/{attempt}",
+            get(integrations::oauth_status).delete(integrations::oauth_cancel),
+        )
+        .route(
+            "/api/integration/{id}/connect/oauth/{attempt}/complete",
+            post(integrations::oauth_complete),
+        )
+        .route("/api/credential", get(integrations::credentials))
+        .route(
+            "/api/credential/{id}",
+            patch(integrations::credential_update).delete(integrations::credential_delete),
+        )
+        .route("/api/credential/{id}/activate", post(integrations::credential_activate))
         .route("/api/project", get(bare_empty_array))
         .route("/api/mcp/resource", get(mcp_resources_empty))
         .route("/api/vcs/base", get(vcs_base_empty))

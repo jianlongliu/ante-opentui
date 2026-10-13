@@ -27,6 +27,8 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 - [x] `/skills` —— 优先用 Ante 播报的技能清单（那是真能调用的集合，含项目域与 `no_skills`），首轮提示词之前才退到磁盘扫描
 - [x] 多标签**临时**关掉（`tabs.mode = "off"`，只是个配置项，不是能力）—— 它要服务端同时驱动多条会话，垫片只有一条连接；真做多标签见「待定」那条
 - [x] 做不了的入口从界面摘掉 —— 插件 / 键位 / 命令黑名单 / 侧栏卡片四层，见 [docs/client-patches.md](docs/client-patches.md) 的「屏蔽做不了的入口」
+- [x] `/connect` —— **Ante 的供应商登录**：`/api/integration` 由 `ante catalog` 的合并目录生成（每个带 `env_key` / `oauth_preset` 的 provider 就是一条 integration），`connect/key` 写进 `auth/api_keys.json`，`connect/oauth` 分三种：**ChatGPT 由垫片自己跑 Codex OAuth**（client id / 回调 / `codex_cli_simplified_flow` 全部取自 Ante 二进制），**Antix 交给 `ante auth login antix`**，其余（Anthropic 订阅）明确报「还没实现」。凭证落 `~/.ante/auth/`，格式与 Ante 自己写的逐字一致；`/api/credential` 的列表/删除也接上了。细节与验证法见 [docs/implementation.md](docs/implementation.md)
+- [x] 模型/供应商列表按「连得上的」喂 —— `/api/model`、`/api/provider` 读 `ante catalog` 的**合并目录**再筛掉没凭证的（Ante 自己的 `/providers` 就是这个口径），所以 `/connect` 签完 ChatGPT 就能在 `/models` 里选到它
 - [x] 断线重连，且掉线期间排队的消息不丢 —— 退避重连 + `health` 说真话 + 转录里一行说明；**回合没跑完就被杀掉的会话（盘上只有 `events.jsonl`）Ante 打不开**，这种会话会新开一条继续，见 [docs/implementation.md](docs/implementation.md) 那条
 
 ### 待定
@@ -41,7 +43,7 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 
 - [ ] ~~`/share`、`/unshare`~~ —— 云端分享，Ante 无此概念（客户端自己也直接报 "Sharing is not implemented for V2 sessions yet"）
 - [ ] ~~`/mcps`、`/status`、MCP 面板~~ —— 无 MCP
-- [ ] ~~`/connect`、`/pair`~~ —— 无 provider OAuth、无设备配对（`/api/integration` 恒空）
+- [ ] ~~`/pair`~~ —— 无设备配对（Ante 没有 pairing，`/api/pair` 只答空）。**`/connect` 已转正**，见「已实现」
 - [ ] ~~`/diff`、`/worktrees`~~ —— 无 diff / VCS / worktree 概念（`/api/vcs/*` 只能答空；`/api/vcs` 因此答**空分支** `{branch:{}}`，位置标签才不会挂上假 `:main`）
 - [ ] ~~`/terminal`、Terminals 面板、`!` shell 模式~~ —— 无 PTY、无 shell 会话 op（Bash 是工具调用，不是终端）
 - [ ] ~~`/plugins`、`/btw`~~ —— 无 opencode 插件系统；`/btw` 要的是「旁问」的独立 generate op
@@ -75,7 +77,7 @@ Ante（**你自己装的**：官方脚本装、`ante update` 升级）
 ## 为什么走这条路
 
 手写复刻 opencode 的 TUI 到不了它的完成度（它有 17k 行的界面层）。反过来做，垫片是**可丢弃**的一层：
-上游界面升级时，重新拉 TUI 即可，只需跟着修垫片。代价是 Ante 没有的概念（LSP、MCP、formatter、OAuth、git 操作）必须打桩。
+上游界面升级时，重新拉 TUI 即可，只需跟着修垫片。代价是 Ante 没有的概念（LSP、MCP、formatter、git 操作）必须打桩——`/connect` 不再打桩了：Ante 的供应商登录被翻译成 opencode 的 integration 接口（见「已实现」）。
 思路同「改接口，不改消费者」（参照 `onarchi`——把 Omarchy 真移植到 niri 的那个仓，原名 omarchy-on-niri）。
 
 几条定下来的选择：

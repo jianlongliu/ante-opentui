@@ -53,6 +53,10 @@ session.step.started → session.text.started → session.text.delta ×N → ses
 | 提问只有 `→ Asked 1 question` 那一格，**选项列表永远不出现** | `form.created` 落在客户端 store 的**第二段 switch** 里，而它的开头是 `if (!event.location) return`——垫片所有事件都不带 `location`，于是事件被静默丢掉（`GET …/form` 却有数据，只按 curl 验会误判成「垫片没问题」）。**已修**（三条 form 事件走 `publish_located()`，form 对象也自带一份；见 `.4`） |
 | 长回答越流越卡、正文行「定位不到」却**不报错** | `ordinal` 不是 delta 序号，而是**同类型 part 在消息里的第几个**：客户端 `rows.ts` 用 `text:{ordinal}`/`reasoning:{ordinal}` 当 part 键，`resolvePart` 取 `content.filter(type)[ordinal]`，而 `appendPart` 对每个没见过的键都会**插一行**。垫片从前按 delta 递增 → 每个 token 建一行、再解析成空；现在每个 part 一个恒定序号 |
 | `/sessions` 第二次打开只显示 **Could not load sessions.** | 会话选择器按「当前会话的 `location.directory`」先 `location.sync`，再拿该目录的 project 去过滤。垫片从前把 Ante `meta.dir`（会话真实目录）当 location 报出去，可 `/api/location` 只会答 `default_directory()` → 客户端永远解析不到那个目录、整个列表报错。**规则**：垫片只有一个 `prj_shim`（家目录），所有会话 info 的 location 都必须用它 |
+| 登录签完，`/models` 里**还是没有**那个供应商 | 模型/供应商列表必须读 `ante catalog` 的**合并目录**：用户的 `catalog.json` 只有自定义的那些，`openai-subscription` / `antix` 这类内置供应商只存在于合并结果里。**注意别只 `cat ~/.ante/catalog.json` 就下结论** |
+| `端口 1455 用不了` / 登录面板报回调端口占用 | ChatGPT 预设的 `redirect_uri` 是**注册死的** `http://localhost:1455/auth/callback`（同一个 client id 也给了 Codex CLI），端口不能换；Ante 自己的 `/connect` 或 Codex CLI 正在登录时会撞上 |
+| 手写的 `auth/<preset>.json` 一会儿就被 Ante 删了 | Ante 用它**预设里写死的** issuer 续签（文件里的 `token_issuer` 不参与，实测 `/tmp` 里塞假 issuer 也没人搭理），401 即 `deleting <preset> oauth credential: refresh token rejected by issuer`。**这也意味着：写进去的必须是真令牌**，编不出来 |
+| 想看清 Ante 自己怎么写凭证 | 驱动它的登录即可，不必真账号：`ANTIX_API_URL=http://127.0.0.1:<假服务器>` + `ante auth login antix --no-browser --callback-port <口>`，授权 URL、令牌请求体、落盘文件名都看得见（2026-10-14 就是这么定下 `auth/<preset>.json` 那八个字段的） |
 
 ## Herdr 集成（本机 herdr 0.9.1）
 

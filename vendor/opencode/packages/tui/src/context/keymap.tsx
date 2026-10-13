@@ -319,14 +319,14 @@ function useLeaderActive() {
 }
 
 /// antex patch: commands the Ante backend cannot serve, keyed by slash name or
-/// command id. Ante has no VCS/diff, no MCP, no revert, no share, no PTY and no
-/// provider OAuth — every one of these is silence at best (the shim answers 200
-/// with an empty body, so nothing errors) and a broken view at worst. Filtering
-/// the entry list removes them from the palette *and* slash completion at once,
-/// because both are built from it; their keybinds are switched off in `cli.json`.
+/// command id. Ante has no VCS/diff, no MCP, no revert, no share and no PTY —
+/// every one of these is silence at best (the shim answers 200 with an empty
+/// body, so nothing errors) and a broken view at worst. Filtering the entry
+/// list removes them from the palette *and* slash completion at once, because
+/// both are built from it; their keybinds are switched off in `cli.json`.
+/// `/connect` is *not* here: the shim serves the integration API and signs in.
 const ANTE_MISSING = new Set([
   "mcps",
-  "connect",
   "status",
   "pair",
   "reload",
