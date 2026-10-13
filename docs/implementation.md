@@ -106,12 +106,23 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 
 **这里只放手上的活与开放问题；功能缺口（空框）看 [README](../README.md)「状态」清单。**
 
-**`待发`：`/connect`（Ante 的供应商登录 + 模型列表改按「连得上的」喂）**
+**`2026.10.14`（待发）：`/connect` + 侧栏额度面板**
+
+**`/connect`（Ante 的供应商登录 + 模型列表改按「连得上的」喂）**
 
 - 垫片新增 `src/integrations.rs`（约 600 行）+ `main.rs` 里 11 条路由；依赖新增 `reqwest`（rustls，只为那一次令牌交换）与 `sha2`（PKCE）；客户端两处补丁（黑名单撤掉 `connect`、`INTEGRATION_PRIORITY` 补上 Ante 的 provider id 让登录项排进 Popular）。
 - **凭证格式是实测出来的，不是猜的**：把 `ANTIX_API_URL` 指到本地假 OAuth 服务器，让 `ante auth login antix` 把整套流程跑完，就看到了 Ante 自己写的 `auth/<preset>.json`——`client_id` / `token_issuer` / `token_request_encoding` / `id_token` / `access_token` / `refresh_token` / `expires_at` / `scopes` 八个字段、权限 600。文件名取**预设名**（`openai.json`，不是 `openai-subscription.json`）：往 scratch home 里分别放两个名字，`ante doctor` 认前者（4 → 5 authed）。
 - **验法（接口级，不必进 TUI）**：`antex serve PORT` 后 ① `curl …/api/integration` 看每条 integration 的 methods/connections；② `curl -X POST …/connect/key -d '{"key":"…"}'`（**务必用 `ANTE_HOME=/tmp/…` 的实例**，别往真凭证里灌测试 key）看 204 与文件权限；③ `DELETE …/api/credential/<id>` 看 `.bak` 与删后的 body；④ OAuth 全链路**用假浏览器**：起实例时把 `xdg-open` 换成一个 `exit 0` 的假脚本（`PATH=/tmp/noop:$PATH`），拿到 attempt 的 `url` 后自己 `curl` 回调口——错 state 应 404 且 attempt 仍 pending，`error=access_denied` 应 400 且失败信息就是 provider 的原文，真 state + 假 code 应 200 但状态落 `令牌交换被拒（HTTP 401 …）`，且**盘上不该出现凭证文件**。真登录只能由人点一次浏览器，见下。
 - **别拿真凭证试**：Ante 在 refresh 被拒（401）时会**删掉** `auth/<preset>.json`（日志 `deleting openai oauth credential: refresh token rejected by issuer`），所以手写的假凭证会被它自己清掉——这正是为什么测试要用 scratch home。
+
+**侧栏额度面板（`▼ Quota`）**
+
+- **为什么不装现成的 opencode 插件**：`@slkiser/opencode-quota` 这类插件的取数半边跑在 opencode 自己的 server 进程里（`opencode.jsonc` 的 `plugin: […]` 由它加载），客户端那半边只通过**服务端插件 RPC** 取数。垫片换掉了那个 server、又不跑 JS，所以插件装上去一动不动；界面只能自己给——做法是**垫片出数 + 自编客户端里一块内置插件画**（`src/quota.rs` + `tui/src/feature-plugins/sidebar/quota.tsx`，注册在 `plugin/builtins.ts`）。
+- **走 `rpc.call` 这条通路**：客户端侧栏调 `POST /api/rpc/antex.quota/panel`（`{input:{sessionID}}` → `{output:{data:{lines,active,updatedAt}}}`）。生成式 client 里只有 `rpc.call` 是「任意 id + 任意方法」，客户端补丁因此不必改生成代码，垫片也不必自造 `/api/quota`。
+- **四家取数与凭据**：`api.deepseek.com/user/balance`、`api.commandcode.ai/alpha/billing/credits`（差 M 窗口时再问 `…/alpha/billing/subscriptions`，按 `planId` 查额度表换算百分比）、`chatgpt.com/backend-api/wham/usage`（`rate_limit.primary_window` / `secondary_window`；账号 id 取 access token 的 `chatgpt_account_id`，凭证用 `/connect` 落下的 `auth/openai.json`，过期现刷、**不写回**）、`opencode.ai/zen/go/v1/usage`。凭据顺序：环境变量 → `auth/api_keys.json`。缓存按 provider：成功 5 分钟、失败 60 秒。
+- **排版按显示列，不按字符数**：面板宽 36 列（侧栏 42 宽减 4 内边距再减 1 滚动条），CJK 与全角标点算两列——按 `chars().count()` 排会让「余额」这类标签多占两列、值被切尾（本机先错的就是这个，值行还额外多算 2 列）。推进 TUI 会显示 `No quota data available` 而不是报错：那说明**垫片那份二进制没有 `/api/rpc` 路由**（老的 `/usr/bin/antex` 对未知路径回空信封），不是面板坏了。
+- **验法**：见 [README](../README.md)「已实现」那条与实现清单里的命令（`set -a; . ~/.zshenv; set +a` 后 `antex serve PORT` + `curl … /api/rpc/antex.quota/panel`；画面用 `script/tui_drive.py --send $'3:\x18l' --send $'6:\r'` 进会话看侧栏）。
+- **Go 那条现状**：`/zen/go/v1/usage` 对无 Go 订阅的 key 回 `403 EntitlementError`，面板如实显示「无有效 Go 订阅」；要看 5h/周/月窗口得走 console（`opencode.ai/console/api/go/status`），垫片认 `OPENCODE_CONSOLE_TOKEN`（+ 可选 `OPENCODE_CONSOLE_ORG_ID`）。
 
 **`2026.10.13`（已出）：跟到 Ante 0.2.11 + 上游 opencode 2.0.26**
 
