@@ -98,12 +98,12 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 
 **这里只放手上的活与开放问题；功能缺口（空框）看 [README](../README.md)「状态」清单。**
 
-**`2026.10.13`（待发）：跟到 Ante 0.2.11 + 上游 opencode 2.0.26**
+**`2026.10.13`（已出）：跟到 Ante 0.2.11 + 上游 opencode 2.0.26**
 
 - **Ante 0.2.11 / `ante-sdk` 0.2.10**：协议面按 changelog 是纯新增（`/api/credential`、`/api/pair`、`/api/integration/{id}/connect/external`、`/api/vcs/init`、`Session.Message.Idle.error`、`Error.response`），垫片**一行没改**，只把 `ante-sdk` 从 0.2.7 提到 0.2.10 重编（`^0.2.10` 仍跟着 Ante 的 0.2.x 走）。
 - **上游 opencode 2.0.18 → 2.0.26**（`git subtree pull` v2 @`4617210`）：**九处客户端补丁全部自动合上**，唯一冲突是 `packages/cli/package.json` 里 `@opencode-ai/pty` 的位置——那行「挪位」不是我们的补丁，是**构建脚本自己 `bun add` 重排**的副产品（同一现象已出现两次），解析取上游、构建后再 `git checkout --` 还原即可，别当补丁留着。依赖锁有变，拉完要 `bun install` 再 `script/build-tui.sh`。
 - **验法（PTY + pyte，`script/tui_drive.py`）**：① 首页右下角应为 `ante 0.2.11 · antex 2026-10-13`，且首行**没有**版本警告；② 一轮真对话（流式 + `Thought` + 右上 Context 计数）；③ 一次 `Bash` 工具调用的渲染与旧客户端**逐字符一致**（拿 `/usr/bin/antex-tui` 跑同一条 prompt 对照）——垫片那层映射没退化；④ 命令面板搜 `share` 仍是 `No results found`（黑名单在新客户端上照样生效）；⑤ 跑完 `tail /tmp/antex.log` 零 404。
-- **口径**：日常用的客户端现在是**仓库构建产物**（`~/.local/bin/antex-tui` → `vendor/opencode/packages/cli/dist/…/opencode`）；包里的 `/usr/bin/antex-tui` 还是 2.0.18，两者要一致得重新发版。
+- **口径**：装完包后日常用的客户端就是 `vendor/opencode/` 那份（`~/.local/bin/antex-tui` → `/usr/bin/antex-tui`，与包同步）；要单改界面才走仓库构建产物。**上游 2.0.26 与 `ante-sdk` 0.2.10 都只在包 2026.10.13 里，装完必须重开 antex**（在跑的进程仍用旧二进制）。
 
 **`2026.10.05`（已出）：启动自检按版本系列判**
 
@@ -136,7 +136,7 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 
 **发版一条线**：改 `PKGBUILD` 的 `pkgver`（日期 + 当日序号）→ 提交 → 打**同名** tag 推上去（流程见 `release-via-ci`）。
 
-**已发布**：`.6`（prompt 请求体上限 2MB → 32MB、「做不了的入口」两层钉死、附件被丢时说出来）→ `2026.10.02`（五条命令放开，见上）→ `2026.10.03`（`ante-sdk` 0.2.7；模型兜底改读 `settings.json`）→ `2026.10.03.2`（恢复会话时提问落位）→ `2026.10.05`（启动自检按版本系列判）。过去列在缺口里的中断收尾、多轮消息落位、会话列表、agent 切换、`/compact`、恢复旧会话后继续对话都已实现并实测。
+**已发布**：`.6`（prompt 请求体上限 2MB → 32MB、「做不了的入口」两层钉死、附件被丢时说出来）→ `2026.10.02`（五条命令放开，见上）→ `2026.10.03`（`ante-sdk` 0.2.7；模型兜底改读 `settings.json`）→ `2026.10.03.2`（恢复会话时提问落位）→ `2026.10.05`（启动自检按版本系列判）→ `2026.10.13`（`ante-sdk` 0.2.10、上游 opencode 2.0.26）。过去列在缺口里的中断收尾、多轮消息落位、会话列表、agent 切换、`/compact`、恢复旧会话后继续对话都已实现并实测。
 
 要接着做，就挑 [README](../README.md)「状态」清单里 **空框** 的那几条（会话内 `/cd` 的退化方案、真多标签、断线时的终端还原）；**带删除线** 的一条都别再提议——Ante 底层没有那些概念。
 
