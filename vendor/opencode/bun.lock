@@ -577,7 +577,6 @@
       "name": "@opencode/httpapi-codegen",
       "version": "2.0.26",
       "dependencies": {
-        "@opencode/schema": "workspace:*",
         "effect": "catalog:",
         "prettier": "3.6.2",
       },
