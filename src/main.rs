@@ -39,6 +39,8 @@ use tokio::sync::broadcast;
 mod attachments;
 /// `/connect`: Ante's provider sign-in, served as opencode integrations.
 mod integrations;
+/// The sidebar's quota panel: what the client asks for over `/api/rpc`.
+mod quota;
 
 /// Where the shim settles a request when the client does not say. The client
 /// normally passes `location[directory]` on every call, so this is only a
@@ -4522,6 +4524,10 @@ async fn main() {
         .route("/api/model", get(models))
         .route("/api/vcs", get(vcs))
         .route("/api/plugin", get(plugins))
+        // The sidebar's quota panel asks over the plugin RPC route: it is the one
+        // "any id, any method" door in the client's generated client, so the client
+        // patch needs no generated-code change (`src/quota.rs`).
+        .route("/api/rpc/{rpc_id}/{method}", post(quota::rpc))
         .route("/api/skill", get(skills))
         .route("/api/command", get(empty_reads))
         .route("/api/mcp", get(empty_reads))

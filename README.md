@@ -28,6 +28,7 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 - [x] 多标签**临时**关掉（`tabs.mode = "off"`，只是个配置项，不是能力）—— 它要服务端同时驱动多条会话，垫片只有一条连接；真做多标签见「待定」那条
 - [x] 做不了的入口从界面摘掉 —— 插件 / 键位 / 命令黑名单 / 侧栏卡片四层，见 [docs/client-patches.md](docs/client-patches.md) 的「屏蔽做不了的入口」
 - [x] `/connect` —— **Ante 的供应商登录**：`/api/integration` 由 `ante catalog` 的合并目录生成（每个带 `env_key` / `oauth_preset` 的 provider 就是一条 integration），`connect/key` 写进 `auth/api_keys.json`，`connect/oauth` 分三种：**ChatGPT 由垫片自己跑 Codex OAuth**（client id / 回调 / `codex_cli_simplified_flow` 全部取自 Ante 二进制），**Antix 交给 `ante auth login antix`**，其余（Anthropic 订阅）明确报「还没实现」。凭证落 `~/.ante/auth/`，格式与 Ante 自己写的逐字一致；`/api/credential` 的列表/删除也接上了。细节与验证法见 [docs/implementation.md](docs/implementation.md)
+- [x] 侧栏**额度面板**（`▼ Quota`）—— 数据由垫片自己取（`src/quota.rs`：DeepSeek 余额、Command Code 的 5h/W/M + 余额、ChatGPT 订阅窗口、OpenCode Go 用量），界面是自编客户端里的一块**内置插件**（`feature-plugins/sidebar/quota.tsx`）。**不装 opencode 插件**：插件那份的取数半边跑在 opencode 自己的 server 里，垫片不跑 JS（理由见 [docs/pitfalls.md](docs/pitfalls.md)）。取数走 `POST /api/rpc/antex.quota/panel`（生成式 client 里唯一「任意 id + 任意方法」的通路，客户端补丁因此不必改生成代码），按 provider 缓存：成功 5 分钟、失败 60 秒，每 60 秒与每个 step 结束时刷新；凭据取环境变量 → `auth/api_keys.json`，ChatGPT 用 `/connect` 落下的 `auth/openai.json`（过期现刷、不写回）
 - [x] 模型/供应商列表按「连得上的」喂 —— `/api/model`、`/api/provider` 读 `ante catalog` 的**合并目录**再筛掉没凭证的（Ante 自己的 `/providers` 就是这个口径），所以 `/connect` 签完 ChatGPT 就能在 `/models` 里选到它
 - [x] 断线重连，且掉线期间排队的消息不丢 —— 退避重连 + `health` 说真话 + 转录里一行说明；**回合没跑完就被杀掉的会话（盘上只有 `events.jsonl`）Ante 打不开**，这种会话会新开一条继续，见 [docs/implementation.md](docs/implementation.md) 那条
 
