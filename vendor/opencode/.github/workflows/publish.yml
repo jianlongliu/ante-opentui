@@ -24,6 +24,10 @@ on:
         description: "Override version (optional)"
         required: false
         type: string
+      release_notes:
+        description: "Reviewed V2 release notes for CHANGELOG.md and the Discord announcement (optional)"
+        required: false
+        type: string
 
 concurrency: ${{ github.workflow }}-${{ github.ref }}-${{ (github.ref_name == 'v2' && (inputs.version || inputs.bump) && 'release') || inputs.version || inputs.bump }}
 
@@ -344,10 +348,11 @@ jobs:
           if-no-files-found: error
 
   build-electron:
+    # Desktop packaging re-signs the bundled CLI on macOS and Windows, so it starts from the unsigned build.
     needs:
       - version
-      - sign-cli-windows
-    if: github.repository == 'anomalyco/opencode' && (github.ref_name != 'v2' || needs.version.outputs.release != '')
+      - build-cli
+    if: github.repository == 'anomalyco/opencode' && ((github.ref_name == 'v2' && needs.version.outputs.release != '') || github.ref_name == 'beta')
     continue-on-error: false
     env:
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
@@ -387,7 +392,7 @@ jobs:
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: opencode-preview-cli
+          name: opencode-preview-cli-unsigned
           path: packages/cli/dist
 
       - uses: apple-actions/import-codesign-certs@8f3fb608891dd2244cdab3d69cd68c0d37a7fe93 # v2.0.0
@@ -643,6 +648,7 @@ jobs:
         env:
           OPENCODE_VERSION: ${{ needs.version.outputs.version }}
           OPENCODE_RELEASE: ${{ needs.version.outputs.release }}
+          OPENCODE_RELEASE_NOTES: ${{ (github.ref_name == 'v2' && inputs.release_notes) || '' }}
           AUR_KEY: ${{ secrets.AUR_KEY }}
           GITHUB_TOKEN: ${{ steps.committer.outputs.token }}
           GH_REPO: ${{ needs.version.outputs.repo }}
@@ -653,3 +659,19 @@ jobs:
           OPENCODE_DESKTOP_DIST: /tmp/desktop
           CLOUDFLARE_ACCOUNT_ID: 15d29c8639fd3733b1b5486a2acfd968
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+  notify-discord-v2:
+    needs:
+      - version
+      - publish
+    if: ${{ !cancelled() && github.repository == 'anomalyco/opencode' && github.ref_name == 'v2' && needs.version.outputs.release && needs.publish.result == 'success' }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      # Unlike dev, V2 publishes a tag rather than a GitHub Release event.
+      - name: Announce V2 release in Discord
+        uses: SethCohen/github-releases-to-discord@24d166886aee4646d448c8a389ff9e1ebcab3682 # v1.20.0
+        with:
+          webhook_url: ${{ secrets.DISCORD_WEBHOOK }}
+          release_name: OpenCode V2 ${{ needs.version.outputs.tag }}
+          release_body: ${{ inputs.release_notes }}
+          release_html_url: https://github.com/${{ github.repository }}/tree/${{ needs.version.outputs.tag }}

@@ -18,6 +18,7 @@ import { SessionRunnerModel } from "@opencode/core/session/runner/model"
 import { SessionTable } from "@opencode/core/session/sql"
 import { SessionStore } from "@opencode/core/session/store"
 import { Session } from "@opencode/core/session"
+import { Location } from "@opencode/core/location"
 import { Project } from "@opencode/core/project"
 import { ProjectTable } from "@opencode/core/project/sql"
 import { App } from "@opencode/core/app"
@@ -87,7 +88,11 @@ const it = testEffect(
       SessionModelRequest.node,
       PluginHooks.node,
     ]),
-    [Bus.node.replace(Bus.configured({ persist: true })), llmClient.replace(client)],
+    [
+      Bus.node.replace(Bus.configured({ persist: true })),
+      llmClient.replace(client),
+      Location.node.replace(Location.boundNode({ directory: AbsolutePath.make("/project") })),
+    ],
   ),
 )
 
@@ -445,12 +450,14 @@ it.effect("manual compaction summarizes short context instead of no-op", () =>
     expect(requests).toHaveLength(1)
     expect(requests[0]?.promptCacheKey).toBe(parentID)
     expect(requests[0]?.http?.headers).toEqual({
-      "x-session-affinity": sessionID,
-      "X-Session-Id": sessionID,
+      "x-opencode-session-id": session.id,
+      "x-opencode-parent-session-id": parentID,
+      "x-session-affinity": parentID,
+      "X-Session-Id": parentID,
       "x-parent-session-id": parentID,
       "User-Agent": App.useragent(App.make()),
       "x-opencode-project": Project.ID.global,
-      "x-opencode-session": sessionID,
+      "x-opencode-session": parentID,
       "x-opencode-client": "opencode",
     })
     expect(requests[0]?.generation).toEqual(GenerationOptions.make({ maxTokens: 20_000 }))
