@@ -98,6 +98,13 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 
 **这里只放手上的活与开放问题；功能缺口（空框）看 [README](../README.md)「状态」清单。**
 
+**`2026.10.13`（待发）：跟到 Ante 0.2.11 + 上游 opencode 2.0.26**
+
+- **Ante 0.2.11 / `ante-sdk` 0.2.10**：协议面按 changelog 是纯新增（`/api/credential`、`/api/pair`、`/api/integration/{id}/connect/external`、`/api/vcs/init`、`Session.Message.Idle.error`、`Error.response`），垫片**一行没改**，只把 `ante-sdk` 从 0.2.7 提到 0.2.10 重编（`^0.2.10` 仍跟着 Ante 的 0.2.x 走）。
+- **上游 opencode 2.0.18 → 2.0.26**（`git subtree pull` v2 @`4617210`）：**九处客户端补丁全部自动合上**，唯一冲突是 `packages/cli/package.json` 里 `@opencode-ai/pty` 的位置——那行「挪位」不是我们的补丁，是**构建脚本自己 `bun add` 重排**的副产品（同一现象已出现两次），解析取上游、构建后再 `git checkout --` 还原即可，别当补丁留着。依赖锁有变，拉完要 `bun install` 再 `script/build-tui.sh`。
+- **验法（PTY + pyte，`script/tui_drive.py`）**：① 首页右下角应为 `ante 0.2.11 · antex 2026-10-13`，且首行**没有**版本警告；② 一轮真对话（流式 + `Thought` + 右上 Context 计数）；③ 一次 `Bash` 工具调用的渲染与旧客户端**逐字符一致**（拿 `/usr/bin/antex-tui` 跑同一条 prompt 对照）——垫片那层映射没退化；④ 命令面板搜 `share` 仍是 `No results found`（黑名单在新客户端上照样生效）；⑤ 跑完 `tail /tmp/antex.log` 零 404。
+- **口径**：日常用的客户端现在是**仓库构建产物**（`~/.local/bin/antex-tui` → `vendor/opencode/packages/cli/dist/…/opencode`）；包里的 `/usr/bin/antex-tui` 还是 2.0.18，两者要一致得重新发版。
+
 **`2026.10.05`（已出）：启动自检按版本系列判**
 
 - **版本对齐：判据从「版本串相等」改成「版本系列相同」**。Ante 自己的版本与它发的 `ante-sdk` 从不同步（后端 `0.2.8` 发的是 sdk `0.2.7`，协议面又是纯新增），比全等只会每次启动打一行「协议可能对不上」——说的是假话，还会把真警告淹掉。现在 `same_series()` 只比前两段（`0.2.x` 对 `0.2.x` 即通过），拿不到可解析版本号时仍按不一致处理（保守）。**验法**：`antex serve <空闲端口>`，启动首行应为 `自检：… → ante 0.2.8；antex 编译于 ante-sdk 0.2.7，同一版本系列（协议按系列走）` 而不是那段警告；`cargo test` 里 `the_self_check_tolerates_the_version_the_backend_ships` 钉死四种情形。

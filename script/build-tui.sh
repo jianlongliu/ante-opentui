@@ -39,8 +39,12 @@ set -eu
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$HOME/.local/share/mise/shims:$PATH"   # bun
-export http_proxy="${http_proxy:-http://127.0.0.1:7890}"    # 依赖安装要代理
-export https_proxy="${https_proxy:-http://127.0.0.1:7890}"
+
+# 网络：代理在路由器上（透明转发），直连即可；只有本地 mihomo 真在 7890 监听时才设代理。
+if [ -z "${http_proxy:-}" ] && [ -z "${https_proxy:-}" ] && ss -ltn 2>/dev/null | grep -q '127\.0\.0\.1:7890'; then
+  export http_proxy=http://127.0.0.1:7890
+  export https_proxy=http://127.0.0.1:7890
+fi
 
 cd "$repo/vendor/opencode/packages/cli"
 bun run script/build.ts --single --skip-web-ui

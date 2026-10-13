@@ -1,6 +1,6 @@
 # antex（项目 ante-opentui）
 
-> 最后核对：2026-10-02 · 目标客户端 opencode 2.0.18 · Rust 1.98.1
+> 最后核对：2026-10-13 · 目标客户端 opencode 2.0.26 · Rust 1.99.0
 
 把 **opencode v2 自带的 TUI** 接到 **Ante** 后端上运行。
 
@@ -91,8 +91,7 @@ Ante（**你自己装的**：官方脚本装、`ante update` 升级）
 
 ```sh
 cd ~/Projects/ante-opentui
-export http_proxy=http://127.0.0.1:7890 https_proxy=http://127.0.0.1:7890   # 编译要代理
-cargo build --release
+cargo build --release        # crates.io 走本机网络直连即可；若只在本地 mihomo（127.0.0.1:7890）里通，就先 export http_proxy/https_proxy
 ln -sfn "$PWD/target/release/antex" ~/.local/bin/antex
 ```
 
@@ -113,7 +112,7 @@ opencode2 --server http://127.0.0.1:41999     # 终端 B
 - **可以多开**：一体化模式下端口被占会**自动往后顺延**（并打印改用哪个），所以第二个、第三个 `antex` 直接跑就行。`serve` 模式相反——按你给的端口，被占就明确报错（换端口会让人连错服务）。
 - 环境变量：`ANTE_BIN` 指定 `ante` 可执行文件（默认 `$PATH`，再退到 `~/.ante/bin/ante`）；`ANTEX_CLIENT` 指定客户端（默认 `~/.local/bin/antex-tui`，再退到 `opencode2` → `opencode`）。**所以不必先 export PATH。**
 - **一体化模式下请求日志写 `/tmp/antex.log`**——写 stdout 会糊在 TUI 上；`serve` 模式仍打在 stdout。
-- **启动自检**：`antex` 起来时先核对 Ante —— 找不到 `ante` 就直接报错退出（否则 TUI 能开、消息全石沉大海）；`ante --version` 与二进制里编进去的 `ante-sdk` **不在同一版本系列**（前两段，如 `0.2.x`）才**警告**（这正是「界面在跑但没反应」最常见的成因）。**判据是系列不是全等**：Ante 自己的版本和它发的 `ante-sdk` 本来就不同步（0.2.8 发的是 sdk 0.2.7），比全等会每次启动都误报。运行期连不上、事件流断掉、消息被丢弃也都写同一处日志（`/tmp/antex.log`），不留哑谜。想看是否通过：`tail /tmp/antex.log`。
+- **启动自检**：`antex` 起来时先核对 Ante —— 找不到 `ante` 就直接报错退出（否则 TUI 能开、消息全石沉大海）；`ante --version` 与二进制里编进去的 `ante-sdk` **不在同一版本系列**（前两段，如 `0.2.x`）才**警告**（这正是「界面在跑但没反应」最常见的成因）。**判据是系列不是全等**：Ante 自己的版本和它发的 `ante-sdk` 本来就不同步（0.2.11 发的是 sdk 0.2.10），比全等会每次启动都误报。运行期连不上、事件流断掉、消息被丢弃也都写同一处日志（`/tmp/antex.log`），不留哑谜。想看是否通过：`tail /tmp/antex.log`。
 
 ## 依赖与版本
 
@@ -121,7 +120,7 @@ opencode2 --server http://127.0.0.1:41999     # 终端 B
 
 | 项 | 版本 |
 | --- | --- |
-| rustc / cargo | **1.98.1**（Arch `rust 1:1.98.1-1`） |
+| rustc / cargo | **1.99.0**（Arch `rust 1:1.99.0-1`） |
 | edition | **2024**（`let` 链语法需要，改回 2021 会编译失败） |
 
 Cargo 依赖（`Cargo.lock` 实际解析值，非 `Cargo.toml` 的约束范围）：
@@ -139,9 +138,9 @@ Cargo 依赖（`Cargo.lock` 实际解析值，非 `Cargo.toml` 的约束范围�
 
 | 项 | 说明 |
 | --- | --- |
-| 网络 | 编译时 **必须走代理**，crates.io 直连被 TLS 拦（`export http_proxy=https_proxy=http://127.0.0.1:7890`） |
-| opencode 客户端 | **2.0.18**，官方脚本装在 `~/.opencode/bin`（`opencode`/`opencode2` 均指向它） |
-| Ante | 接后端时用 **`ante-sdk` 0.2.7**——**已发布 crates.io**，直接写 `ante-sdk = "0.2.7"` 即可。本机另有 clone 在 `~/Projects/ante`（同版本），需要魔改上游时才改走 path 引用 |
+| 网络 | 本机现在**直连即可**（代理在路由器上做透明转发）。若哪天又只用本地 mihomo，再 `export http_proxy=https_proxy=http://127.0.0.1:7890`——`script/*.sh` 已改成「只有 7890 真在监听才设代理」 |
+| opencode 客户端 | **2.0.26**，来自本仓库 `vendor/opencode/`（subtree `v2`），用 `script/build-tui.sh` 自编；官方脚本那份仍装在 `~/.opencode/bin`（`opencode`/`opencode2` 指向它，**2.0.18**，只作兜底） |
+| Ante | 接后端时用 **`ante-sdk` 0.2.10**——**已发布 crates.io**，直接写 `ante-sdk = "0.2.10"` 即可（是 `^0.2.10`，跟着 Ante 的 0.2.x 走）。实测对着 Ante **0.2.11** |
 
 ## 目录
 

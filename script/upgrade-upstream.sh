@@ -11,9 +11,12 @@ set -eu
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo"
 
-# 拉上游走 GitHub；编依赖走 crates.io/bun。本机这两个都得过代理。
-export http_proxy="${http_proxy:-http://127.0.0.1:7890}"
-export https_proxy="${https_proxy:-http://127.0.0.1:7890}"
+# 网络：本机代理现在在路由器上做透明转发，直连就行。只有本地 mihomo 真在 7890 监听时才设代理
+# ——老写法无条件设 7890，代理一搬走就把本来能通的请求塞进死端口（2026-10-13 踩到）。
+if [ -z "${http_proxy:-}" ] && [ -z "${https_proxy:-}" ] && ss -ltn 2>/dev/null | grep -q '127\.0\.0\.1:7890'; then
+  export http_proxy=http://127.0.0.1:7890
+  export https_proxy=http://127.0.0.1:7890
+fi
 
 upstream="https://github.com/anomalyco/opencode"
 branch="v2"
