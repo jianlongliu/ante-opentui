@@ -124,7 +124,7 @@ opencode2 --server http://127.0.0.1:41999     # 终端 B
 | 产物 | 平台 | 装法 |
 | --- | --- | --- |
 | `antex-<版本>-1-x86_64.pkg.tar.zst` | Arch | `pkexec pacman -U <包>`（放 `/usr/bin/{antex,antex-tui,opencode2}`） |
-| `antex-<版本>-macos-arm64.tar.gz` | macOS（Apple Silicon） | 解包，把 `bin/` 里的三个文件放 `~/.local/bin`（垫片默认就在那儿找客户端），或把 `bin` 加进 `PATH` |
+| `antex-<版本>-macos-arm64.tar.gz` | macOS（Apple Silicon） | 解包，把 `bin/` 里的三个文件放 `~/.local/bin`（垫片默认就在那儿找客户端），或把 `bin` 加进 `PATH`。**本机那台 Mac mini（macOS 27 / arm64）已实测**：起得来、连得上 Ante |
 
 macOS 那份**只能在 macOS 上编**：垫片要 Apple SDK（Linux 上交叉编要自备 SDK，不划算），客户端是 bun `--single`，那个脚本只给**同平台**出产物（`item.os !== process.platform` 直接跳过，见 `vendor/opencode/packages/cli/script/build.ts`）。所以 CI 里跑在 `macos-latest`（arm64）——**不需要本机那台 Mac mini**；要验跑起来才需要一台 macOS（本机就是 Mac mini）。
 
