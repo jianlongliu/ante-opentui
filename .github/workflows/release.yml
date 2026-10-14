@@ -61,9 +61,84 @@ jobs:
             '
           ls -l build/*.pkg.tar.zst
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch-pkg
+          path: build/*.pkg.tar.zst
+          if-no-files-found: error
+
+  # macOS 只能在自己的机器上编：垫片要 Apple SDK，客户端是 bun `--single`，
+  # 那个脚本只给「同平台」出产物（`item.os !== process.platform` 直接跳过）。
+  # runner 是 arm64 的，所以产物是给 Apple Silicon 的（Mac mini 就是这种）。
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 定版本（同样以 PKGBUILD 为准，两个 job 必须同版本）
+        id: ver
+        run: |
+          pkgver=$(sed -n 's/^pkgver=//p' PKGBUILD)
+          test -n "$pkgver"
+          echo "pkgver=$pkgver" >> "$GITHUB_OUTPUT"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: 编译垫片
+        run: cargo build --release --locked
+
+      - name: 编译魔改客户端
+        run: |
+          cd vendor/opencode
+          bun install --frozen-lockfile
+          cd packages/cli
+          bun run script/build.ts --single --skip-web-ui
+
+      - name: 打包成 tar.gz
+        run: |
+          set -eu
+          ver="${{ steps.ver.outputs.pkgver }}"
+          root="dist/antex-$ver-macos-arm64"
+          mkdir -p "$root/bin"
+          cp target/release/antex "$root/bin/antex"
+          client=$(ls vendor/opencode/packages/cli/dist/cli-darwin-*/bin/opencode)
+          cp "$client" "$root/bin/antex-tui"
+          ln -s antex-tui "$root/bin/opencode2"
+          cp README.md "$root/"
+          tar -C dist -czf "dist/antex-$ver-macos-arm64.tar.gz" "antex-$ver-macos-arm64"
+          ls -l dist/*.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # 两个平台的产物一起挂上去。分开发布会在同一个 tag 上抢建 Release，所以合到这里。
+  release:
+    needs: [pkg, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 定 tag（同 PKGBUILD 的 pkgver）
+        id: ver
+        run: echo "tag=v$(sed -n 's/^pkgver=//p' PKGBUILD)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 看一眼要上传什么
+        run: find artifacts -type f | sort
+
       - name: 挂到 Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
-          files: build/*.pkg.tar.zst
+          files: |
+            artifacts/arch-pkg/*.pkg.tar.zst
+            artifacts/macos/*.tar.gz
           generate_release_notes: true

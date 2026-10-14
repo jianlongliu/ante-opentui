@@ -106,6 +106,13 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 
 **这里只放手上的活与开放问题；功能缺口（空框）看 [README](../README.md)「状态」清单。**
 
+**`2026.10.15.2`（待发）：macOS 产物**
+
+- **CI 加一个 `macos-latest` job**，出 `antex-<版本>-macos-arm64.tar.gz`（`bin/{antex,antex-tui,opencode2}` + README）；同时把「挂 Release」从 Arch 那个 job 里拆出来成第三个 job（`needs: [pkg, macos]`）——两个平台各自 `upload-artifact`，最后一个 job 统一 `softprops/action-gh-release`，免得两个 job 在同一个 tag 上抢建 Release。
+- **为什么必须跑在 macOS 上**：垫片要 Apple SDK；客户端是 bun `--single`，脚本只给同平台出产物（`build.ts` 里 `item.os !== process.platform` 就跳过）。**不需要本机那台 Mac mini**——`macos-latest` 就是 arm64。
+- **代码只有一处平台差别**：`/connect` 打开浏览器（`src/integrations.rs` 的 `browser_opener()`，macOS 用 `open`）。其余无 Linux 专属：没有 `/proc`、没有 systemd；`omarchy-osd` 那处在 macOS 上找不到可执行文件就静默跳过；herdr 上报门控在 `HERDR_ENV=1`。
+- **验法**：CI 里两个 job 都绿 + Release 上两个产物都在（`gh release view v<版本> --json assets`）；macOS 那份拿到 Mac mini 上跑 `./antex serve <口>`，`curl …/api/health` 与 `…/api/rpc/antex.quota/panel` 都要有响应（额度取数要凭据，没就显示「未取到」——那不影响「能跑」这个结论）。
+
 **`2026.10.15`（已出）：`/connect` + 侧栏额度面板**
 
 **`/connect`（Ante 的供应商登录 + 模型列表改按「连得上的」喂）**

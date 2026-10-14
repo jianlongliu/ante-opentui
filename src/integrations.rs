@@ -59,6 +59,12 @@ fn error(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({ "message": message.into() }))).into_response()
 }
 
+/// Who opens the sign-in URL: Linux has `xdg-open`, macOS has `open`. Only the
+/// browser launch differs — everything else in the flow is the same on both.
+fn browser_opener() -> &'static str {
+    if cfg!(target_os = "macos") { "open" } else { "xdg-open" }
+}
+
 // ----------------------------------------------------------------- providers --
 
 #[derive(Clone)]
@@ -529,7 +535,7 @@ async fn start_openai(attempt_id: &str) -> Result<(String, String, CancelFn), St
     let opened = url.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(400)).await;
-        let _ = tokio::process::Command::new("xdg-open").arg(&opened).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+        let _ = tokio::process::Command::new(browser_opener()).arg(&opened).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
     });
     let id = attempt_id.to_string();
     tokio::spawn(async move {

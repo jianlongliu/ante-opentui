@@ -117,6 +117,17 @@ opencode2 --server http://127.0.0.1:41999     # 终端 B
 - **一体化模式下请求日志写 `/tmp/antex.log`**——写 stdout 会糊在 TUI 上；`serve` 模式仍打在 stdout。
 - **启动自检**：`antex` 起来时先核对 Ante —— 找不到 `ante` 就直接报错退出（否则 TUI 能开、消息全石沉大海）；`ante --version` 与二进制里编进去的 `ante-sdk` **不在同一版本系列**（前两段，如 `0.2.x`）才**警告**（这正是「界面在跑但没反应」最常见的成因）。**判据是系列不是全等**：Ante 自己的版本和它发的 `ante-sdk` 本来就不同步（0.2.11 发的是 sdk 0.2.10），比全等会每次启动都误报。运行期连不上、事件流断掉、消息被丢弃也都写同一处日志（`/tmp/antex.log`），不留哑谜。想看是否通过：`tail /tmp/antex.log`。
 
+### 装包（两个平台的产物都由 CI 出）
+
+打 tag 推上去，Actions 出两个东西挂到同一个 Release：
+
+| 产物 | 平台 | 装法 |
+| --- | --- | --- |
+| `antex-<版本>-1-x86_64.pkg.tar.zst` | Arch | `pkexec pacman -U <包>`（放 `/usr/bin/{antex,antex-tui,opencode2}`） |
+| `antex-<版本>-macos-arm64.tar.gz` | macOS（Apple Silicon） | 解包，把 `bin/` 里的三个文件放 `~/.local/bin`（垫片默认就在那儿找客户端），或把 `bin` 加进 `PATH` |
+
+macOS 那份**只能在 macOS 上编**：垫片要 Apple SDK（Linux 上交叉编要自备 SDK，不划算），客户端是 bun `--single`，那个脚本只给**同平台**出产物（`item.os !== process.platform` 直接跳过，见 `vendor/opencode/packages/cli/script/build.ts`）。所以 CI 里跑在 `macos-latest`（arm64）——**不需要本机那台 Mac mini**；要验跑起来才需要一台 macOS（本机就是 Mac mini）。
+
 ## 依赖与版本
 
 工具链（本机实测，pacman 的 `rust` 包）：
