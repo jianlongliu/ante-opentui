@@ -99,12 +99,21 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 - **肉眼验收要加 `--print-logs --log-level debug`**——客户端抛异常只弹一个小 toast，正文里什么都不显示，「没反应」多半是它。
 - **TUI 自动化验收用 PTY + pyte 探针**：`script/tui_drive.py` 驱动客户端——`--send '18:文本\r'` 按**绝对秒数**发键（`\r` 提交、`\n` 换行、`\e` 转义），`--after` 是最后一次发键后再等多久，`--dump` 把最终屏文本写文件（不写就只打印；屏上空白行会被滤掉）。**本机没装 tmux**；`uv` 已装（本机那条 `shot-home.py` / `tui_drive.py` 直接 `uv run --with pyte …` 就能跑）——不想用 uv 时另起一次性 venv：`python3 -m venv /tmp/tuivenv && /tmp/tuivenv/bin/pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pyte`，再用 `/tmp/tuivenv/bin/python script/tui_drive.py …`。表单渲染、`AskUser` 作答、首页版本号都是这么验的。
 - **接口级验证不必进 TUI**：`antex serve PORT` 后直接 `curl`，逐条对着「实现清单」的验证法做。
-- **重新出首页截图**（README 顶部那张）：`uv run --with pyte script/shot-home.py --cmd "./target/release/antex 41994" --out docs/home.png`（`uv` 已装，直接跑；不用 uv 就走上条的一次性 venv：`/tmp/tuivenv/bin/python`）。它跑 PTY、用 pyte 把屏幕（含 24 位色）还原出来，再交给 ImageMagick 的 Pango 渲染；字体取 ghostty 的 `GoogleSansCode Nerd Font Mono`，底色取 `ghostty +show-config`（TUI 把页面底色留给终端，硬编码就会跟真实观感对不上）。**方块字要贴死**：`-interline-spacing` 默认 `-4`（负值收掉行缝），否则 logo 会出现横纹。**另一个坑**：pyte 的 24 位色是**不带 `#` 的裸十六进制**（`ffffff`），当成颜色名解析会全部落空、整张图退化成单色——看着像「主题没生效」，其实是解析写错了。
+- **重新出首页截图**（README 顶部那张）：`uv run --with pyte script/shot-home.py --cmd "./target/release/antex 41994" --out docs/home.png`（`uv` 已装，直接跑；不用 uv 就走上条的一次性 venv：`/tmp/tuivenv/bin/python`）。**用 `env -i … ANTE_HOME=<空目录>` 起一个干净环境**：垫片按「有凭证」筛模型列表，环境里带着 `DEEPSEEK_API_KEY` 之类就画上模型名，而这张图只该有 `Auto`（完整命令见 README 那条 caption）。它跑 PTY、用 pyte 把屏幕（含 24 位色）还原出来，再交给 ImageMagick 的 Pango 渲染；字体取 ghostty 的 `GoogleSansCode Nerd Font Mono`，底色取 `ghostty +show-config`（TUI 把页面底色留给终端，硬编码就会跟真实观感对不上）。**方块字要贴死**：`-interline-spacing` 默认 `-4`（负值收掉行缝），否则 logo 会出现横纹。**另一个坑**：pyte 的 24 位色是**不带 `#` 的裸十六进制**（`ffffff`），当成颜色名解析会全部落空、整张图退化成单色——看着像「主题没生效」，其实是解析写错了。
 - 垫片自己的开关：`ANTE_SHIM_TRACE=<文件>`（记 Ante 事件全文 + 垫片发布的事件）、`SHIM_PERMISSION_MODE=strict|auto|yolo`、`SHIM_SKIP_EVENTS=`、`SHIM_TOOL_EVENTS=`。
 
 ## 下一步
 
 **这里只放手上的活与开放问题；功能缺口（空框）看 [README](../README.md)「状态」清单。**
+
+**上游同步（2026-10-15，本机未出包）：opencode 2.0.26 → 2.0.29**
+
+- **上游换线了**：我们原先跟的 `v2` 分支最后提交是 **2026-10-10**、版本停在 2.0.26；上游把 v2 线并回了默认分支（`dev`），之后按 `v2.0.x` 打 tag。这次 `git subtree pull` 拉的是 **tag `v2.0.29`**（`@042d0832`，含我们那份 `4617210`）。`script/upgrade-upstream.sh` 的 ref 因此从写死的 `v2` 改成**第一个参数、默认 `dev`**（想跟着某个已发布版本就传 tag），并顺带把「按 lock 装依赖」补成脚本里的一步（`bun install --frozen-lockfile`，上游 lock 常跟着变）。
+- **协议面等于零改动**：两份 `openapi.json` 逐操作对比（**142 个操作，无增无删**），唯一差异是 `GET /api/project` 多了一个可选 `archived` 查询参数——垫片对它答空数组、不理会筛选，所以**垫片一行没改**，也不必重编。
+- **补丁全部自动合上、零冲突**：清单里 12 处标志串逐条 grep 全在；唯一被两边同时碰到的是 `packages/client/src/solid/data.ts`（我们的「记录回读」两处 vs 上游新加的 `solid-data.test.ts`），diff 不重叠。（上一轮 2.0.13→2.0.26 冲突的是 `packages/cli/package.json` 里被构建脚本重排的 `@opencode-ai/pty`，这次没有。）
+- **上游 2.0.28 新增的「更新后弹 release highlights」在垫片这里不触发**：`/highlights` 命令只在 `app.highlights` 非空（只嵌进正式发布构建）且版本是纯 `x.y.z` 时注册，我们这份是 dev 构建 ⇒ 既不弹窗、命令也不出现在面板里，**不必进黑名单**。
+- **验收（PTY + pyte，`script/tui_drive.py`）**：① 首页 logo 与右下 `ante 0.2.11 · antex 2026-10-14`，首行无版本警告；② `/sessions` 列表正常，打开一条历史会话后整份转录按时间重建（走 `data.ts` 那处补丁）；③ 侧栏 `▼ Quota` 四家照常出数（DeepSeek 余额 / Command Code 5h·W·M / ChatGPT 未登录 / Go 无订阅）；④ 一轮真对话：投递 → 流式回复 → 右上 Context 计数 → 底部模型行都对。
+- **本机口径**：这次没出包，所以 `~/.local/bin/antex-tui` 指向**仓库构建产物**（开发态），`/usr/bin/antex-tui` 仍是包里那份 2.0.26。要回到「与包同步」就出包（抬 `PKGBUILD` 的 pkgver → tag → CI）。**在跑的 antex 进程不换客户端，重启才生效。**
 
 **`2026.10.15.2`（已出）：macOS 产物**
 

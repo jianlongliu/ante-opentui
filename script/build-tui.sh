@@ -34,7 +34,8 @@
 #                                                              —— --server 模式不再对垫片报版本不匹配
 #                                                                 （垫片答的是 Ante 版本，那行 warning 会常驻首行）
 #
-# 上游更新（git subtree pull ... v2）之后跑一次这个脚本，然后 antex 用的就是新的。
+# 上游更新（git subtree pull ... <ref>，如 `dev` 或某个 `v2.0.x` tag）之后跑一次这个脚本，
+# 然后 antex 用的就是新的。依赖 lock 有变时先 `bun install --frozen-lockfile`（upgrade-upstream.sh 会做）。
 set -eu
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"

@@ -8,16 +8,22 @@
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Arch%20%7C%20macOS-4b5563)](#装包ci-产物)
 [![rustc](https://img.shields.io/badge/rustc-1.99%20%C2%B7%20edition%202024-dea584)](#依赖与版本)
-[![client](https://img.shields.io/badge/opencode-v2%20%2F%202.0.26-111827)](#依赖与版本)
+[![client](https://img.shields.io/badge/opencode-v2%20%2F%202.0.29-111827)](#依赖与版本)
 
 ![antex 首页](docs/home.png)
 
 > 上图是自编客户端的默认界面：顶栏 Ante 面具 + `ANTEX`，composer 下是权限模式，右下角 `ante <后端版本> · antex <构建日期>`。
-> 这张图由 `script/shot-home.py` 生成（PTY + pyte 抓屏 → Pango 渲染）：
-> `ANTE_HOME=<空目录> ANTEX_MODEL= ANTEX_PROVIDER= uv run --with pyte script/shot-home.py --out docs/home.png`。
-> 截图里刻意只留 `Auto`，不带任何模型 / 供应商名——模型名是本机 catalog 的事，不该进仓库。
+> 这张图由 `script/shot-home.py` 生成（PTY + pyte 抓屏 → Pango 渲染）。**必须在干净环境里跑**：
+> 垫片的模型列表按「有凭证」筛，环境里带着 `DEEPSEEK_API_KEY` 之类的 key 时 composer 就会挂上模型名，
+> 而截图里刻意只留 `Auto`——模型名是本机 catalog 的事，不该进仓库。
+>
+> ```sh
+> rm -rf /tmp/emptyhome && mkdir -p /tmp/emptyhome
+> env -i HOME="$HOME" PATH="$PATH" TERM=xterm-256color LANG=C.UTF-8 ANTE_HOME=/tmp/emptyhome \
+>   ANTEX_MODEL= ANTEX_PROVIDER= uv run --with pyte script/shot-home.py --cmd "$HOME/.local/bin/antex 41994" --out docs/home.png
+> ```
 
-> 最后核对：2026-10-15 · 目标客户端 opencode 2.0.26 · Rust 1.99.0
+> 最后核对：2026-10-15 · 目标客户端 opencode 2.0.29 · Rust 1.99.0
 
 ---
 
@@ -147,7 +153,7 @@ macOS 那份**只能在 macOS 上编**：垫片要 Apple SDK（Linux 上交叉�
 几条定下来的选择：
 
 - **Rust 写垫片**：它是长驻进程，要稳、要单文件产物。
-- **上游进同一个仓**（`vendor/opencode/`，git subtree，分支 `v2`）：升级即拉上游，本质就是打补丁。
+- **上游进同一个仓**（`vendor/opencode/`，git subtree，跟上游主线走）：升级即拉上游，本质就是打补丁。
 - **只做垫片、不 fork 界面**：日常使用不必依赖自建前端（源码模式要 3.1G `node_modules`），**只有要改界面本身才必须 fork**。
 - **映射原则**：Ante 真有对应概念的才做成真差别（`shift+tab`→权限模式、模型选择→provider/model）；没有的（LSP/formatter/VCS）打桩显示为空，不假装。
 
@@ -217,7 +223,8 @@ Cargo 依赖（`Cargo.lock` 实际解析值，非 `Cargo.toml` 的约束范围�
 | 项 | 说明 |
 | --- | --- |
 | 网络 | 本机现在**直连即可**（代理在路由器上做透明转发）。若哪天又只用本地 mihomo，再 `export http_proxy=https_proxy=http://127.0.0.1:7890`——`script/*.sh` 已改成「只有 7890 真在监听才设代理」 |
-| opencode 客户端 | **2.0.26**，来自本仓库 `vendor/opencode/`（subtree `v2`），用 `script/build-tui.sh` 自编；官方脚本那份仍装在 `~/.opencode/bin`（`opencode`/`opencode2` 指向它，**2.0.18**，只作兜底） |
+| opencode 客户端 | **2.0.29**，来自本仓库 `vendor/opencode/`（subtree 上游 tag `v2.0.29`），用 `script/build-tui.sh` 自编；官方脚本那份仍装在 `~/.opencode/bin`（`opencode`/`opencode2` 指向它，**2.0.18**，只作兜底） |
+| 跟上游的口子 | `./script/upgrade-upstream.sh [ref]`——默认跟上游**主线**（默认分支 `dev`），也可传 tag（如 `v2.0.29`）。**原先跟的 `v2` 分支 2026-10-10 停更了**（版本停在 2.0.26），别再拿它当上游 |
 | Ante | 接后端时用 **`ante-sdk` 0.2.10**——**已发布 crates.io**，直接写 `ante-sdk = "0.2.10"` 即可（是 `^0.2.10`，跟着 Ante 的 0.2.x 走）。实测对着 Ante **0.2.11** |
 
 ## 目录结构
@@ -227,7 +234,7 @@ docs/                本 README 的细节分册（见下「细节去哪了」）
 src/                 垫片本体：路由、信封、SSE、会话/消息存储
 build.rs             把编译用的 ante-sdk 版本写进二进制（启动自检要用）
 script/              build-tui.sh（重建客户端）、upgrade-upstream.sh（拉上游 + 重建，一条命令）、shot-home.py（把首页渲染成 PNG，README 那张图就是它出的）、tui_drive.py（在 PTY 里驱动客户端：按秒发键 + 抓最终屏文本，验收自动化探针）
-vendor/opencode/     上游 opencode（subtree，v2 分支）——魔改对象
+vendor/opencode/     上游 opencode（subtree，跟主线）——魔改对象
 Cargo.toml           axum + tokio + serde
 ```
 

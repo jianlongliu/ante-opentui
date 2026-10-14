@@ -76,7 +76,7 @@ Ante 没有 VCS/diff、MCP、revert、分享、PTY。垫片对这些一律答 **
 
 ## 魔改上游 TUI
 
-上游 opencode 以 **git subtree** 放在 `vendor/opencode/`（分支 `v2`，约 7.8k 文件）。
+上游 opencode 以 **git subtree** 放在 `vendor/opencode/`（跟上游主线，约 7.8k 文件）。**别再跟 `v2` 分支**：它 2026-10-10 就停更了（版本停在 2.0.26），上游把 v2 线并回了默认分支 `dev`、之后按 `v2.0.x` 打 tag。
 
 ```sh
 ### 改完跑起来（入口在 packages/cli）
@@ -94,17 +94,17 @@ bun run dev -- --server http://127.0.0.1:41999
 **跟上游的例行步骤**（上游源码在仓库里，就等于有了契约测试）：
 
 ```sh
-./script/upgrade-upstream.sh             # 一条命令：拉 v2 子树 + 重建客户端
+./script/upgrade-upstream.sh             # 一条命令：拉上游子树 + 装依赖 + 重建客户端
 cargo build --release                    # 垫片（源码有改动才需要）
 ./target/release/antex serve 41999 &
 cd vendor/opencode && bun run dev -- --server http://127.0.0.1:41999
 ```
 
-`script/upgrade-upstream.sh` 干的就是下面两件事，只是省得你记得第二步（忘了它的症状是「上游明明更新了、界面还是旧的」）：
+`script/upgrade-upstream.sh [ref]` 干的就是下面三件事，只是省得你记得后两步（忘了中间那步的症状是「构建缺包」，忘了最后一步是「上游明明更新了、界面还是旧的」）。`ref` 默认 `dev`（上游默认分支），也可以给 tag：
 
 ```sh
-git subtree pull --prefix=vendor/opencode https://github.com/anomalyco/opencode v2 --squash
-cd vendor/opencode && bun install        # 依赖有变时才需要
+git subtree pull --prefix=vendor/opencode https://github.com/anomalyco/opencode dev --squash
+cd vendor/opencode && bun install --frozen-lockfile
 cd - && ./script/build-tui.sh
 ```
 
