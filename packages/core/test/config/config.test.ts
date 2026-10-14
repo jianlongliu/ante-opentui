@@ -3,6 +3,7 @@ import fs from "fs/promises"
 import { describe, expect, test } from "bun:test"
 import { Arbitrary, Effect, Fiber, Layer, Logger, Schema, Stream } from "effect"
 import { Config } from "@opencode/core/config"
+import { ConfigDiscovery } from "@opencode/core/config/discovery"
 import { Directory, Document, type Entry, Event, Info } from "@opencode/schema/config"
 import { ConfigModel } from "@opencode/schema/config/model"
 import { ConfigProvider } from "@opencode/schema/config/provider"
@@ -22,6 +23,7 @@ import { Provider } from "@opencode/core/provider"
 import { AbsolutePath } from "@opencode/core/schema"
 import { WellKnown } from "@opencode/core/wellknown"
 import { KV } from "@opencode/core/kv"
+import { ManagedPolicy } from "@opencode/core/managed-policy"
 import { Integration } from "@opencode/schema/integration"
 import { emptyCredentialNode, emptyWellknownNode } from "../fixture/config-nodes"
 import { location } from "../fixture/location"
@@ -64,7 +66,7 @@ function testLayer(
     ),
   )
   const built = AppNodeBuilder.build(LayerNode.group([Config.node, Bus.node]), [
-    Config.node.replace(Config.configured(options)),
+    Config.node.replace(Config.configured({ system: false, ...options })),
     Location.node.replace(locationLayer),
     Global.node.replace(Global.layerWith({ config: globalDirectory, home: path.join(globalDirectory, "home") })),
     Credential.node.replace(credentialNode),
@@ -75,6 +77,8 @@ function testLayer(
   // memoized instance the built graph uses.
   return Layer.mergeAll(built, watcher)
 }
+
+const tool = (effect: "allow" | "deny") => ({ action: "tool.use", resource: "shell:*", effect })
 
 const provider = {
   package: "native",
@@ -200,6 +204,108 @@ describe("Config", () => {
       }),
     ),
   )
+
+  it.live("loads system configuration at highest priority", () =>
+    Effect.acquireDisposable(Effect.promise(() => tmpdir())).pipe(
+      Effect.flatMap((tmp) => {
+        const system = path.join(tmp.path, "system")
+        const global = path.join(tmp.path, "global")
+        const project = path.join(tmp.path, "project")
+        return Effect.promise(async () => {
+          await fs.mkdir(system, { recursive: true })
+          await fs.mkdir(global, { recursive: true })
+          await fs.mkdir(project, { recursive: true })
+          await fs.writeFile(
+            path.join(system, "opencode.json"),
+            JSON.stringify({ shell: "system", username: "system-user", experimental: { policies: [tool("deny")] } }),
+          )
+          await fs.writeFile(path.join(global, "opencode.json"), JSON.stringify({ shell: "global" }))
+          await fs.writeFile(
+            path.join(project, "opencode.json"),
+            JSON.stringify({ shell: "project", experimental: { policies: [tool("allow")] } }),
+          )
+        }).pipe(
+          Effect.andThen(
+            Effect.gen(function* () {
+              const config = yield* Config.Service
+              const entries = yield* config.entries()
+              expect(
+                entries.flatMap((entry) => (entry.type === "document" && entry.info.shell ? [entry.info.shell] : [])),
+              ).toEqual(["global", "project", "system"])
+              expect(entries.flatMap((entry) => (entry.type === "directory" ? [entry.path] : []))).toEqual([
+                AbsolutePath.make(global),
+                AbsolutePath.make(system),
+              ])
+              expect(Config.latest(entries, "shell")).toBe("system")
+              expect(Config.latest(entries, "username")).toBe("system-user")
+              expect(
+                ManagedPolicy.decision(ManagedPolicy.statements(entries, { statements: [] }), "tool.use", "shell:ls"),
+              ).toBe("deny")
+            }).pipe(
+              Effect.provide(
+                testLayer(project, global, project, undefined, undefined, emptyCredentialNode, emptyWellknownNode, {
+                  system,
+                }),
+              ),
+            ),
+          ),
+          Effect.andThen(
+            Effect.gen(function* () {
+              const config = yield* Config.Service
+              const entries = yield* config.entries()
+              expect(
+                entries.flatMap((entry) => (entry.type === "document" && entry.info.shell ? [entry.info.shell] : [])),
+              ).toEqual(["global", "project"])
+            }).pipe(
+              Effect.provide(
+                testLayer(project, global, project, undefined, undefined, emptyCredentialNode, emptyWellknownNode, {
+                  system: false,
+                }),
+              ),
+            ),
+          ),
+        )
+      }),
+    ),
+  )
+
+  test("resolves the system configuration directory per platform", () => {
+    expect(ConfigDiscovery.systemDirectory("darwin", {})).toBe(
+      AbsolutePath.make("/Library/Application Support/opencode"),
+    )
+    expect(ConfigDiscovery.systemDirectory("linux", {})).toBe(AbsolutePath.make("/etc/opencode"))
+    expect(ConfigDiscovery.systemDirectory("win32", { ProgramData: "D:\\ProgramData" })).toBe(
+      AbsolutePath.make(path.join("D:\\ProgramData", "opencode")),
+    )
+    expect(ConfigDiscovery.systemDirectory("win32", {})).toBe(
+      AbsolutePath.make(path.join("C:\\ProgramData", "opencode")),
+    )
+  })
+
+  test("resolves macOS managed preferences with user-specific profiles first", () => {
+    expect(ConfigDiscovery.preferencePaths("alice")).toEqual([
+      AbsolutePath.make(path.join("/Library/Managed Preferences", "alice", "ai.opencode.managed.plist")),
+      AbsolutePath.make("/Library/Managed Preferences/ai.opencode.managed.plist"),
+    ])
+  })
+
+  test("strips MDM payload metadata from managed preferences", () => {
+    expect(
+      JSON.parse(
+        ConfigDiscovery.stripPreferenceMetadata(
+          JSON.stringify({
+            PayloadDisplayName: "OpenCode",
+            PayloadIdentifier: "ai.opencode.managed",
+            PayloadType: "ai.opencode.managed",
+            PayloadUUID: "00000000-0000-0000-0000-000000000000",
+            PayloadVersion: 1,
+            _manualProfile: true,
+            share: "disabled",
+          }),
+        ),
+      ),
+    ).toEqual({ share: "disabled" })
+  })
 
   it.live("loads explicit file and content overrides in priority order", () =>
     Effect.acquireDisposable(Effect.promise(() => tmpdir())).pipe(
@@ -395,6 +501,7 @@ describe("Config", () => {
           }).pipe(
             Effect.provide(
               AppNodeBuilder.build(LayerNode.group([Config.node, Bus.node]), [
+                Config.node.replace(Config.configured({ system: false })),
                 Location.node.replace(
                   Layer.succeed(
                     Location.Service,
@@ -602,7 +709,7 @@ describe("Config", () => {
         const project = path.join(tmp.path, "project")
         const remote = (entries: readonly Entry[]) => ({
           provider: Config.latest(entries, "providers")?.remote?.package,
-          policies: Config.latest(entries, "experimental")?.policies,
+          policies: Config.latest(entries, "policies"),
         })
         const loaded = {
           provider: "aisdk:@ai-sdk/openai-compatible",
@@ -618,6 +725,7 @@ describe("Config", () => {
           // Each build is a fresh process sharing one persisted KV store.
           const instance = () =>
             AppNodeBuilder.build(LayerNode.group([Config.node, Bus.node, WellKnown.node]), [
+              Config.node.replace(Config.configured({ system: false })),
               Location.node.replace(
                 Layer.succeed(
                   Location.Service,
@@ -858,14 +966,14 @@ describe("Config", () => {
       migrateV1({
         enabled_providers: ["anthropic", "openai"],
         disabled_providers: ["openai"],
-      }).experimental?.policies,
+      }).policies,
     ).toEqual([
       { action: "provider.use", resource: "*", effect: "deny" },
       { action: "provider.use", resource: "anthropic", effect: "allow" },
       { action: "provider.use", resource: "openai", effect: "allow" },
       { action: "provider.use", resource: "openai", effect: "deny" },
     ])
-    expect(migrateV1({ enabled_providers: [] }).experimental?.policies).toEqual([
+    expect(migrateV1({ enabled_providers: [] }).policies).toEqual([
       { action: "provider.use", resource: "*", effect: "deny" },
     ])
   })
@@ -923,7 +1031,7 @@ describe("Config", () => {
     expect(migrated.model).toEqual({ providerID: "azure", model: "deployment" })
     expect(migrated.agents?.reviewer?.model).toEqual({ providerID: "google-vertex", model: "claude-sonnet" })
     expect(migrated.commands?.review?.model).toEqual({ providerID: "azure", model: "deployment" })
-    expect(migrated.experimental?.policies).toEqual([
+    expect(migrated.policies).toEqual([
       { action: "provider.use", resource: "*", effect: "deny" },
       { action: "provider.use", resource: "google-vertex", effect: "allow" },
       { action: "provider.use", resource: "azure", effect: "deny" },
@@ -1564,6 +1672,16 @@ describe("Config", () => {
                       },
                     },
                   },
+                  litellm: {
+                    npm: "@ai-sdk/openai-compatible",
+                    options: { baseURL: "https://litellm.example/v1" },
+                    models: {
+                      "glm-5.3-flashx": {
+                        options: { reasoningEffort: "high", allowed_openai_params: ["reasoning_effort"] },
+                        variants: { thinking: { chat_template_kwargs: { enable_thinking: true } } },
+                      },
+                    },
+                  },
                 },
                 compaction: { auto: true, tail_turns: 3, preserve_recent_tokens: 2000, reserved: 10000 },
                 experimental: { mcp_timeout: 5000 },
@@ -1640,6 +1758,11 @@ describe("Config", () => {
                   },
                 },
               },
+            })
+            expect(documents[0]?.info.providers?.litellm?.models?.["glm-5.3-flashx"]).toMatchObject({
+              settings: { reasoningEffort: "high" },
+              body: { allowed_openai_params: ["reasoning_effort"] },
+              variants: [{ id: "thinking", settings: {}, body: { chat_template_kwargs: { enable_thinking: true } } }],
             })
             expect(documents[0]?.info.compaction).toEqual({
               auto: true,
