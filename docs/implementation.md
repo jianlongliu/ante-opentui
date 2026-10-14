@@ -106,7 +106,7 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 
 **这里只放手上的活与开放问题；功能缺口（空框）看 [README](../README.md)「状态」清单。**
 
-**`2026.10.14`（待发）：`/connect` + 侧栏额度面板**
+**`2026.10.15`（已出）：`/connect` + 侧栏额度面板**
 
 **`/connect`（Ante 的供应商登录 + 模型列表改按「连得上的」喂）**
 
@@ -124,9 +124,11 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 - **验法**：见 [README](../README.md)「已实现」那条与实现清单里的命令（`set -a; . ~/.zshenv; set +a` 后 `antex serve PORT` + `curl … /api/rpc/antex.quota/panel`；画面用 `script/tui_drive.py --send $'3:\x18l' --send $'6:\r'` 进会话看侧栏）。
 - **Go 那条现状**：`/zen/go/v1/usage` 对无 Go 订阅的 key 回 `403 EntitlementError`，面板如实显示「无有效 Go 订阅」；要看 5h/周/月窗口得走 console（`opencode.ai/console/api/go/status`），垫片认 `OPENCODE_CONSOLE_TOKEN`（+ 可选 `OPENCODE_CONSOLE_ORG_ID`）。
 
+- **发版插曲（`tag v2026.10.14` 那次 CI 挂了）**：`ld.lld: error: undefined symbol: ring_core_0_17_14__…`。根因是 makepkg 默认把 `-flto=auto` 塞进 CFLAGS，而本版新引入的 ring（`reqwest → rustls`）的汇编目标在 `lld + -Wl,--gc-sections` 下会丢符号——本机 `cargo build --release` 不带那份 CFLAGS，所以本地怎么试都编得过，只能在容器里复现。修法一行：`PKGBUILD` 的 `options` 加 `'!lto'`（在 archlinux 容器里实测；另两条已验证的绕法是 `-Clink-arg=-fuse-ld=bfd`、`-Clink-arg=-Wl,--no-gc-sections`）。**`v2026.10.14` 这个 tag 就作废了**（CI 失败、也没产物），版本按规矩往前走到 `2026.10.15`；排查过程见 [pitfalls.md](pitfalls.md)。验包：`tar --zstd -xOf <包> usr/bin/antex | grep -c antex.quota` 应 ≥1，`usr/bin/antex-tui` 里应能找到 `antex.sidebar.quota`。
+
 **`2026.10.13`（已出）：跟到 Ante 0.2.11 + 上游 opencode 2.0.26**
 
-- **Ante 0.2.11 / `ante-sdk` 0.2.10**：协议面按 changelog 是纯新增（`/api/credential`、`/api/pair`、`/api/integration/{id}/connect/external`、`/api/vcs/init`、`Session.Message.Idle.error`、`Error.response`），垫片**一行没改**（`/api/integration` 与 `/api/credential` 是**之后**才接上的，见上面那条「待发」），只把 `ante-sdk` 从 0.2.7 提到 0.2.10 重编（`^0.2.10` 仍跟着 Ante 的 0.2.x 走）。
+- **Ante 0.2.11 / `ante-sdk` 0.2.10**：协议面按 changelog 是纯新增（`/api/credential`、`/api/pair`、`/api/integration/{id}/connect/external`、`/api/vcs/init`、`Session.Message.Idle.error`、`Error.response`），垫片**一行没改**（`/api/integration` 与 `/api/credential` 是**之后**才接上的，见上面那条 `2026.10.15`），只把 `ante-sdk` 从 0.2.7 提到 0.2.10 重编（`^0.2.10` 仍跟着 Ante 的 0.2.x 走）。
 - **上游 opencode 2.0.18 → 2.0.26**（`git subtree pull` v2 @`4617210`）：**九处客户端补丁全部自动合上**，唯一冲突是 `packages/cli/package.json` 里 `@opencode-ai/pty` 的位置——那行「挪位」不是我们的补丁，是**构建脚本自己 `bun add` 重排**的副产品（同一现象已出现两次），解析取上游、构建后再 `git checkout --` 还原即可，别当补丁留着。依赖锁有变，拉完要 `bun install` 再 `script/build-tui.sh`。
 - **验法（PTY + pyte，`script/tui_drive.py`）**：① 首页右下角应为 `ante 0.2.11 · antex 2026-10-13`，且首行**没有**版本警告；② 一轮真对话（流式 + `Thought` + 右上 Context 计数）；③ 一次 `Bash` 工具调用的渲染与旧客户端**逐字符一致**（拿 `/usr/bin/antex-tui` 跑同一条 prompt 对照）——垫片那层映射没退化；④ 命令面板搜 `share` 仍是 `No results found`（黑名单在新客户端上照样生效）；⑤ 跑完 `tail /tmp/antex.log` 零 404。
 - **口径**：装完包后日常用的客户端就是 `vendor/opencode/` 那份（`~/.local/bin/antex-tui` → `/usr/bin/antex-tui`，与包同步）；要单改界面才走仓库构建产物。**上游 2.0.26 与 `ante-sdk` 0.2.10 都只在包 2026.10.13 里，装完必须重开 antex**（在跑的进程仍用旧二进制）。
@@ -162,7 +164,7 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 
 **发版一条线**：改 `PKGBUILD` 的 `pkgver`（日期 + 当日序号）→ 提交 → 打**同名** tag 推上去（流程见 `release-via-ci`）。
 
-**已发布**：`.6`（prompt 请求体上限 2MB → 32MB、「做不了的入口」两层钉死、附件被丢时说出来）→ `2026.10.02`（五条命令放开，见上）→ `2026.10.03`（`ante-sdk` 0.2.7；模型兜底改读 `settings.json`）→ `2026.10.03.2`（恢复会话时提问落位）→ `2026.10.05`（启动自检按版本系列判）→ `2026.10.13`（`ante-sdk` 0.2.10、上游 opencode 2.0.26）。过去列在缺口里的中断收尾、多轮消息落位、会话列表、agent 切换、`/compact`、恢复旧会话后继续对话都已实现并实测。
+**已发布**：`.6`（prompt 请求体上限 2MB → 32MB、「做不了的入口」两层钉死、附件被丢时说出来）→ `2026.10.02`（五条命令放开，见上）→ `2026.10.03`（`ante-sdk` 0.2.7；模型兜底改读 `settings.json`）→ `2026.10.03.2`（恢复会话时提问落位）→ `2026.10.05`（启动自检按版本系列判）→ `2026.10.13`（`ante-sdk` 0.2.10、上游 opencode 2.0.26）→ `2026.10.15`（`/connect` 转正、侧栏额度面板；顺带修了 CI 的 ring + LTO + lld 链接失败）。过去列在缺口里的中断收尾、多轮消息落位、会话列表、agent 切换、`/compact`、恢复旧会话后继续对话都已实现并实测。
 
 要接着做，就挑 [README](../README.md)「状态」清单里 **空框** 的那几条（会话内 `/cd` 的退化方案、真多标签、断线时的终端还原）；**带删除线** 的一条都别再提议——Ante 底层没有那些概念。
 
