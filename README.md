@@ -114,6 +114,16 @@ opencode2 --server http://127.0.0.1:41999     # 终端 B
 - **一体化模式下请求日志写 `/tmp/antex.log`**——写 stdout 会糊在 TUI 上；`serve` 模式仍打在 stdout。
 - **启动自检**：找不到 `ante` 就直接报错退出（否则 TUI 能开、消息全石沉大海）；`ante --version` 与二进制里编进去的 `ante-sdk` **不在同一版本系列**（前两段，如 `0.2.x`）才**警告**。判据是**系列不是全等**：Ante 自己的版本与它发的 `ante-sdk` 本来就不同步（0.2.11 发的是 sdk 0.2.10），比全等会每次启动都误报。运行期连不上、事件流断掉、消息被丢弃也写同一处日志，不留哑谜：`tail /tmp/antex.log`。
 
+**macOS 上多两件事**（其余同上；已在 macOS 27 / arm64 上实测一条命令能起）：
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"     # macOS 默认不带 ~/.local/bin；也可以直接写全路径 ~/.local/bin/antex
+~/.local/bin/antex
+```
+
+- 一体化模式的日志落在 **`$TMPDIR/antex.log`**（macOS 的临时目录是 `/var/folders/...`，不是 Linux 那个 `/tmp/antex.log`）；`serve` 模式照旧打在 stdout。
+- 从别的机器远程用它要带 `-t`（TUI 要 tty）：`ssh -t <mac> '~/.local/bin/antex'`。
+
 ## 装包（CI 产物）
 
 打 tag 推上去，Actions 出两个产物挂到同一个 Release：
@@ -234,7 +244,7 @@ Cargo.toml           axum + tokio + serde
 ## 常见问题
 
 **界面在跑，发消息却没反应？**
-先 `tail /tmp/antex.log`：启动自检那行会明说 `ante` 找没找到、版本是不是同一系列（例如
+先 `tail /tmp/antex.log`（macOS 上是 `$TMPDIR/antex.log`）：启动自检那行会明说 `ante` 找没找到、版本是不是同一系列（例如
 `自检：… → ante 0.2.11；antex 编译于 ante-sdk 0.2.10，同一版本系列`）。自检过了还没反应，就看日志里
 「未连接 / 事件流结束 / 消息被丢弃」那几句——它不会静默。
 
