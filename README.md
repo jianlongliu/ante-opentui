@@ -1,6 +1,6 @@
 # antex（项目 ante-opentui）
 
-> 最后核对：2026-10-14 · 目标客户端 opencode 2.0.26 · Rust 1.99.0
+> 最后核对：2026-10-15 · 目标客户端 opencode 2.0.26 · Rust 1.99.0
 
 把 **opencode v2 自带的 TUI** 接到 **Ante** 后端上运行。
 

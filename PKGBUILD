@@ -11,7 +11,7 @@
 # `opencode2` / `opencode`（src/main.rs 的 resolve client）。所以这里除了装 antex-tui，
 # 还放一个 opencode2 软链让它能从 PATH 找到。
 pkgname=antex
-pkgver=2026.10.14
+pkgver=2026.10.15
 pkgrel=1
 pkgdesc="Ante agent, driven by the opencode v2 TUI (antex)"
 arch=('x86_64')
@@ -22,7 +22,12 @@ depends=()
 # 后端本体不在任何仓库（官方脚本装到 ~/.ante/bin），只能声明成可选依赖。
 optdepends=('ante: the agent backend this TUI talks to (installed by its own installer)')
 makedepends=('rust' 'bun' 'git')
-options=('!strip')   # bun 编出来的单文件二进制里塞了运行时，别去动它的段
+# `!strip`：bun 编出来的单文件二进制里塞了运行时，别去动它的段。
+# `!lto`：makepkg 默认把 `-flto=auto` 塞进 CFLAGS，而本包唯一的 C/汇编依赖 ring
+# （reqwest → rustls 带进来的）在 `lld + -Wl,--gc-sections` 下会丢符号
+# （`undefined symbol: ring_core_0_17_14__…`，2026-10-14 的 CI 就是这么挂的，见 docs/pitfalls.md）。
+# 这个包的结果是 Rust 二进制，LTO 只作用到那个 C 依赖，关掉不影响别处。
+options=('!strip' '!lto')
 
 _src="${ANTEX_SRC:-git+https://github.com/jianlongliu/ante-opentui.git#tag=v$pkgver}"
 source=("$pkgname-$pkgver::$_src")
