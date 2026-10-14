@@ -1,15 +1,145 @@
-# antex（项目 ante-opentui）
+# antex
 
-> 最后核对：2026-10-15 · 目标客户端 opencode 2.0.26 · Rust 1.99.0
+**把 opencode v2 自带的 TUI 接到 [Ante](https://github.com/jianlongliu) 后端上跑。**
+界面、主题、键位全用 opencode 的，数据由 Ante 提供——中间这层垫片（`antex`）实现 opencode 的 server API，
+让 `opencode --server <url>` 分辨不出真假。思路同「改接口，不改消费者」。
 
-把 **opencode v2 自带的 TUI** 接到 **Ante** 后端上运行。
-
-做法是**实现 opencode v2 要求的 server API**，让 `opencode --server <url>` 分辨不出真假；
-opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同「改接口，不改消费者」。
+[![release](https://img.shields.io/github/v/release/jianlongliu/ante-opentui?label=release&color=2f81f7)](https://github.com/jianlongliu/ante-opentui/releases)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![platform](https://img.shields.io/badge/platform-Arch%20%7C%20macOS-4b5563)](#装包ci-产物)
+[![rustc](https://img.shields.io/badge/rustc-1.99%20%C2%B7%20edition%202024-dea584)](#依赖与版本)
+[![client](https://img.shields.io/badge/opencode-v2%20%2F%202.0.26-111827)](#依赖与版本)
 
 ![antex 首页](docs/home.png)
 
-首页（本仓库自编客户端的默认界面）：顶栏是 Ante 面具 + `ANTEX`，composer 下是权限模式，右下角是 `ante <后端版本> · antex <构建日期>`。**这张图由 `script/shot-home.py` 生成**（PTY + pyte 抓屏 → Pango 渲染）：`ANTE_HOME=<空目录> ANTEX_MODEL= ANTEX_PROVIDER= uv run --with pyte script/shot-home.py --out docs/home.png`——截图里刻意只留 `Auto`，不带任何模型 / 供应商名（模型名是本机 catalog 的事，不该进仓库）。
+> 上图是自编客户端的默认界面：顶栏 Ante 面具 + `ANTEX`，composer 下是权限模式，右下角 `ante <后端版本> · antex <构建日期>`。
+> 这张图由 `script/shot-home.py` 生成（PTY + pyte 抓屏 → Pango 渲染）：
+> `ANTE_HOME=<空目录> ANTEX_MODEL= ANTEX_PROVIDER= uv run --with pyte script/shot-home.py --out docs/home.png`。
+> 截图里刻意只留 `Auto`，不带任何模型 / 供应商名——模型名是本机 catalog 的事，不该进仓库。
+
+> 最后核对：2026-10-15 · 目标客户端 opencode 2.0.26 · Rust 1.99.0
+
+---
+
+## 目录
+
+- [这是什么](#这是什么)
+- [特性](#特性)
+- [快速开始](#快速开始)
+- [装包（CI 产物）](#装包ci-产物)
+- [为什么这么做](#为什么这么做)
+- [状态：已实现 / 待定 / 遗弃](#状态已实现--待定--遗弃)
+- [依赖与版本](#依赖与版本)
+- [目录结构](#目录结构)
+- [细节去哪了](#细节去哪了)
+- [常见问题](#常见问题)
+- [致谢与许可](#致谢与许可)
+
+## 这是什么
+
+```
+opencode 的 TUI（本仓库自己编的，改了 logo）      ← 界面
+        ↕  opencode 协议（本仓库实现的「垫片」）
+antex（垫片，本仓库，一个二进制）
+        ↕  ante-sdk / `ante serve --stdio`
+Ante（**你自己装的**：官方脚本装、`ante update` 升级）
+```
+
+**Ante 不在本仓库里，也不用管它**——你装你的、它更它的，垫片按它的协议趴在上面。
+唯一耦合点就是协议：若 Ante 升级改了协议，改垫片即可（通常只动 `Cargo.toml` 里的 `ante-sdk` 版本 + `cargo build`）。
+
+## 特性
+
+| | |
+| --- | --- |
+| **真数据流** | 起界、提示词送达、流式文本、推理、工具调用、审批、失败可见——全由垫片喂 Ante 的真事件，不是模拟 |
+| **会话** | 列表、恢复、恢复后继续、删除（`Ctrl+D` 两下）；**打开一条会话即从它的 `events.jsonl` 重建整份记录**（每一步的思考、回答、工具都在） |
+| **插嘴与排队** | `Ctrl+S` 把排队消息插进正在跑的回合，带斜体 `Pending...` 角标；送到时机按 Ante 的真实边界判——**收下不算，下一个 step 开始才算模型读到** |
+| **`/connect`** | Ante 的供应商登录被翻译成 opencode 的 integration 接口：ChatGPT 由垫片自己跑 Codex OAuth，Antix 交给 `ante auth login antix`；凭证落 `~/.ante/auth/`，格式与 Ante 自己写的逐字一致 |
+| **侧栏额度面板** | `▼ Quota`：DeepSeek 余额、Command Code 的 5h/W/M + 余额、ChatGPT 订阅窗口、OpenCode Go 用量；数据垫片自己取（`src/quota.rs`），界面是自编客户端里的内置插件 |
+| **贴图** | 粘贴即发；超过 Ante 的接收上限（≈240KB base64）垫片先压到 160KB 以内，压不下就明说 |
+| **断线重连** | 退避重连 + `/api/health` 说真话 + 转录里一行说明；掉线期间排队的消息不丢 |
+| **常用命令** | `/compact`、`/rename`、`/copy`、`/export`、`/stats`、`/skills`、模型选择、`shift+tab` 权限模式、`@` 文件补全 |
+| **不装样子** | Ante 没有的概念（MCP、LSP、VCS、终端、子代理会话）从界面里摘掉，而不是留个点了没反应的入口 |
+| **两个平台** | CI 出 Arch 包 + macOS（Apple Silicon）tar.gz，见[装包](#装包ci-产物) |
+
+## 快速开始
+
+### 0. 前置：Ante 后端
+
+antex 只是前端那一层，**Ante 要你自己装**（官方脚本装到 `~/.ante/bin`，`ante update` 升级）。
+`antex` 启动时会先核对它：找不到 `ante` 直接报错退出。
+
+### 1. 装 antex
+
+**Arch（推荐，日常就这么用）**——从 [Releases](https://github.com/jianlongliu/ante-opentui/releases) 取包：
+
+```sh
+pkexec pacman -U antex-<版本>-1-x86_64.pkg.tar.zst
+```
+
+**macOS（Apple Silicon）**——取 `antex-<版本>-macos-arm64.tar.gz`，解包后把 `bin/` 里的三个文件放 `~/.local/bin`：
+
+```sh
+tar -xzf antex-<版本>-macos-arm64.tar.gz
+cp antex-<版本>-macos-arm64/bin/* ~/.local/bin/
+```
+
+**源码**（改代码时才需要）：
+
+```sh
+cd ~/Projects/ante-opentui
+cargo build --release        # crates.io 直连即可；只在本地 mihomo（127.0.0.1:7890）里通就先 export http_proxy/https_proxy
+ln -sfn "$PWD/target/release/antex" ~/.local/bin/antex
+```
+
+### 2. 跑
+
+日常就一条命令——**起服务并直接进 TUI，退出时服务一起停**：
+
+```sh
+antex
+```
+
+想分开（一个终端起服务、另一个连）也行：
+
+```sh
+antex serve 41999                             # 终端 A：只起服务，留在前台
+opencode2 --server http://127.0.0.1:41999     # 终端 B
+```
+
+- `antex PORT` 指定端口（默认 41999）；`antex -h` 看用法。
+- **可以多开**：一体化模式下端口被占会**自动往后顺延**（并打印改用哪个），所以第二个、第三个 `antex` 直接跑就行。`serve` 模式相反——按你给的端口，被占就明确报错（换端口会让人连错服务）。
+- 环境变量：`ANTE_BIN` 指定 `ante` 可执行文件（默认 `$PATH`，再退到 `~/.ante/bin/ante`）；`ANTEX_CLIENT` 指定客户端（默认 `~/.local/bin/antex-tui`，再退到 `opencode2` → `opencode`）。**所以不必先 export PATH。**
+- **一体化模式下请求日志写 `/tmp/antex.log`**——写 stdout 会糊在 TUI 上；`serve` 模式仍打在 stdout。
+- **启动自检**：找不到 `ante` 就直接报错退出（否则 TUI 能开、消息全石沉大海）；`ante --version` 与二进制里编进去的 `ante-sdk` **不在同一版本系列**（前两段，如 `0.2.x`）才**警告**。判据是**系列不是全等**：Ante 自己的版本与它发的 `ante-sdk` 本来就不同步（0.2.11 发的是 sdk 0.2.10），比全等会每次启动都误报。运行期连不上、事件流断掉、消息被丢弃也写同一处日志，不留哑谜：`tail /tmp/antex.log`。
+
+## 装包（CI 产物）
+
+打 tag 推上去，Actions 出两个产物挂到同一个 Release：
+
+| 产物 | 平台 | 装法 |
+| --- | --- | --- |
+| `antex-<版本>-1-x86_64.pkg.tar.zst` | Arch | `pkexec pacman -U <包>`（放 `/usr/bin/{antex,antex-tui,opencode2}`） |
+| `antex-<版本>-macos-arm64.tar.gz` | macOS（Apple Silicon） | 解包，把 `bin/` 里的三个文件放 `~/.local/bin`（垫片默认就在那儿找客户端），或把 `bin` 加进 `PATH`。**本机那台 Mac mini（macOS 27 / arm64）已实测**：起得来、连得上 Ante |
+
+macOS 那份**只能在 macOS 上编**：垫片要 Apple SDK（Linux 上交叉编要自备 SDK，不划算），客户端是 bun `--single`，
+那个脚本只给**同平台**出产物（`item.os !== process.platform` 直接跳过，见 `vendor/opencode/packages/cli/script/build.ts`）。
+所以 CI 里跑在 `macos-latest`（arm64）——**不需要一台 Mac 去编**，只有要验跑起来才需要。
+
+## 为什么这么做
+
+手写复刻 opencode 的 TUI 到不了它的完成度（它有 17k 行的界面层）。反过来做，垫片是**可丢弃**的一层：
+上游界面升级时，重新拉 TUI 即可，只需跟着修垫片。代价是 Ante 没有的概念（LSP、MCP、formatter、git 操作）必须打桩
+——`/connect` 不再打桩了：Ante 的供应商登录被翻译成 opencode 的 integration 接口（见「已实现」）。
+思路同「改接口，不改消费者」（参照 `onarchi`——把 Omarchy 真移植到 niri 的那个仓，原名 omarchy-on-niri）。
+
+几条定下来的选择：
+
+- **Rust 写垫片**：它是长驻进程，要稳、要单文件产物。
+- **上游进同一个仓**（`vendor/opencode/`，git subtree，分支 `v2`）：升级即拉上游，本质就是打补丁。
+- **只做垫片、不 fork 界面**：日常使用不必依赖自建前端（源码模式要 3.1G `node_modules`），**只有要改界面本身才必须 fork**。
+- **映射原则**：Ante 真有对应概念的才做成真差别（`shift+tab`→权限模式、模型选择→provider/model）；没有的（LSP/formatter/VCS）打桩显示为空，不假装。
 
 ## 状态：已实现 / 待定 / 遗弃
 
@@ -52,82 +182,6 @@ opencode 的界面、主题、键位一行不改，Ante 提供数据。思路同
 - [ ] ~~LSP、formatter~~ —— 无对应概念，打桩显示为空（入口已摘；**暂时遗弃**）
 - [ ] ~~子代理面板 / 点进子代理~~ —— 客户端的子代理 UI（内联块点进去看子会话、composer 的 subagents tab、mini 的 footer inspector）**整套都挂在「子代理 = 独立 child session」上**（`session.parentID` + 自己的事件流 + `sessionFamily()`）。Ante 没有这个概念：子代理只是父会话里的一次 `Agent` 工具调用，内部活动不推给前端——本机 188 条会话日志里 `ToolUpdate` 事件 **0 条**，一次 68 秒的 `Agent` 调用（14:42:20→14:43:28）中途**零事件**，结果只在 `ToolEnd.result_json.report` 里一次交付；协议里也没有 agent id / parent turn（`SessionInfo.subagents` 只是可委派清单）。硬造 child session 只有空壳，还会污染会话列表。能做的只有把 `Agent` 调用按客户端的 subagent 块渲染（已做）
 
-## 细节去哪了
-
-本 README 只留「是什么、怎么跑、现状」；实现过程、坑与验收按主题分册：
-
-| 文件 | 内容 |
-| --- | --- |
-| [docs/implementation.md](docs/implementation.md) | 实现清单（逐条实测）· 未完成项的验证法 · 审批 · 验收与排错开关 · 下一步 |
-| [docs/pitfalls.md](docs/pitfalls.md) | 关键坑 · v2 API 约定与事件名 · Herdr 集成 · 权威出处 |
-| [docs/client-patches.md](docs/client-patches.md) | 客户端补丁（首页 logo、Pending 角标、命令黑名单…）· 屏蔽做不了的入口 · 客户端现状 · 魔改上游 TUI |
-
-## 它在你系统里的位置
-
-```
-opencode 的 TUI（本仓库自己编的，改了 logo）      ← 界面
-        ↕  opencode 协议（本仓库实现的「垫片」）
-antex（垫片，本仓库，一个二进制）
-        ↕  ante-sdk / `ante serve --stdio`
-Ante（**你自己装的**：官方脚本装、`ante update` 升级）
-```
-
-**Ante 不在本仓库里，也不用管它**——你装你的、它更它的，垫片按它的协议趴在上面。
-唯一耦合点就是协议：若 Ante 升级改了协议，改垫片即可（通常只动 `Cargo.toml` 里的 `ante-sdk` 版本 + `cargo build`）。
-
-## 为什么走这条路
-
-手写复刻 opencode 的 TUI 到不了它的完成度（它有 17k 行的界面层）。反过来做，垫片是**可丢弃**的一层：
-上游界面升级时，重新拉 TUI 即可，只需跟着修垫片。代价是 Ante 没有的概念（LSP、MCP、formatter、git 操作）必须打桩——`/connect` 不再打桩了：Ante 的供应商登录被翻译成 opencode 的 integration 接口（见「已实现」）。
-思路同「改接口，不改消费者」（参照 `onarchi`——把 Omarchy 真移植到 niri 的那个仓，原名 omarchy-on-niri）。
-
-几条定下来的选择：
-
-- **Rust 写垫片**：它是长驻进程，要稳、要单文件产物。
-- **上游进同一个仓**（`vendor/opencode/`，git subtree，分支 `v2`）：升级即拉上游，本质就是打补丁。
-- **只做垫片、不 fork 界面**：日常使用不必依赖自建前端（源码模式要 3.1G `node_modules`），**只有要改界面本身才必须 fork**。
-- **映射原则**：Ante 真有对应概念的才做成真差别（`shift+tab`→权限模式、模型选择→provider/model）；没有的（LSP/formatter/VCS）打桩显示为空，不假装。
-
-## 怎么跑
-
-装一次（软链到 `PATH`，之后任意目录可用）：
-
-```sh
-cd ~/Projects/ante-opentui
-cargo build --release        # crates.io 走本机网络直连即可；若只在本地 mihomo（127.0.0.1:7890）里通，就先 export http_proxy/https_proxy
-ln -sfn "$PWD/target/release/antex" ~/.local/bin/antex
-```
-
-日常就一条命令——**起服务并直接进 TUI，退出时服务一起停**：
-
-```sh
-antex
-```
-
-想分开（一个终端起服务、另一个连）也行：
-
-```sh
-antex serve 41999                             # 终端 A：只起服务，留在前台
-opencode2 --server http://127.0.0.1:41999     # 终端 B
-```
-
-- `antex PORT` 指定端口（默认 41999）；`antex -h` 看用法。
-- **可以多开**：一体化模式下端口被占会**自动往后顺延**（并打印改用哪个），所以第二个、第三个 `antex` 直接跑就行。`serve` 模式相反——按你给的端口，被占就明确报错（换端口会让人连错服务）。
-- 环境变量：`ANTE_BIN` 指定 `ante` 可执行文件（默认 `$PATH`，再退到 `~/.ante/bin/ante`）；`ANTEX_CLIENT` 指定客户端（默认 `~/.local/bin/antex-tui`，再退到 `opencode2` → `opencode`）。**所以不必先 export PATH。**
-- **一体化模式下请求日志写 `/tmp/antex.log`**——写 stdout 会糊在 TUI 上；`serve` 模式仍打在 stdout。
-- **启动自检**：`antex` 起来时先核对 Ante —— 找不到 `ante` 就直接报错退出（否则 TUI 能开、消息全石沉大海）；`ante --version` 与二进制里编进去的 `ante-sdk` **不在同一版本系列**（前两段，如 `0.2.x`）才**警告**（这正是「界面在跑但没反应」最常见的成因）。**判据是系列不是全等**：Ante 自己的版本和它发的 `ante-sdk` 本来就不同步（0.2.11 发的是 sdk 0.2.10），比全等会每次启动都误报。运行期连不上、事件流断掉、消息被丢弃也都写同一处日志（`/tmp/antex.log`），不留哑谜。想看是否通过：`tail /tmp/antex.log`。
-
-### 装包（两个平台的产物都由 CI 出）
-
-打 tag 推上去，Actions 出两个东西挂到同一个 Release：
-
-| 产物 | 平台 | 装法 |
-| --- | --- | --- |
-| `antex-<版本>-1-x86_64.pkg.tar.zst` | Arch | `pkexec pacman -U <包>`（放 `/usr/bin/{antex,antex-tui,opencode2}`） |
-| `antex-<版本>-macos-arm64.tar.gz` | macOS（Apple Silicon） | 解包，把 `bin/` 里的三个文件放 `~/.local/bin`（垫片默认就在那儿找客户端），或把 `bin` 加进 `PATH`。**本机那台 Mac mini（macOS 27 / arm64）已实测**：起得来、连得上 Ante |
-
-macOS 那份**只能在 macOS 上编**：垫片要 Apple SDK（Linux 上交叉编要自备 SDK，不划算），客户端是 bun `--single`，那个脚本只给**同平台**出产物（`item.os !== process.platform` 直接跳过，见 `vendor/opencode/packages/cli/script/build.ts`）。所以 CI 里跑在 `macos-latest`（arm64）——**不需要本机那台 Mac mini**；要验跑起来才需要一台 macOS（本机就是 Mac mini）。
-
 ## 依赖与版本
 
 工具链（本机实测，pacman 的 `rust` 包）：
@@ -156,10 +210,10 @@ Cargo 依赖（`Cargo.lock` 实际解析值，非 `Cargo.toml` 的约束范围�
 | opencode 客户端 | **2.0.26**，来自本仓库 `vendor/opencode/`（subtree `v2`），用 `script/build-tui.sh` 自编；官方脚本那份仍装在 `~/.opencode/bin`（`opencode`/`opencode2` 指向它，**2.0.18**，只作兜底） |
 | Ante | 接后端时用 **`ante-sdk` 0.2.10**——**已发布 crates.io**，直接写 `ante-sdk = "0.2.10"` 即可（是 `^0.2.10`，跟着 Ante 的 0.2.x 走）。实测对着 Ante **0.2.11** |
 
-## 目录
+## 目录结构
 
 ```
-docs/                本 README 的细节分册（见上「细节去哪了」）
+docs/                本 README 的细节分册（见下「细节去哪了」）
 src/                 垫片本体：路由、信封、SSE、会话/消息存储
 build.rs             把编译用的 ante-sdk 版本写进二进制（启动自检要用）
 script/              build-tui.sh（重建客户端）、upgrade-upstream.sh（拉上游 + 重建，一条命令）、shot-home.py（把首页渲染成 PNG，README 那张图就是它出的）、tui_drive.py（在 PTY 里驱动客户端：按秒发键 + 抓最终屏文本，验收自动化探针）
@@ -167,10 +221,45 @@ vendor/opencode/     上游 opencode（subtree，v2 分支）——魔改对象
 Cargo.toml           axum + tokio + serde
 ```
 
-## 致谢
+## 细节去哪了
+
+本 README 只留「是什么、怎么跑、现状」；实现过程、坑与验收按主题分册：
+
+| 文件 | 内容 |
+| --- | --- |
+| [docs/implementation.md](docs/implementation.md) | 实现清单（逐条实测）· 未完成项的验证法 · 审批 · 验收与排错开关 · 下一步 |
+| [docs/pitfalls.md](docs/pitfalls.md) | 关键坑 · v2 API 约定与事件名 · Herdr 集成 · 权威出处 |
+| [docs/client-patches.md](docs/client-patches.md) | 客户端补丁（首页 logo、Pending 角标、命令黑名单…）· 屏蔽做不了的入口 · 客户端现状 · 魔改上游 TUI |
+
+## 常见问题
+
+**界面在跑，发消息却没反应？**
+先 `tail /tmp/antex.log`：启动自检那行会明说 `ante` 找没找到、版本是不是同一系列（例如
+`自检：… → ante 0.2.11；antex 编译于 ante-sdk 0.2.10，同一版本系列`）。自检过了还没反应，就看日志里
+「未连接 / 事件流结束 / 消息被丢弃」那几句——它不会静默。
+
+**贴的图模型说看不到？**
+Ante 侧有硬上限：约 240KB base64（≈170KB 原文件）以上直接丢弃。垫片会先压到 160KB 以内，压不下会明说。
+模型本身不看图（提示 `no vision support`）那是 catalog 里那个模型缺 `support_vision: true`，与体积无关。
+
+**想装个 opencode 插件加功能？**
+垫片**不跑 JS**：插件的取数半边跑在 opencode 自己的 server 进程里，装上去不会动。要加界面只有两条路——
+改自编客户端（内置插件，见 [docs/client-patches.md](docs/client-patches.md)），或让垫片直接喂数据
+（例如额度面板走的 `POST /api/rpc/…`）。
+
+**侧栏额度显示「未取到」/「无有效 Go 订阅」？**
+「未取到」多半是凭据或网络：垫片按顺序找环境变量（`DEEPSEEK_API_KEY`、`CMD_API_KEY`、`OPENCODE_ZEN_API_KEY`…）
+→ `~/.ante/auth/api_keys.json`；ChatGPT 那一行要先 `/connect`。OpenCode Go 若显示「无有效 Go 订阅」，
+那是订阅本身的状态（`/zen/go/v1/usage` 会回 `403 EntitlementError`），不是面板坏了。
+
+**装完没生效 / 改了界面没变化？**
+在跑的进程不会自己换二进制：装完包要重开 `antex`。改的是客户端源码（`vendor/opencode/`）时，还要先
+`script/build-tui.sh` 重建，否则用的还是旧客户端。
+
+## 致谢与许可
 
 **TUI、键位系统、渲染、插件机制，连「用服务端 API 驱动一个现成客户端」这条路子本身**，全部来自
 **opencode**（<https://github.com/sst/opencode>）。本仓库做的只是把它 git subtree 收进来、在「TUI 调后端」那一层
 打几个补丁接到 Ante 上——等于站在人家肩上，上游不再更新，这里也就跟着停。感谢 opencode 的作者和所有贡献者。
 
-许可跟上游一致（MIT，见 `LICENSE`）：随意分发修改
+许可跟上游一致（MIT，见 [`LICENSE`](LICENSE)）：随意分发修改。
