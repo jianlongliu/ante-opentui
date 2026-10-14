@@ -106,7 +106,7 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 
 **这里只放手上的活与开放问题；功能缺口（空框）看 [README](../README.md)「状态」清单。**
 
-**视觉一致性：界面文案改英文（2026-10-15，本机未出包）**
+**`2026.10.15.3`（已出）：界面文案改英文 + 上游 opencode 2.0.29**
 
 - **规则**：**垫片喂进界面的字符串一律英文**，只给人读的日志与终端输出保留中文（`/tmp/antex.log` 的 `ante: …`、`serve` 的启动横幅、CLI 参数错误）；**启动自检双语**（中文行 + `self-check:` 行，同义）。完整清单与判据见 [client-patches.md](client-patches.md) 的「文案语言」。
 - **为什么**：这个 TUI 的壳、按钮、报错全是上游英文，中英混排看着像坏了一半；本机 locale 也是 `en_US.UTF-8`。
@@ -114,14 +114,16 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 - **日志侧一个字没动**：那些 `ante: …` / `session: …` 是人读的排错线索，跟界面无关。
 - **验法**：`cargo test`（26 项；两处断言跟着文案改：`the_answer_reads_back_as_the_user_would_say_it`、`a_dropped_attachment_says_so_in_the_message`）；接口级 `antex serve PORT` 后 `curl /api/agent`（三条描述应全英文）、`POST /api/session/x/move`（英文 400）、`POST /api/rpc/antex.quota/panel`（标签英文、36 列排得下）、`POST /api/integration/anthropic-subscription/connect/oauth`（英文解释）；画面用 `script/tui_drive.py` 进一条会话看侧栏。**注意**：`/api/health` 的 `reason`（`not connected yet` / `connected` / 连接失败原文）也跟着改了——它虽然不进界面，但会出现在转录那条断线说明里。
 
-**上游同步（2026-10-15，本机未出包）：opencode 2.0.26 → 2.0.29**
+- **`2026.10.15.3` 出包与验收**：CI run [`38614495302`](https://github.com/jianlongliu/antex-opentui/actions/runs/38614495302) 三个 job（`pkg` / `macos` / `release`）全绿，Release 上两个产物齐（Arch 包 67.6MB、macOS tar.gz 70.5MB）。**验包不必解包安装**：`tar --zstd -xOf <包> usr/bin/antex | grep -ac 'self-check:'` 应 >0（本机 12）、`grep -ac '未取到'` 应为 0。本机 `pkexec pacman -U` 装上（装前把 `/usr/bin/{antex,antex-tui,opencode2}` 备份到 `~/.local/state/backups/usr/bin/*.bak-2026.10.15.3`），两条 `~/.local/bin` 软链指回 `/usr/bin/`；装完 `antex serve` 的自检是中英两行、`/api/rpc/antex.quota/panel` 回英文标签。
+
+**上游同步（随 `2026.10.15.3` 出）：opencode 2.0.26 → 2.0.29**
 
 - **上游换线了**：我们原先跟的 `v2` 分支最后提交是 **2026-10-10**、版本停在 2.0.26；上游把 v2 线并回了默认分支（`dev`），之后按 `v2.0.x` 打 tag。这次 `git subtree pull` 拉的是 **tag `v2.0.29`**（`@042d0832`，含我们那份 `4617210`）。`script/upgrade-upstream.sh` 的 ref 因此从写死的 `v2` 改成**第一个参数、默认 `dev`**（想跟着某个已发布版本就传 tag），并顺带把「按 lock 装依赖」补成脚本里的一步（`bun install --frozen-lockfile`，上游 lock 常跟着变）。
 - **协议面等于零改动**：两份 `openapi.json` 逐操作对比（**142 个操作，无增无删**），唯一差异是 `GET /api/project` 多了一个可选 `archived` 查询参数——垫片对它答空数组、不理会筛选，所以**垫片一行没改**，也不必重编。
 - **补丁全部自动合上、零冲突**：清单里 12 处标志串逐条 grep 全在；唯一被两边同时碰到的是 `packages/client/src/solid/data.ts`（我们的「记录回读」两处 vs 上游新加的 `solid-data.test.ts`），diff 不重叠。（上一轮 2.0.13→2.0.26 冲突的是 `packages/cli/package.json` 里被构建脚本重排的 `@opencode-ai/pty`，这次没有。）
 - **上游 2.0.28 新增的「更新后弹 release highlights」在垫片这里不触发**：`/highlights` 命令只在 `app.highlights` 非空（只嵌进正式发布构建）且版本是纯 `x.y.z` 时注册，我们这份是 dev 构建 ⇒ 既不弹窗、命令也不出现在面板里，**不必进黑名单**。
 - **验收（PTY + pyte，`script/tui_drive.py`）**：① 首页 logo 与右下 `ante 0.2.11 · antex 2026-10-14`，首行无版本警告；② `/sessions` 列表正常，打开一条历史会话后整份转录按时间重建（走 `data.ts` 那处补丁）；③ 侧栏 `▼ Quota` 四家照常出数（DeepSeek 余额 / Command Code 5h·W·M / ChatGPT 未登录 / Go 无订阅）；④ 一轮真对话：投递 → 流式回复 → 右上 Context 计数 → 底部模型行都对。
-- **本机口径**：这次没出包，所以 `~/.local/bin/antex-tui` 指向**仓库构建产物**（开发态），`/usr/bin/antex-tui` 仍是包里那份 2.0.26。要回到「与包同步」就出包（抬 `PKGBUILD` 的 pkgver → tag → CI）。**在跑的 antex 进程不换客户端，重启才生效。**
+- **出包前后的口径**：确认改动那几天 `~/.local/bin/antex-tui` 临时指向仓库构建产物（开发态）；`2026.10.15.3` 出包装上后两条软链都指回 `/usr/bin/`，日常用的就是包里那份（客户端 2.0.29）。**在跑的 antex 进程不换二进制，重启才生效。**
 
 **`2026.10.15.2`（已出）：macOS 产物**
 
@@ -188,7 +190,7 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 
 **发版一条线**：改 `PKGBUILD` 的 `pkgver`（日期 + 当日序号）→ 提交 → 打**同名** tag 推上去（流程见 `release-via-ci`）。
 
-**已发布**：`.6`（prompt 请求体上限 2MB → 32MB、「做不了的入口」两层钉死、附件被丢时说出来）→ `2026.10.02`（五条命令放开，见上）→ `2026.10.03`（`ante-sdk` 0.2.7；模型兜底改读 `settings.json`）→ `2026.10.03.2`（恢复会话时提问落位）→ `2026.10.05`（启动自检按版本系列判）→ `2026.10.13`（`ante-sdk` 0.2.10、上游 opencode 2.0.26）→ `2026.10.15`（`/connect` 转正、侧栏额度面板；顺带修了 CI 的 ring + LTO + lld 链接失败）。过去列在缺口里的中断收尾、多轮消息落位、会话列表、agent 切换、`/compact`、恢复旧会话后继续对话都已实现并实测。
+**已发布**：`.6`（prompt 请求体上限 2MB → 32MB、「做不了的入口」两层钉死、附件被丢时说出来）→ `2026.10.02`（五条命令放开，见上）→ `2026.10.03`（`ante-sdk` 0.2.7；模型兜底改读 `settings.json`）→ `2026.10.03.2`（恢复会话时提问落位）→ `2026.10.05`（启动自检按版本系列判）→ `2026.10.13`（`ante-sdk` 0.2.10、上游 opencode 2.0.26）→ `2026.10.15`（`/connect` 转正、侧栏额度面板；顺带修了 CI 的 ring + LTO + lld 链接失败）→ `2026.10.15.3`（上游 opencode 2.0.29；垫片喂进界面的文案全改英文、启动自检中英双语）。过去列在缺口里的中断收尾、多轮消息落位、会话列表、agent 切换、`/compact`、恢复旧会话后继续对话都已实现并实测。
 
 要接着做，就挑 [README](../README.md)「状态」清单里 **空框** 的那几条（会话内 `/cd` 的退化方案、真多标签、断线时的终端还原）；**带删除线** 的一条都别再提议——Ante 底层没有那些概念。
 
