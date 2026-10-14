@@ -88,14 +88,14 @@ fn stage_one(file: &Value) -> Result<Option<(Value, Option<String>)>, String> {
     if let Some(rest) = uri.strip_prefix("data:") {
         let (mime, bytes) = decode_data_url(rest, name)?;
         if bytes.len() > MAX_RAW_BYTES {
-            return Err(format!("{name} 超过 {} MB", MAX_RAW_BYTES / 1024 / 1024));
+            return Err(format!("{name} is over {} MB", MAX_RAW_BYTES / 1024 / 1024));
         }
         return match kind(&mime) {
             // A pasted image travels as a mention: Ante turns that into an image
             // attachment, which is the only channel its protocol has.
             Kind::Image => {
                 let Some(prepared) = prepare(bytes, &mime) else {
-                    return Err(format!("{name} 无法解码为图片"));
+                    return Err(format!("{name} is not a decodable image"));
                 };
                 let path = write_staged(&prepared, name)?;
                 let entry = entry(&prepared.bytes, &prepared.mime, name, None);
@@ -109,7 +109,7 @@ fn stage_one(file: &Value) -> Result<Option<(Value, Option<String>)>, String> {
                 let entry = entry(&bytes, &mime, name, None);
                 Ok(Some((entry, Some(mention(&path)))))
             }
-            Kind::Other => Err(format!("{name} 的类型 {mime} Ante 读不了")),
+            Kind::Other => Err(format!("{name} has type {mime}, which Ante cannot read")),
         };
     }
     // `file://` attachments are files the client already points at in the text
@@ -128,12 +128,12 @@ fn stage_local(path: &Path, name: &str) -> Result<Option<(Value, Option<String>)
         Ok(bytes) if bytes.len() <= MAX_RAW_BYTES => bytes,
         Ok(_) => {
             return Err(format!(
-                "{} 超过 {} MB",
+                "{} is over {} MB",
                 path.display(),
                 MAX_RAW_BYTES / 1024 / 1024
             ));
         }
-        Err(err) => return Err(format!("读不了 {}：{err}", path.display())),
+        Err(err) => return Err(format!("cannot read {}: {err}", path.display())),
     };
     let label = if name.is_empty() {
         &basename(path)
@@ -143,7 +143,7 @@ fn stage_local(path: &Path, name: &str) -> Result<Option<(Value, Option<String>)
     let mime = mime_for(path);
     let entry = if mime.starts_with("image/") && mime != "image/svg+xml" {
         let Some(prepared) = prepare(bytes, &mime) else {
-            return Err(format!("{label} 无法解码为图片"));
+            return Err(format!("{label} is not a decodable image"));
         };
         entry(&prepared.bytes, &prepared.mime, label, Some(uri_of(path)))
     } else {
@@ -316,9 +316,9 @@ fn write_raw(bytes: &[u8], ext: &str, name: &str, fallback: &str) -> Result<Path
 
 fn write_file(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|err| format!("建不了 {}：{err}", dir.display()))?;
+        std::fs::create_dir_all(dir).map_err(|err| format!("cannot create {}: {err}", dir.display()))?;
     }
-    std::fs::write(path, bytes).map_err(|err| format!("写不了 {}：{err}", path.display()))?;
+    std::fs::write(path, bytes).map_err(|err| format!("cannot write {}: {err}", path.display()))?;
     Ok(path.to_path_buf())
 }
 
@@ -373,7 +373,7 @@ fn encode(bytes: &[u8]) -> String {
 fn decode_data_url(rest: &str, label: &str) -> Result<(String, Vec<u8>), String> {
     let (meta, payload) = rest
         .split_once(',')
-        .ok_or_else(|| format!("{label} 的 data URL 没有正文"))?;
+        .ok_or_else(|| format!("the data URL for {label} carries no payload"))?;
     let mime = meta.split(';').next().unwrap_or("").to_string();
     if meta
         .split(';')
@@ -381,7 +381,7 @@ fn decode_data_url(rest: &str, label: &str) -> Result<(String, Vec<u8>), String>
     {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(payload.trim())
-            .map_err(|err| format!("{label} 的 base64 解不开：{err}"))?;
+            .map_err(|err| format!("cannot decode the base64 for {label}: {err}"))?;
         return Ok((mime, bytes));
     }
     Ok((mime, percent_decode(payload).into_bytes()))
@@ -615,7 +615,7 @@ mod tests {
         assert_eq!(sent, "附件", "the caller adds the notice, not `stage`");
         assert_eq!(dropped.len(), 1);
         let reason = &dropped[0];
-        assert!(reason.contains("a.zip") && reason.contains("Ante 读不了"), "{reason}");
+        assert!(reason.contains("a.zip") && reason.contains("Ante cannot read"), "{reason}");
         assert!(!sent.contains('@'), "no mention for something Ante cannot read");
         assert!(echo.is_empty());
     }

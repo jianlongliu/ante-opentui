@@ -97,7 +97,7 @@ pub async fn rpc(Path((rpc_id, method)): Path<(String, String)>, Json(body): Jso
         return error(
             StatusCode::NOT_FOUND,
             "rpc.unavailable",
-            format!("没有注册 {rpc_id}.{method}"),
+            format!("no RPC registered for {rpc_id}.{method}"),
         );
     }
     let session = body
@@ -164,7 +164,7 @@ where
             Block {
                 header: header(key),
                 rows: vec![Row::Value {
-                    label: "未取到".to_string(),
+                    label: "Unavailable".to_string(),
                     value: message,
                 }],
                 available: false,
@@ -214,19 +214,19 @@ fn header(key: &str) -> String {
 // -------------------------------------------------------------------- 取数 --
 
 async fn deepseek() -> Result<Block, String> {
-    let key = credential(&["DEEPSEEK_API_KEY"]).ok_or("没有 DEEPSEEK_API_KEY")?;
+    let key = credential(&["DEEPSEEK_API_KEY"]).ok_or("no DEEPSEEK_API_KEY")?;
     let body = get_json("https://api.deepseek.com/user/balance", &key, &[]).await?;
     let info = body
         .get("balance_infos")
         .and_then(Value::as_array)
         .and_then(|infos| infos.first())
-        .ok_or("余额响应里没有 balance_infos")?;
+        .ok_or("the balance response has no balance_infos")?;
     let currency = info.get("currency").and_then(Value::as_str).unwrap_or("CNY");
     let total = info.get("total_balance").and_then(Value::as_str).unwrap_or("0");
     Ok(Block {
         header: header("deepseek"),
         rows: vec![Row::Value {
-            label: "余额".to_string(),
+            label: "Balance".to_string(),
             value: format!("{currency} {total}"),
         }],
         available: true,
@@ -234,7 +234,7 @@ async fn deepseek() -> Result<Block, String> {
 }
 
 async fn commandcode() -> Result<Block, String> {
-    let key = credential(&["CMD_API_KEY", "COMMANDCODE_API_KEY"]).ok_or("没有 CMD_API_KEY")?;
+    let key = credential(&["CMD_API_KEY", "COMMANDCODE_API_KEY"]).ok_or("no CMD_API_KEY")?;
     let body = get_json("https://api.commandcode.ai/alpha/billing/credits", &key, &[]).await?;
     let limits = body.get("windowLimits").and_then(Value::as_object);
     let mut rows = Vec::new();
@@ -274,12 +274,12 @@ async fn commandcode() -> Result<Block, String> {
     }
     if remaining > 0.0 {
         rows.push(Row::Value {
-            label: "余额".to_string(),
+            label: "Balance".to_string(),
             value: format!("${remaining:.2}"),
         });
     }
     if rows.is_empty() {
-        return Err("接口没给任何窗口".to_string());
+        return Err("the API returned no windows".to_string());
     }
     Ok(Block {
         header: header("commandcode"),
@@ -340,7 +340,7 @@ async fn chatgpt() -> Result<Block, String> {
         });
     }
     if rows.is_empty() {
-        return Err("额度窗口是空的（这个账号可能不共享 ChatGPT 用量）".to_string());
+        return Err("no usage windows (this account may not share ChatGPT usage)".to_string());
     }
     Ok(Block {
         header: header("chatgpt"),
@@ -358,13 +358,13 @@ struct OpenAiCredential {
 async fn openai_credential() -> Result<OpenAiCredential, String> {
     let path = crate::ante_home().join("auth").join("openai.json");
     let text = std::fs::read_to_string(&path)
-        .map_err(|_| "还没登录（/connect → OpenAI）".to_string())?;
-    let stored: Value = serde_json::from_str(&text).map_err(|_| "auth/openai.json 读不出来".to_string())?;
+        .map_err(|_| "not signed in (/connect)".to_string())?;
+    let stored: Value = serde_json::from_str(&text).map_err(|_| "cannot read auth/openai.json".to_string())?;
     let access = stored
         .get("access_token")
         .and_then(Value::as_str)
         .filter(|token| !token.is_empty())
-        .ok_or("凭证里没有 access_token")?
+        .ok_or("the credential has no access_token")?
         .to_string();
     let expires_at = stored
         .get("expires_at")
@@ -378,7 +378,7 @@ async fn openai_credential() -> Result<OpenAiCredential, String> {
         .get("refresh_token")
         .and_then(Value::as_str)
         .filter(|token| !token.is_empty())
-        .ok_or("令牌已过期，且没有 refresh_token")?;
+        .ok_or("the token expired and there is no refresh_token")?;
     let issuer = crate::env_or("ANTEX_OPENAI_ISSUER", "https://auth.openai.com");
     let response = http()
         .post(format!("{issuer}/oauth/token"))
@@ -389,17 +389,17 @@ async fn openai_credential() -> Result<OpenAiCredential, String> {
         }))
         .send()
         .await
-        .map_err(|e| format!("续期请求发不出去：{e}"))?;
+        .map_err(|e| format!("the refresh request could not be sent: {e}"))?;
     let status = response.status();
     let body: Value = response.json().await.unwrap_or(Value::Null);
     if !status.is_success() {
-        return Err(format!("续期被拒（HTTP {status}），重新 /connect 一下"));
+        return Err(format!("refresh rejected (HTTP {status}); run /connect again"));
     }
     let access = body
         .get("access_token")
         .and_then(Value::as_str)
         .filter(|token| !token.is_empty())
-        .ok_or("续期响应里没有 access_token")?
+        .ok_or("the refresh response has no access_token")?
         .to_string();
     Ok(OpenAiCredential { access })
 }
@@ -431,7 +431,7 @@ async fn opencode() -> Result<Block, String> {
             Err(message) => return Err(message),
         }
     }
-    let key = credential(&["OPENCODE_ZEN_API_KEY"]).ok_or("没有 OPENCODE_ZEN_API_KEY")?;
+    let key = credential(&["OPENCODE_ZEN_API_KEY"]).ok_or("no OPENCODE_ZEN_API_KEY")?;
     let body = match get_json("https://opencode.ai/zen/go/v1/usage", &key, &[]).await {
         Ok(body) => body,
         Err(message) => {
@@ -440,9 +440,9 @@ async fn opencode() -> Result<Block, String> {
             return Ok(Block {
                 header: header("opencode"),
                 rows: vec![Row::Value {
-                    label: "状态".to_string(),
+                    label: "Status".to_string(),
                     value: if message.contains("Entitlement") {
-                        "无有效 Go 订阅".to_string()
+                        "no Go subscription".to_string()
                     } else {
                         message
                     },
@@ -453,7 +453,7 @@ async fn opencode() -> Result<Block, String> {
     };
     let block = console_block(&body);
     if block.rows.is_empty() {
-        return Err("用量接口没给窗口".to_string());
+        return Err("the usage API returned no windows".to_string());
     }
     Ok(block)
 }
@@ -555,8 +555,8 @@ fn row_lines(row: &Row) -> Vec<String> {
             ]
         }
         Row::Value { label, value } => {
-            // 值窄（余额、百分比）就对齐到右侧一列；状态类长文字（「还没登录」
-            // 「HTTP 403: …」）跟着标题排，别让 pad_left 从左边切掉半句话。
+            // 值窄（金额、百分比）就对齐到右侧一列；状态类长文字（`not signed in`、
+            // `HTTP 403: …`）跟着标题排，别让 pad_left 从左边切掉半句话。
             if display_width(value) <= PERCENT_WIDTH {
                 return vec![format!(
                     "{}{}{}",
@@ -596,7 +596,8 @@ fn countdown(reset_ms: Option<i64>) -> String {
 }
 
 /// 显示宽度：中日韩文字与全角标点占两列，终端按列切，不按字符切。
-/// 按字符数排的话「余额」这类标签会多占两列，值就被切掉尾巴（本机先错的就是这个）。
+/// 面板文案现在是英文，但错误详情可能是任何语言（接口回的 body 原样贴上来），
+/// 按字符数排的话中文标签会多占两列、值被切掉尾巴（本机先错的就是这个）。
 fn char_width(character: char) -> usize {
     match character as u32 {
         0x1100..=0x115F
@@ -712,7 +713,7 @@ async fn get_json(url: &str, bearer: &str, extra: &[(&str, &str)]) -> Result<Val
     for (name, value) in extra {
         request = request.header(*name, *value);
     }
-    let response = request.send().await.map_err(|e| format!("请求发不出去：{e}"))?;
+    let response = request.send().await.map_err(|e| format!("the request could not be sent: {e}"))?;
     let status = response.status();
     let body: Value = response.json().await.unwrap_or(Value::Null);
     if !status.is_success() {
@@ -721,7 +722,7 @@ async fn get_json(url: &str, bearer: &str, extra: &[(&str, &str)]) -> Result<Val
             .and_then(|error| error.get("type").or(error.get("message")))
             .or_else(|| body.get("error"))
             .and_then(Value::as_str)
-            .unwrap_or("接口拒绝了请求");
+            .unwrap_or("the API rejected the request");
         return Err(format!("HTTP {status}: {detail}"));
     }
     Ok(body)

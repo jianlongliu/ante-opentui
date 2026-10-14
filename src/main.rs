@@ -282,8 +282,8 @@ enum Link {
 impl Link {
     fn reason(&self) -> String {
         match self {
-            Link::Connecting => "还没连上".to_string(),
-            Link::Up => "连接正常".to_string(),
+            Link::Connecting => "not connected yet".to_string(),
+            Link::Up => "connected".to_string(),
             Link::Down { reason, .. } => reason.clone(),
         }
     }
@@ -1243,14 +1243,14 @@ fn question_answer_text(form: &Value, answer: &Value) -> String {
             .as_str()
             .or_else(|| field["description"].as_str())
             .unwrap_or(key);
-        lines.push(format!("- {label}：{picked}"));
+        lines.push(format!("- {label}: {picked}"));
     }
     if lines.is_empty() {
         // The client allows skipping a question, and "nothing" is an answer the
         // model should not have to guess at.
-        return "（用户跳过了这次提问，没有作答）".to_string();
+        return "(the user skipped this question)".to_string();
     }
-    format!("回答提问：\n{}", lines.join("\n"))
+    format!("Answering the question:\n{}", lines.join("\n"))
 }
 
 /// The readable part of a tool result, for the tool cell.
@@ -1345,7 +1345,10 @@ async fn ante_selfcheck() {
         let msg = format!(
             "自检：找不到 `ante` 可执行文件（找过 $ANTE_BIN、$PATH、~/.ante/bin/ante）。\n\
              没有它 TUI 照样能开，但每条消息都会石沉大海，所以这里直接退出。\n\
-             装好 Ante，或用 ANTE_BIN 指到它的路径。"
+             装好 Ante，或用 ANTE_BIN 指到它的路径。\n\
+             self-check: no `ante` executable found (looked at $ANTE_BIN, $PATH, ~/.ante/bin/ante).\n\
+             Without it the TUI still opens and every message goes nowhere, so this exits here.\n\
+             Install Ante, or point ANTE_BIN at it."
         );
         report_startup(&msg);
         std::process::exit(1);
@@ -1360,17 +1363,24 @@ async fn ante_selfcheck() {
         Some(found) if !same_series(&found, built) => {
             let msg = format!(
                 "自检：协议可能对不上——antex 是按 ante-sdk {built} 编的，本机 {} 是 ante {found}。\n\
-                 若发消息没反应，就是这个：改 Cargo.toml 的 ante-sdk 版本后 `cargo build --release`。",
+                 若发消息没反应，就是这个：改 Cargo.toml 的 ante-sdk 版本后 `cargo build --release`。\n\
+                 self-check: the protocol may not match — antex was built against ante-sdk {built} while {} ships ante {found}.\n\
+                 If prompts go unanswered, this is why: bump ante-sdk in Cargo.toml and `cargo build --release`.",
+                bin.display(),
                 bin.display()
             );
             report_startup(&msg);
         }
         Some(found) => log_line(&format!(
-            "自检：{} → ante {found}；antex 编译于 ante-sdk {built}，同一版本系列（协议按系列走）",
+            "自检：{} → ante {found}；antex 编译于 ante-sdk {built}，同一版本系列（协议按系列走）\n\
+             self-check: {} → ante {found}; antex built against ante-sdk {built} — same version series (the protocol follows the series)",
+            bin.display(),
             bin.display()
         )),
         None => log_line(&format!(
-            "自检：{} --version 没给出可用版本号，无法核对协议版本（编译用的 ante-sdk {built}）",
+            "自检：{} --version 没给出可用版本号，无法核对协议版本（编译用的 ante-sdk {built}）\n\
+             self-check: {} --version gave no usable version, so the protocol version cannot be checked (built against ante-sdk {built})",
+            bin.display(),
             bin.display()
         )),
     }
@@ -1678,14 +1688,14 @@ mod herdr {
 /// dialed — so a host that dies on startup only shows up as a stream that
 /// closes immediately, which the caller's backoff handles.
 async fn connect_ante() -> Result<ante_sdk::Client, String> {
-    let endpoint: ante_sdk::Endpoint = "stdio".parse().map_err(|err| format!("端点解析失败：{err}"))?;
+    let endpoint: ante_sdk::Endpoint = "stdio".parse().map_err(|err| format!("cannot parse the endpoint: {err}"))?;
     let bin = ante_executable();
     let mut options = ConnectOptions::default();
     options.executable = bin.clone();
     connect(endpoint, options).await.map_err(|err| {
         format!(
-            "连接失败：{err}\n  ante = {}；antex 编译于 ante-sdk {}",
-            bin.map(|p| p.display().to_string()).unwrap_or_else(|| "（没找到）".into()),
+            "could not connect: {err}\n  ante = {}; antex built against ante-sdk {}",
+            bin.map(|p| p.display().to_string()).unwrap_or_else(|| "(not found)".into()),
             env!("ANTE_SDK_VERSION"),
         )
     })
@@ -1718,7 +1728,7 @@ async fn spawn_ante(store: Store) {
                 let reason = pump_events(&store, rx).await;
                 (reason.clone(), reason)
             }
-            Err(err) => ("连不上 ante".to_string(), err),
+            Err(err) => ("cannot reach Ante".to_string(), err),
         };
         // The connection is gone. Drop the handle first: it is what makes a
         // later prompt take the "not connected" path instead of sending into a
@@ -1858,7 +1868,7 @@ fn announce_offline(store: &Store, session: &str, reason: &str, open_message: Op
         json!({
             "type": "ante_disconnected",
             "message": format!(
-                "与 Ante 后端的连接断了（{reason}）。antex 正在自动重连，之后排队的消息会自动发出去。"
+                "The connection to the Ante backend dropped ({reason}). antex is reconnecting automatically; queued messages will go out afterwards."
             ),
         }),
         open_message,
@@ -1875,7 +1885,7 @@ fn announce_unresumed(store: &Store, session: &str) {
         session,
         json!({
             "type": "session_unresumed",
-            "message": "这条会话在 Ante 里打不开（上一轮没跑完就被杀了，存档没落盘），接不上上次那段；掉线期间排队的消息还在，下一条消息会新开一条会话带走它。",
+            "message": "Ante cannot reopen this session (the last turn was killed before its archive was written), so the previous stretch cannot be picked back up. Messages queued while offline are still here; the next one opens a new session and takes them along.",
         }),
         None,
     );
@@ -2531,8 +2541,8 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
                 // `blocked`: the turn is waiting on the user, which is exactly
                 // what Herdr wants to notify about and can wait on.
                 let waiting = format!(
-                    "等待批准：{}",
-                    tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>().join("、")
+                    "Waiting for approval: {}",
+                    tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>().join(", ")
                 );
                 let payload = json!({
                     "id": request_id,
@@ -2564,14 +2574,14 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
         announce_offline(
             store,
             &session,
-            if goodbye { "Ante 关闭了连接" } else { "事件流结束" },
+            if goodbye { "Ante closed the connection" } else { "the event stream ended" },
             open.as_deref(),
         );
     }
     if goodbye {
-        "Ante 关闭了连接".to_string()
+        "Ante closed the connection".to_string()
     } else {
-        "事件流结束".to_string()
+        "the event stream ended".to_string()
     }
 }
 
@@ -2955,8 +2965,8 @@ const AGENTS: [&str; 3] = ["strict", "auto", "yolo"];
 
 fn agent_description(agent: &str) -> &'static str {
     match agent {
-        "strict" => "Ask unless provably safe（Ante 的默认）",
-        "yolo" => "Never ask（跳过全部检查）",
+        "strict" => "Ask unless provably safe (Ante's default)",
+        "yolo" => "Never ask (skip every check)",
         _ => "Act unless provably dangerous",
     }
 }
@@ -3279,7 +3289,7 @@ async fn session_delete(State(store): State<Store>, Path(id): Path<String>) -> R
     if !safe_id(&id) {
         return (
             axum::http::StatusCode::BAD_REQUEST,
-            Json(json!({ "message": format!("不认识的会话 id：{id}") })),
+            Json(json!({ "message": format!("unknown session id: {id}") })),
         )
             .into_response();
     }
@@ -3288,7 +3298,7 @@ async fn session_delete(State(store): State<Store>, Path(id): Path<String>) -> R
     let Some(archive) = store.ante.archive_of(&id) else {
         return (
             axum::http::StatusCode::NOT_FOUND,
-            Json(json!({ "message": format!("没有 {id} 的会话存档") })),
+            Json(json!({ "message": format!("no archive for session {id}") })),
         )
             .into_response();
     };
@@ -3298,14 +3308,14 @@ async fn session_delete(State(store): State<Store>, Path(id): Path<String>) -> R
     if store.ante.busy() && store.ante.live_id().as_deref() == Some(id.as_str()) {
         return (
             axum::http::StatusCode::BAD_REQUEST,
-            Json(json!({ "message": "这个会话正在跑，先中断（Esc）再删" })),
+            Json(json!({ "message": "this session is running; interrupt it (Esc) before deleting" })),
         )
             .into_response();
     }
     if let Err(err) = std::fs::remove_dir_all(&dir) {
         return (
             axum::http::StatusCode::BAD_REQUEST,
-            Json(json!({ "message": format!("删不掉 {id}：{err}") })),
+            Json(json!({ "message": format!("cannot delete {id}: {err}") })),
         )
             .into_response();
     }
@@ -3784,7 +3794,7 @@ async fn session_update(
     Json(body): Json<Value>,
 ) -> Response {
     if !safe_id(&id) {
-        return bad_request(format!("不认识的会话 id：{id}"));
+        return bad_request(format!("unknown session id: {id}"));
     }
     // `metadata` and `permissions` are the route's other two keys: neither is
     // something Ante has, and the client only ever sends them beside a title.
@@ -3829,7 +3839,7 @@ async fn session_update(
 /// which the client reports as `UnexpectedStatus: 200` — true, but unreadable.
 async fn session_move(Path(_id): Path<String>, Json(_body): Json<Value>) -> Response {
     bad_request(
-        "Ante 的会话目录在建会话时就定死了，没有换目录的接口。要换目录请开一条新会话（/new）"
+        "Ante fixes a session's directory when the session is created and has no op to change it. To work elsewhere, start a new session (/new)."
             .to_string(),
     )
 }
@@ -4251,11 +4261,11 @@ async fn session_prompt(
         // Ante is told the image never arrived instead of guessing — and the
         // user gets a card in the corner.
         for reason in &dropped {
-            let note = format!("\n【附件没有发出去：{reason}】");
+            let note = format!("\n[attachment not sent: {reason}]");
             text.push_str(&note);
             staged.push_str(&note);
         }
-        osd_notice(&format!("附件没有发出去：{}", dropped.join("；")));
+        osd_notice(&format!("Attachment not sent: {}", dropped.join("; ")));
     }
     if !files.is_empty() {
         log_line(&format!("attachments: 暂存 {} 个附件，随消息提及给 Ante", files.len()));
@@ -4773,12 +4783,12 @@ mod tests {
         let answer = json!({ "q0": "先不发，攒着", "q1": ["Diff", "Subagent"] });
         assert_eq!(
             question_answer_text(&form, &answer),
-            "回答提问：\n- 发版：先不发，攒着\n- Checks：Diff, Subagent"
+            "Answering the question:\n- 发版: 先不发，攒着\n- Checks: Diff, Subagent"
         );
         // A question left blank is not an answer, and a fully blank form is still
         // worth saying out loud — "nothing" is not something to guess at.
-        assert!(question_answer_text(&form, &json!({ "q0": "" })).contains("跳过"));
-        assert_eq!(question_answer_text(&form, &json!({})), "（用户跳过了这次提问，没有作答）");
+        assert!(question_answer_text(&form, &json!({ "q0": "" })).contains("skipped"));
+        assert_eq!(question_answer_text(&form, &json!({})), "(the user skipped this question)");
     }
 
     #[test]

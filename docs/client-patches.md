@@ -27,6 +27,25 @@
 - **上游更新后**（`git subtree pull`）跑一次 `script/build-tui.sh` 即可；两步合一就是下面那条 `./script/upgrade-upstream.sh`。
 - 想临时切回官方二进制：`ANTEX_CLIENT=opencode2 antex`。
 
+## 文案语言：界面英文，日志中文
+
+**规则（2026-10-15 定）：垫片喂进界面的字符串一律英文。** 这个 TUI 的壳、按钮、报错全是上游英文，中英混排看着像坏了一半；而**只给人读的日志与终端输出保留中文**（`/tmp/antex.log` 里那些 `ante: …`、`antex serve` 的启动横幅、CLI 参数错误）。
+
+判据是「会不会画进 TUI」——按这条，这六处是英文：
+
+| 处 | 在哪 |
+| --- | --- |
+| 额度面板的标签与失败原因 | `src/quota.rs`（`Balance` / `Unavailable` / `Status` / `not signed in (/connect)` / 各类取数错误） |
+| `/connect` 对话框的正文 | `src/integrations.rs`（未实现、超时、令牌交换被拒…） |
+| agents / 权限模式的描述 | `src/main.rs` 的 `agent_description()`（`Ask unless provably safe (Ante's default)`…） |
+| 转录里垫片自己插的说明行 | 断线重连、会话打不开那两条 |
+| 会话类接口的报错原文 | `/cd` 的拒绝、删除会话的三种失败（客户端原样显示垫片的 message） |
+| 附件被丢时的那句 | 追加进消息正文的 `[attachment not sent: …]` + `omarchy-osd` 的角标卡片 |
+
+**启动自检是双语**（它只进日志与 `serve` 的 stdout）：中文那行在前、`self-check:` 那行在后，两边同义，见 `src/main.rs` 的 `ante_selfcheck`。
+
+**改文案的注意**：① 面板按 36 列排版（`quota.rs` 的 `WIDTH`），英文标签更长，改完要跑一次 PTY 探针看换行；② `display_width` 那套「CJK 算两列」留着——面板上仍可能贴出接口回的中文错误详情；③ 只改文案不动逻辑：客户端判「有没有数据」看的是 `available` 字段，不解析文字；④ 两处测试断言跟着文案走（`the_answer_reads_back_as_the_user_would_say_it`、`a_dropped_attachment_says_so_in_the_message`）。
+
 ## 屏蔽做不了的入口
 
 Ante 没有 VCS/diff、MCP、revert、分享、PTY。垫片对这些一律答 **200 + 空**（落进通用 fallback 也是 200），**不报错**——所以它们的坏法是「点了没反应」或空面板，不是弹错误框。这类入口分四层摘：

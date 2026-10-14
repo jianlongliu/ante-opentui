@@ -75,7 +75,7 @@
   - **排版是 36 列**（上游插件的侧栏宽度）：百分比行 = 名字 27 + 倒计时 7，第二行 = 进度条 25 + `NN% used` 9；值行 = 名字 **25** + 值 9（**别照抄百分比行的 27**：27+2+9=38 会被客户端切掉值的尾巴，本机就是这么先错了一版）。用掉 0% 的窗口不显示倒计时（与上游一致）。
   - **验证法**（数据面，不必进 TUI）：`set -a; . ~/.zshenv; set +a`（四家的 key 在 `~/.zshenv`）后 `./target/release/antex serve 41997`，再 `curl -s -X POST -H 'content-type: application/json' -d '{"input":{"sessionID":"ses_…"}}' http://127.0.0.1:41997/api/rpc/antex.quota/panel | python3 -m json.tool`，逐行量宽度应 ≤36。
   - **验证法**（画面）：`uv run --with pyte script/tui_drive.py --cmd "cd $HOME && exec ~/.local/bin/antex-tui --server http://127.0.0.1:41997 $HOME" --send $'3:\x18l' --send $'6:\r' --after 30 --cols 150 --rows 46`（`ctrl+x` `l` 开会话列表、回车进最新一条），侧栏应出现 `▼ Quota` 与四块内容。
-  - **OpenCode Go 的实情（2026-10-14 实测）**：`/zen/go/v1/usage` 对没有 Go 订阅的 key 回 `403 EntitlementError`；连 Go 模型调用都回 `403 … An active OpenCode Go subscription is required to use Go models`（`deepseek-v4-flash` / `glm-5.2` / `minimax-m3` 都一样，且推理请求必须带 `x-opencode-session` 头，否则是另一条 `MissingSessionID`）。所以这一行现在如实显示「无有效 Go 订阅」而不是假装有窗口。真要看 5h/周/月窗口得走 console（`opencode.ai/console/api/go/status`，`access.meters.{fiveHour,week,month}`），那需要 console 会话令牌：垫片认 `OPENCODE_CONSOLE_TOKEN`（+ 可选 `OPENCODE_CONSOLE_ORG_ID`）环境变量，给了就走 console、没给才退回 key。
+  - **OpenCode Go 的实情（2026-10-14 实测）**：`/zen/go/v1/usage` 对没有 Go 订阅的 key 回 `403 EntitlementError`；连 Go 模型调用都回 `403 … An active OpenCode Go subscription is required to use Go models`（`deepseek-v4-flash` / `glm-5.2` / `minimax-m3` 都一样，且推理请求必须带 `x-opencode-session` 头，否则是另一条 `MissingSessionID`）。所以这一行现在如实显示 `Status: no Go subscription` 而不是假装有窗口。真要看 5h/周/月窗口得走 console（`opencode.ai/console/api/go/status`，`access.meters.{fiveHour,week,month}`），那需要 console 会话令牌：垫片认 `OPENCODE_CONSOLE_TOKEN`（+ 可选 `OPENCODE_CONSOLE_ORG_ID`）环境变量，给了就走 console、没给才退回 key。
 
 ### 未完成项的验证法
 
@@ -106,6 +106,14 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 
 **这里只放手上的活与开放问题；功能缺口（空框）看 [README](../README.md)「状态」清单。**
 
+**视觉一致性：界面文案改英文（2026-10-15，本机未出包）**
+
+- **规则**：**垫片喂进界面的字符串一律英文**，只给人读的日志与终端输出保留中文（`/tmp/antex.log` 的 `ante: …`、`serve` 的启动横幅、CLI 参数错误）；**启动自检双语**（中文行 + `self-check:` 行，同义）。完整清单与判据见 [client-patches.md](client-patches.md) 的「文案语言」。
+- **为什么**：这个 TUI 的壳、按钮、报错全是上游英文，中英混排看着像坏了一半；本机 locale 也是 `en_US.UTF-8`。
+- **改了六处**：① 额度面板（`src/quota.rs`：`Balance` / `Unavailable` / `Status` / `no Go subscription` / `not signed in (/connect)`，以及全部取数失败原因）；② `/connect` 对话框（`src/integrations.rs`，含 `ante auth login antix` 那串错误、回调端口被占、令牌交换被拒）；③ 转录里垫片自己插的说明行（断线重连、会话打不开）；④ 会话接口的报错原文（`/cd` 的拒绝、删除会话三种失败、rename 的 400/404，客户端原样显示垫片的 message）；⑤ agents / 权限模式的描述（`agent_description()`，之前三条里两条中文）；⑥ 附件被丢时追加进消息的 `[attachment not sent: …]` + `omarchy-osd` 卡片、herdr pane 的 `Waiting for approval: …`。
+- **日志侧一个字没动**：那些 `ante: …` / `session: …` 是人读的排错线索，跟界面无关。
+- **验法**：`cargo test`（26 项；两处断言跟着文案改：`the_answer_reads_back_as_the_user_would_say_it`、`a_dropped_attachment_says_so_in_the_message`）；接口级 `antex serve PORT` 后 `curl /api/agent`（三条描述应全英文）、`POST /api/session/x/move`（英文 400）、`POST /api/rpc/antex.quota/panel`（标签英文、36 列排得下）、`POST /api/integration/anthropic-subscription/connect/oauth`（英文解释）；画面用 `script/tui_drive.py` 进一条会话看侧栏。**注意**：`/api/health` 的 `reason`（`not connected yet` / `connected` / 连接失败原文）也跟着改了——它虽然不进界面，但会出现在转录那条断线说明里。
+
 **上游同步（2026-10-15，本机未出包）：opencode 2.0.26 → 2.0.29**
 
 - **上游换线了**：我们原先跟的 `v2` 分支最后提交是 **2026-10-10**、版本停在 2.0.26；上游把 v2 线并回了默认分支（`dev`），之后按 `v2.0.x` 打 tag。这次 `git subtree pull` 拉的是 **tag `v2.0.29`**（`@042d0832`，含我们那份 `4617210`）。`script/upgrade-upstream.sh` 的 ref 因此从写死的 `v2` 改成**第一个参数、默认 `dev`**（想跟着某个已发布版本就传 tag），并顺带把「按 lock 装依赖」补成脚本里的一步（`bun install --frozen-lockfile`，上游 lock 常跟着变）。
@@ -120,7 +128,7 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 - **CI 加一个 `macos-latest` job**，出 `antex-<版本>-macos-arm64.tar.gz`（`bin/{antex,antex-tui,opencode2}` + README）；同时把「挂 Release」从 Arch 那个 job 里拆出来成第三个 job（`needs: [pkg, macos]`）——两个平台各自 `upload-artifact`，最后一个 job 统一 `softprops/action-gh-release`，免得两个 job 在同一个 tag 上抢建 Release。
 - **为什么必须跑在 macOS 上**：垫片要 Apple SDK；客户端是 bun `--single`，脚本只给同平台出产物（`build.ts` 里 `item.os !== process.platform` 就跳过）。**不需要本机那台 Mac mini**——`macos-latest` 就是 arm64。
 - **代码只有一处平台差别**：`/connect` 打开浏览器（`src/integrations.rs` 的 `browser_opener()`，macOS 用 `open`）。其余无 Linux 专属：没有 `/proc`、没有 systemd；`omarchy-osd` 那处在 macOS 上找不到可执行文件就静默跳过；herdr 上报门控在 `HERDR_ENV=1`。
-- **验法**：CI 里两个 job 都绿 + Release 上两个产物都在（`gh release view v<版本> --json assets`）。**2026.10.15.2 已在 Mac mini（macOS 27 / arm64）实测**：解包后 `bin/{antex,antex-tui,opencode2}` 放进 `~/.local/bin`，`antex-tui --version` 正常（`opencode v0.0.0-detached-21`），`antex serve 45999` 起得来——自检那行是 `ante 0.2.11；antex 编译于 ante-sdk 0.2.10，同一版本系列`，`/api/health` 回 `ante.connected: true`，`POST /api/rpc/antex.quota/panel` 也照常应答。**注意**：那台机器上额度取数走不通（DeepSeek/Command Code 回「请求发不出去」，Go 没有 key），那是它的网络/凭据问题，不是产物问题——面板照样如实显示「未取到」。
+- **验法**：CI 里两个 job 都绿 + Release 上两个产物都在（`gh release view v<版本> --json assets`）。**2026.10.15.2 已在 Mac mini（macOS 27 / arm64）实测**：解包后 `bin/{antex,antex-tui,opencode2}` 放进 `~/.local/bin`，`antex-tui --version` 正常（`opencode v0.0.0-detached-21`），`antex serve 45999` 起得来——自检那行是 `ante 0.2.11；antex 编译于 ante-sdk 0.2.10，同一版本系列`，`/api/health` 回 `ante.connected: true`，`POST /api/rpc/antex.quota/panel` 也照常应答。**注意**：那台机器上额度取数走不通（DeepSeek/Command Code 回「请求发不出去」，Go 没有 key），那是它的网络/凭据问题，不是产物问题——面板照样如实显示 `Unavailable`（当时那版还是中文标签）。
 
 **`2026.10.15`（已出）：`/connect` + 侧栏额度面板**
 
@@ -136,9 +144,9 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 - **为什么不装现成的 opencode 插件**：`@slkiser/opencode-quota` 这类插件的取数半边跑在 opencode 自己的 server 进程里（`opencode.jsonc` 的 `plugin: […]` 由它加载），客户端那半边只通过**服务端插件 RPC** 取数。垫片换掉了那个 server、又不跑 JS，所以插件装上去一动不动；界面只能自己给——做法是**垫片出数 + 自编客户端里一块内置插件画**（`src/quota.rs` + `tui/src/feature-plugins/sidebar/quota.tsx`，注册在 `plugin/builtins.ts`）。
 - **走 `rpc.call` 这条通路**：客户端侧栏调 `POST /api/rpc/antex.quota/panel`（`{input:{sessionID}}` → `{output:{data:{lines,active,updatedAt}}}`）。生成式 client 里只有 `rpc.call` 是「任意 id + 任意方法」，客户端补丁因此不必改生成代码，垫片也不必自造 `/api/quota`。
 - **四家取数与凭据**：`api.deepseek.com/user/balance`、`api.commandcode.ai/alpha/billing/credits`（差 M 窗口时再问 `…/alpha/billing/subscriptions`，按 `planId` 查额度表换算百分比）、`chatgpt.com/backend-api/wham/usage`（`rate_limit.primary_window` / `secondary_window`；账号 id 取 access token 的 `chatgpt_account_id`，凭证用 `/connect` 落下的 `auth/openai.json`，过期现刷、**不写回**）、`opencode.ai/zen/go/v1/usage`。凭据顺序：环境变量 → `auth/api_keys.json`。缓存按 provider：成功 5 分钟、失败 60 秒。
-- **排版按显示列，不按字符数**：面板宽 36 列（侧栏 42 宽减 4 内边距再减 1 滚动条），CJK 与全角标点算两列——按 `chars().count()` 排会让「余额」这类标签多占两列、值被切尾（本机先错的就是这个，值行还额外多算 2 列）。推进 TUI 会显示 `No quota data available` 而不是报错：那说明**垫片那份二进制没有 `/api/rpc` 路由**（老的 `/usr/bin/antex` 对未知路径回空信封），不是面板坏了。
+- **排版按显示列，不按字符数**：面板宽 36 列（侧栏 42 宽减 4 内边距再减 1 滚动条），CJK 与全角标点算两列——按 `chars().count()` 排会让中文标签多占两列、值被切尾（本机先错的就是这个，值行还额外多算 2 列）。面板文案现在是英文，但这套宽度计算留着：接口回的错误详情可能是任何语言。推进 TUI 会显示 `No quota data available` 而不是报错：那说明**垫片那份二进制没有 `/api/rpc` 路由**（老的 `/usr/bin/antex` 对未知路径回空信封），不是面板坏了。
 - **验法**：见 [README](../README.md)「已实现」那条与实现清单里的命令（`set -a; . ~/.zshenv; set +a` 后 `antex serve PORT` + `curl … /api/rpc/antex.quota/panel`；画面用 `script/tui_drive.py --send $'3:\x18l' --send $'6:\r'` 进会话看侧栏）。
-- **Go 那条现状**：`/zen/go/v1/usage` 对无 Go 订阅的 key 回 `403 EntitlementError`，面板如实显示「无有效 Go 订阅」；要看 5h/周/月窗口得走 console（`opencode.ai/console/api/go/status`），垫片认 `OPENCODE_CONSOLE_TOKEN`（+ 可选 `OPENCODE_CONSOLE_ORG_ID`）。
+- **Go 那条现状**：`/zen/go/v1/usage` 对无 Go 订阅的 key 回 `403 EntitlementError`，面板如实显示 `Status: no Go subscription`；要看 5h/周/月窗口得走 console（`opencode.ai/console/api/go/status`），垫片认 `OPENCODE_CONSOLE_TOKEN`（+ 可选 `OPENCODE_CONSOLE_ORG_ID`）。
 
 - **发版插曲（`tag v2026.10.14` 那次 CI 挂了）**：`ld.lld: error: undefined symbol: ring_core_0_17_14__…`。根因是 makepkg 默认把 `-flto=auto` 塞进 CFLAGS，而本版新引入的 ring（`reqwest → rustls`）的汇编目标在 `lld + -Wl,--gc-sections` 下会丢符号——本机 `cargo build --release` 不带那份 CFLAGS，所以本地怎么试都编得过，只能在容器里复现。修法一行：`PKGBUILD` 的 `options` 加 `'!lto'`（在 archlinux 容器里实测；另两条已验证的绕法是 `-Clink-arg=-fuse-ld=bfd`、`-Clink-arg=-Wl,--no-gc-sections`）。**`v2026.10.14` 这个 tag 就作废了**（CI 失败、也没产物），版本按规矩往前走到 `2026.10.15`；排查过程见 [pitfalls.md](pitfalls.md)。验包：`tar --zstd -xOf <包> usr/bin/antex | grep -c antex.quota` 应 ≥1，`usr/bin/antex-tui` 里应能找到 `antex.sidebar.quota`。
 

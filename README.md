@@ -264,9 +264,10 @@ Ante 侧有硬上限：约 240KB base64（≈170KB 原文件）以上直接丢�
 改自编客户端（内置插件，见 [docs/client-patches.md](docs/client-patches.md)），或让垫片直接喂数据
 （例如额度面板走的 `POST /api/rpc/…`）。
 
-**侧栏额度显示「未取到」/「无有效 Go 订阅」？**
-「未取到」多半是凭据或网络：垫片按顺序找环境变量（`DEEPSEEK_API_KEY`、`CMD_API_KEY`、`OPENCODE_ZEN_API_KEY`…）
-→ `~/.ante/auth/api_keys.json`；ChatGPT 那一行要先 `/connect`。OpenCode Go 若显示「无有效 Go 订阅」，
+**侧栏额度显示 `Unavailable` / `Status: no Go subscription`？**
+面板文案是英文（跟 TUI 走，见 [docs/client-patches.md](docs/client-patches.md) 的「文案语言」）。`Unavailable` 多半是凭据或网络：
+垫片按顺序找环境变量（`DEEPSEEK_API_KEY`、`CMD_API_KEY`、`OPENCODE_ZEN_API_KEY`…）
+→ `~/.ante/auth/api_keys.json`；ChatGPT 那一行要先 `/connect`。OpenCode Go 显示 `Status: no Go subscription`，
 那是订阅本身的状态（`/zen/go/v1/usage` 会回 `403 EntitlementError`），不是面板坏了。
 
 **装完没生效 / 改了界面没变化？**

@@ -220,18 +220,18 @@ fn backup_once(path: &FsPath) {
 /// reader ever sees a half-written store.
 fn write_private(path: &FsPath, body: &str) -> Result<(), String> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("建 {} 失败：{e}", dir.display()))?;
+        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     }
     backup_once(path);
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    std::fs::write(&tmp, body).map_err(|e| format!("写 {} 失败：{e}", tmp.display()))?;
+    std::fs::write(&tmp, body).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("设置权限失败：{e}"))?;
+            .map_err(|e| format!("cannot set permissions: {e}"))?;
     }
-    std::fs::rename(&tmp, path).map_err(|e| format!("落盘 {} 失败：{e}", path.display()))
+    std::fs::rename(&tmp, path).map_err(|e| format!("cannot move into place {}: {e}", path.display()))
 }
 
 // --------------------------------------------------------- integration shape --
@@ -265,7 +265,7 @@ fn integration_json(p: &Provider, keys: &Map<String, Value>, presets: &[String])
         if keys.contains_key(env) {
             connections.push(json!({
                 "type": "credential", "id": p.id, "method": "key",
-                "label": format!("{env}（auth/api_keys.json 里的）"),
+                "label": format!("{env} (from auth/api_keys.json)"),
             }));
         }
     }
@@ -288,7 +288,7 @@ pub async fn get(Path(id): Path<String>) -> Response {
     let presets = stored_presets();
     match providers().await.iter().find(|p| p.id == id) {
         Some(p) => crate::envelope(integration_json(p, &keys, &presets)).into_response(),
-        None => error(StatusCode::NOT_FOUND, format!("Ante 的 catalog 里没有 {id}")),
+        None => error(StatusCode::NOT_FOUND, format!("Ante's catalog has no {id}")),
     }
 }
 
@@ -298,17 +298,17 @@ pub async fn get(Path(id): Path<String>) -> Response {
 /// provider's `env_key`, so both front-ends see one store.
 pub async fn connect_key(Path(id): Path<String>, Json(body): Json<Value>) -> Response {
     let Some(p) = provider(&id).await else {
-        return error(StatusCode::NOT_FOUND, format!("Ante 的 catalog 里没有 {id}"));
+        return error(StatusCode::NOT_FOUND, format!("Ante's catalog has no {id}"));
     };
     let Some(env) = p.env_key.clone() else {
         return error(
             StatusCode::BAD_REQUEST,
-            format!("{} 不是按 API key 登录的供应商（catalog 里没有 env_key）", p.name),
+            format!("{} is not a provider that signs in with an API key (its catalog entry has no env_key)", p.name),
         );
     };
     let key = body.get("key").and_then(Value::as_str).unwrap_or("").trim().to_string();
     if key.is_empty() {
-        return error(StatusCode::BAD_REQUEST, "key 是空的");
+        return error(StatusCode::BAD_REQUEST, "the key is empty");
     }
     let mut keys = read_api_keys();
     keys.insert(env, Value::String(key));
@@ -349,7 +349,7 @@ pub async fn credentials() -> Json<Value> {
 /// the file for an OAuth preset, the entry for a saved key.
 pub async fn credential_delete(Path(id): Path<String>) -> Response {
     let Some(p) = provider(&id).await else {
-        return error(StatusCode::NOT_FOUND, format!("Ante 的 catalog 里没有 {id}"));
+        return error(StatusCode::NOT_FOUND, format!("Ante's catalog has no {id}"));
     };
     let mut removed = false;
     if let Some(preset) = &p.preset {
@@ -357,7 +357,7 @@ pub async fn credential_delete(Path(id): Path<String>) -> Response {
         if path.is_file() {
             backup_once(&path);
             if let Err(e) = std::fs::remove_file(&path) {
-                return error(StatusCode::INTERNAL_SERVER_ERROR, format!("删 {} 失败：{e}", path.display()));
+                return error(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot delete {}: {e}", path.display()));
             }
             removed = true;
         }
@@ -374,7 +374,7 @@ pub async fn credential_delete(Path(id): Path<String>) -> Response {
     if removed {
         StatusCode::NO_CONTENT.into_response()
     } else {
-        error(StatusCode::NOT_FOUND, format!("{} 没有存下来的凭证", p.name))
+        error(StatusCode::NOT_FOUND, format!("no stored credential for {}", p.name))
     }
 }
 
@@ -387,7 +387,7 @@ pub async fn credential_activate(Path(_id): Path<String>) -> Response {
 pub async fn credential_update(Path(_id): Path<String>, Json(_body): Json<Value>) -> Response {
     error(
         StatusCode::BAD_REQUEST,
-        "Ante 的凭证没有可改的标签：它按供应商命名（auth/<preset>.json、auth/api_keys.json 的 env 名）",
+        "Ante's credentials have no editable label: they are named after the provider (auth/<preset>.json, or the env name in auth/api_keys.json)",
     )
 }
 
@@ -435,10 +435,10 @@ fn status_json(attempt: &Attempt) -> Value {
 
 pub async fn connect_oauth(Path(id): Path<String>, Json(_body): Json<Value>) -> Response {
     let Some(p) = provider(&id).await else {
-        return error(StatusCode::NOT_FOUND, format!("Ante 的 catalog 里没有 {id}"));
+        return error(StatusCode::NOT_FOUND, format!("Ante's catalog has no {id}"));
     };
     let Some(preset) = p.preset.clone() else {
-        return error(StatusCode::BAD_REQUEST, format!("{} 不是 OAuth 登录的供应商", p.name));
+        return error(StatusCode::BAD_REQUEST, format!("{} is not a provider that signs in with OAuth", p.name));
     };
     let attempt_id = format!("att_{}", token(9));
     let created_ms = crate::now_ms();
@@ -456,7 +456,7 @@ pub async fn connect_oauth(Path(id): Path<String>, Json(_body): Json<Value>) -> 
         "openai" => start_openai(&attempt_id).await,
         "antix" => start_antix(&attempt_id).await,
         other => Err(format!(
-            "antex 还没实现 {other} 的 OAuth。Ante 的 TUI 能签的三个里，ChatGPT 由 antex 自己跑、Antix 走 `ante auth login`，{other} 目前只能去 Ante 自己的 TUI 里签一次。"
+            "antex has no OAuth for {other} yet. Of the three Ante can sign in, ChatGPT is handled here and Antix goes through `ante auth login`; {other} still has to be signed in from Ante's own TUI."
         )),
     };
     match started {
@@ -484,7 +484,7 @@ pub async fn oauth_status(Path((_integration, attempt_id)): Path<(String, String
     let map = attempts().lock().await;
     match map.get(&attempt_id) {
         Some(attempt) => crate::envelope(status_json(attempt)).into_response(),
-        None => error(StatusCode::NOT_FOUND, "没有这次登录尝试（已经结束了）"),
+        None => error(StatusCode::NOT_FOUND, "no such sign-in attempt (it has already finished)"),
     }
 }
 
@@ -504,10 +504,10 @@ pub async fn oauth_complete(Path((_integration, attempt_id)): Path<(String, Stri
     if attempts().lock().await.contains_key(&attempt_id) {
         error(
             StatusCode::BAD_REQUEST,
-            "这次登录是浏览器回调收尾的，不用粘授权码",
+            "this sign-in finishes on its own browser callback; there is no code to paste",
         )
     } else {
-        error(StatusCode::NOT_FOUND, "没有这次登录尝试（已经结束了）")
+        error(StatusCode::NOT_FOUND, "no such sign-in attempt (it has already finished)")
     }
 }
 
@@ -525,7 +525,7 @@ async fn start_openai(attempt_id: &str) -> Result<(String, String, CancelFn), St
 &id_token_add_organizations=true&codex_cli_simplified_flow=true"
     );
     let listener = TcpListener::bind(("127.0.0.1", OPENAI_CALLBACK_PORT)).await.map_err(|e| {
-        format!("回调端口 {OPENAI_CALLBACK_PORT} 用不了（Ante 自己的 /connect 或 Codex CLI 正在登录？）：{e}")
+        format!("callback port {OPENAI_CALLBACK_PORT} is unusable (is Ante's own /connect or the Codex CLI signing in already?): {e}")
     })?;
     let (tx_code, rx_code) = oneshot::channel::<Result<String, String>>();
     let (tx_stop, rx_stop) = oneshot::channel::<()>();
@@ -542,10 +542,10 @@ async fn start_openai(attempt_id: &str) -> Result<(String, String, CancelFn), St
         let outcome = tokio::select! {
             landed = rx_code => match landed {
                 Ok(verdict) => verdict,
-                Err(_) => Err("回调监听停了".to_string()),
+                Err(_) => Err("the callback listener stopped".to_string()),
             },
             _ = rx_cancel => Err(String::new()),
-            _ = tokio::time::sleep(ATTEMPT_TTL) => Err("授权超时（5 分钟）".to_string()),
+            _ = tokio::time::sleep(ATTEMPT_TTL) => Err("authorization timed out (5 minutes)".to_string()),
         };
         let _ = tx_stop.send(());
         match outcome {
@@ -553,13 +553,13 @@ async fn start_openai(attempt_id: &str) -> Result<(String, String, CancelFn), St
                 Ok(()) => set_state(&id, AttemptState::Done).await,
                 Err(message) => set_state(&id, AttemptState::Failed(message)).await,
             },
-            Err(message) if message.is_empty() => set_state(&id, AttemptState::Failed("已取消".into())).await,
+            Err(message) if message.is_empty() => set_state(&id, AttemptState::Failed("cancelled".into())).await,
             Err(message) => set_state(&id, AttemptState::Failed(message)).await,
         }
     });
     Ok((
         url,
-        format!("在浏览器里完成 ChatGPT 登录。回调落在 {OPENAI_REDIRECT}，成功后会写成 auth/openai.json。"),
+        format!("Finish signing in to ChatGPT in the browser. The callback lands on {OPENAI_REDIRECT}; on success the credential is written to auth/openai.json."),
         Box::new(move || {
             let _ = tx_cancel.send(());
         }),
@@ -717,11 +717,11 @@ async fn exchange_openai(code: &str, verifier: &str) -> Result<Value, String> {
         }))
         .send()
         .await
-        .map_err(|e| format!("请求 {} 失败：{e}", openai_issuer()))?;
+        .map_err(|e| format!("request to {} failed: {e}", openai_issuer()))?;
     let status = response.status();
     let body: Value = response.json().await.unwrap_or(Value::Null);
     if !status.is_success() {
-        return Err(format!("令牌交换被拒（HTTP {status}）：{}", failure_detail(&body)));
+        return Err(format!("token exchange rejected (HTTP {status}): {}", failure_detail(&body)));
     }
     Ok(body)
 }
@@ -756,11 +756,11 @@ fn write_openai_credential(tokens: &Value) -> Result<(), String> {
     let access = tokens
         .get("access_token")
         .and_then(Value::as_str)
-        .ok_or("令牌响应里没有 access_token")?;
+        .ok_or("the token response has no access_token")?;
     let refresh = tokens
         .get("refresh_token")
         .and_then(Value::as_str)
-        .ok_or("令牌响应里没有 refresh_token——这次登录签不下续期凭证，Ante 用不了它")?;
+        .ok_or("the token response has no refresh_token — the sign-in cannot be renewed, so Ante cannot use it")?;
     let expires_in = tokens.get("expires_in").and_then(Value::as_i64).unwrap_or(3600);
     let expires_at = (chrono::Utc::now() + chrono::Duration::seconds(expires_in))
         .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
@@ -795,8 +795,8 @@ async fn start_antix(attempt_id: &str) -> Result<(String, String, CancelFn), Str
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| format!("起 `ante auth login antix` 失败：{e}"))?;
-    let stdout = child.stdout.take().ok_or("拿不到 `ante auth login antix` 的输出")?;
+        .map_err(|e| format!("could not run `ante auth login antix`: {e}"))?;
+    let stdout = child.stdout.take().ok_or("could not read the output of `ante auth login antix`")?;
     let (tx_url, rx_url) = oneshot::channel::<Result<String, String>>();
     // Draining to EOF matters: the child writes to this pipe, and a closed pipe
     // would end the sign-in before it finishes.
@@ -817,33 +817,33 @@ async fn start_antix(attempt_id: &str) -> Result<(String, String, CancelFn), Str
         }
         if !seen {
             if let Some(sender) = sender.take() {
-                let _ = sender.send(Err("`ante auth login antix` 没打印授权链接".into()));
+                let _ = sender.send(Err("`ante auth login antix` printed no authorize link".into()));
             }
         }
     });
     let url = tokio::time::timeout(Duration::from_secs(20), rx_url)
         .await
-        .map_err(|_| "等 `ante auth login antix` 打印授权链接超时".to_string())?
-        .map_err(|_| "`ante auth login antix` 提前退出了".to_string())??;
+        .map_err(|_| "timed out waiting for `ante auth login antix` to print the authorize link".to_string())?
+        .map_err(|_| "`ante auth login antix` exited early".to_string())??;
     let (tx_cancel, rx_cancel) = oneshot::channel::<()>();
     let id = attempt_id.to_string();
     tokio::spawn(async move {
         let outcome = tokio::select! {
             status = child.wait() => match status {
                 Ok(status) if status.success() => AttemptState::Done,
-                Ok(status) => AttemptState::Failed(format!("`ante auth login antix` 退出码 {status}：登录没完成")),
-                Err(e) => AttemptState::Failed(format!("等 `ante auth login antix` 失败：{e}")),
+                Ok(status) => AttemptState::Failed(format!("`ante auth login antix` exited with {status}: the sign-in did not complete")),
+                Err(e) => AttemptState::Failed(format!("waiting for `ante auth login antix` failed: {e}")),
             },
             _ = rx_cancel => {
                 let _ = child.kill().await;
-                AttemptState::Failed("已取消".into())
+                AttemptState::Failed("cancelled".into())
             }
         };
         set_state(&id, outcome).await;
     });
     Ok((
         url,
-        "在浏览器里完成 Antix 登录；回调由 Ante 自己接，凭证也由它自己写。".to_string(),
+        "Finish signing in to Antix in the browser; Ante handles the callback and writes the credential itself.".to_string(),
         Box::new(move || {
             let _ = tx_cancel.send(());
         }),
