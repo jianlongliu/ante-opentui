@@ -106,6 +106,21 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 
 **这里只放手上的活与开放问题；功能缺口（空框）看 [README](../README.md)「状态」清单。**
 
+**输出速率（`· N tok/s`）**
+
+- **客户端的算式**：`turnTokensPerSecond`（`packages/tui/src/routes/session/rows.ts`）＝ `Σ(step.tokens.output + step.tokens.reasoning) ÷ Σ(step.time.streamed − step.time.created)`（最后再 ×1000），逐个 **assistant step** 求和。渲染在每步的行尾（`routes/session/index.tsx`），由 `config.session.tps` 开关（默认开）。
+- **硬门槛**：`durations.length !== steps.length` 直接返回 undefined ⇒ **一个 step 缺 `streamed`，整个回合的数字就没了**。`output <= 0 || duration <= 0` 同理。
+- **为什么原本不显示**：`created` 是载荷字段（`session.step.started` 的 `started`），`streamed` 取事件信封时间（客户端把 `session.step.streamed` 的到达时刻写进 `time.streamed`，见 `core/src/session/message-updater.ts`）。垫片原来**从未发过 `session.step.streamed`**，`started` 也取的内容时间戳（＝调用结束时刻）⇒ 差值恒 0。
+- **Ante 的真实事件次序**（实测 156 份 `events.jsonl` + 活 SSE）：一次调用是 `[Thinking] [AgentMessage] UsageUpdate [ToolStart … ToolEnd]` —— **`UsageUpdate` 落在该步工具调用之前**；内容与 usage **同毫秒**到达（Delta 不落盘，只有 `session.reasoning.delta` 在活流里，189 条日志里 Delta 事件 0 条）。所以：
+  - `created` = **派发锚点**：回合开始（`TurnStart`），或上一步最后一个 `ToolEnd`（下一次调用的输入是它的返回值）。`streamed` = 该步自己的 `UsageUpdate` 到达时刻。
+  - **一个调用可能只请求工具、没有任何文字**（`usage [tools…]`，无内容事件、无 step）⇒ usage 到达时先存 `pending_usage`，由随后 `ToolStart` 开的 step 领走。
+  - **子代理复用同一条流**：它的 `UsageUpdate` 落在父 step 打开期间（`Agent` 工具在跑）且**晚于**父 step 自己的 usage ⇒ **第一个 usage 获胜**就安全。
+  - **一步可并行多个工具** ⇒ 用 `open_tools` 计数，**最后一个 `ToolEnd` 才收步**。
+- **两条路各改一遍**（`src/main.rs`）：活会话的 `pump_events`（`mark_streamed!` / `close_step!` 宏）与 `replay_session`（`events.jsonl` 重放，同一套规则）。失败行（`session.step.failed`，含 `publish_failure` 造的断线行）也是一条 assistant 行、也要标记；它**不是模型调用**，`created` 取它自己的时刻而不是旧锚点（否则一个 0 token 长耗时的 step 会拖低均值）。
+- **`tokens.reasoning` 写 `0` 是对的**：Ante 的 `usage.output_tokens` **已含思考 token**（实测：`Thinking 100561 字` 那步 `output_tokens = 26113`，光思考估算 ≈25161；12 个样本的「思考+答案」估算与 `output` 比值中位 0.75）⇒ 分子写回真实 reasoning 会**双倍计算**。
+- **验法**：`cargo test`（`every_step_of_a_turn_gets_its_streamed_marker` 等四个测试直接用合成事件驱动 `pump_events`，读它发布到广播通道的产物；`run_pump` 会滤掉 `msg_offline*` 行——流一结束 shim 就报一次断线，那是另一回事）；接口级 `antex serve PORT` → 建会话 → prompt 一句 → `curl /api/session/<id>/message` 数每个 assistant 步的 `time.streamed` 与 `tokens`，再按上面的算式复算（实测一轮：155 tok / 4.51s ＝ **34.4 tok/s**）。**注意**：跑真回合要花额度、会落一条真会话，测完删掉那条目录。
+- **不算实时**：Ante 只在调用**完成后**才播报内容与 usage，所以思考期/工具期都没有数字，`· N tok/s` 是**每步的事后均值**，不是边跑边涨。
+
 **`2026.10.15.3`（已出）：界面文案改英文 + 上游 opencode 2.0.29**
 
 - **规则**：**垫片喂进界面的字符串一律英文**，只给人读的日志与终端输出保留中文（`/tmp/antex.log` 的 `ante: …`、`serve` 的启动横幅、CLI 参数错误）；**启动自检双语**（中文行 + `self-check:` 行，同义）。完整清单与判据见 [client-patches.md](client-patches.md) 的「文案语言」。

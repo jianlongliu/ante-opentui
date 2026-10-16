@@ -61,6 +61,7 @@ Ante（**你自己装的**：官方脚本装、`ante update` 升级）
 | **真数据流** | 起界、提示词送达、流式文本、推理、工具调用、审批、失败可见——全由垫片喂 Ante 的真事件，不是模拟 |
 | **会话** | 列表、恢复、恢复后继续、删除（`Ctrl+D` 两下）；**打开一条会话即从它的 `events.jsonl` 重建整份记录**（每一步的思考、回答、工具都在） |
 | **插嘴与排队** | `Ctrl+S` 把排队消息插进正在跑的回合，带斜体 `Pending...` 角标；送到时机按 Ante 的真实边界判——**收下不算，下一个 step 开始才算模型读到** |
+| **输出速率（`· N tok/s`）** | 每步行尾的均值，来自 Ante 每次调用的 `UsageUpdate`；`session.step.started` 的 `started` 用**派发锚点**（回合开始或上一个工具返回），与 `session.step.streamed`（该次调用报出用量的时刻）之差即生成耗时。实时与回读（`events.jsonl` 重放）两条路同一套算法 |
 | **`/connect`** | Ante 的供应商登录被翻译成 opencode 的 integration 接口：ChatGPT 由垫片自己跑 Codex OAuth，Antix 交给 `ante auth login antix`；凭证落 `~/.ante/auth/`，格式与 Ante 自己写的逐字一致 |
 | **侧栏额度面板** | `▼ Quota`：DeepSeek 余额、Command Code 的 5h/W/M + 余额、ChatGPT 订阅窗口、OpenCode Go 用量；数据垫片自己取（`src/quota.rs`），界面是自编客户端里的内置插件 |
 | **贴图** | 粘贴即发；超过 Ante 的接收上限（≈240KB base64）垫片先压到 160KB 以内，压不下就明说 |
@@ -177,6 +178,7 @@ macOS 那份**只能在 macOS 上编**：垫片要 Apple SDK（Linux 上交叉�
 - [x] 侧栏**额度面板**（`▼ Quota`）—— 数据由垫片自己取（`src/quota.rs`：DeepSeek 余额、Command Code 的 5h/W/M + 余额、ChatGPT 订阅窗口、OpenCode Go 用量），界面是自编客户端里的一块**内置插件**（`feature-plugins/sidebar/quota.tsx`）。**不装 opencode 插件**：插件那份的取数半边跑在 opencode 自己的 server 里，垫片不跑 JS（理由见 [docs/pitfalls.md](docs/pitfalls.md)）。取数走 `POST /api/rpc/antex.quota/panel`（生成式 client 里唯一「任意 id + 任意方法」的通路，客户端补丁因此不必改生成代码），按 provider 缓存：成功 5 分钟、失败 60 秒，每 60 秒与每个 step 结束时刷新；凭据取环境变量 → `auth/api_keys.json`，ChatGPT 用 `/connect` 落下的 `auth/openai.json`（过期现刷、不写回）
 - [x] 模型/供应商列表按「连得上的」喂 —— `/api/model`、`/api/provider` 读 `ante catalog` 的**合并目录**再筛掉没凭证的（Ante 自己的 `/providers` 就是这个口径），所以 `/connect` 签完 ChatGPT 就能在 `/models` 里选到它
 - [x] 断线重连，且掉线期间排队的消息不丢 —— 退避重连 + `health` 说真话 + 转录里一行说明；**回合没跑完就被杀掉的会话（盘上只有 `events.jsonl`）Ante 打不开**，这种会话会新开一条继续，见 [docs/implementation.md](docs/implementation.md) 那条
+- [x] 输出速率 `· N tok/s` —— 客户端的算式是 `Σ(output+reasoning) ÷ Σ(streamed−created)`，而 Ante **从不落盘「第一个 token 何时到」**，所以两个时刻都由垫片反推：`created` 取派发锚点、`streamed` 取该次调用 `UsageUpdate` 到达的时刻。**标记必须每步都有**（客户端是 `durations.length !== steps.length` 硬门槛，缺一步整个回合不显示），实时 pump 与 `events.jsonl` 回放两条路都发。细节与验证法见 [docs/implementation.md](docs/implementation.md) 的「输出速率」
 
 ### 待定
 

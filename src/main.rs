@@ -1293,8 +1293,15 @@ fn trace_ante(event: &Evt) {
 }
 
 fn tokens_json(input: u32, output: u32) -> Value {
+    tokens_json_cached(input, output, 0, 0)
+}
+
+/// Same shape, with the prompt-cache split Ante reports. `reasoning` stays 0:
+/// Ante has no such breakdown, and the client adds it into the TPS numerator —
+/// 0 is the honest value, not a missing one.
+fn tokens_json_cached(input: u32, output: u32, cache_read: u32, cache_write: u32) -> Value {
     json!({ "input": input, "output": output, "reasoning": 0,
-            "cache": { "read": 0, "write": 0 } })
+            "cache": { "read": cache_read, "write": cache_write } })
 }
 
 /// Connect to Ante and pump its events into opencode's event shapes.
@@ -1950,7 +1957,6 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
     let mut message_id = String::new();
     let mut step_open = false;
     let mut text_started = false;
-    let mut streamed = false;
     let mut reasoning_open = false;
     // The thinking seen so far, so the block can be closed the moment the
     // answer starts. Ante's own `Thinking` aggregate only lands at the end of
@@ -1964,8 +1970,33 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
     let mut text_ordinal = 0u32;
     let mut reasoning_part = 0u32;
     let mut reasoning_ordinal = 0u32;
-    let mut tokens_in = 0u32;
-    let mut tokens_out = 0u32;
+    // One step == one model call, and the step is what the client hangs a
+    // duration on. Ante describes a call as `[thinking] [answer] usage [tools …]`:
+    // the usage lands *before* the tools the call asked for, and a call that only
+    // asked for tools arrives as `usage [tools …]` with no content to open a step
+    // at all.
+    //
+    // So a step takes its call's numbers when they land (`step_tokens`; the first
+    // usage wins, because a subagent reports its own usage on this stream and
+    // those arrive later, while its `Agent` tool holds the parent's step open),
+    // and is marked `streamed` at that same moment. The client sums those marks
+    // into its tok/s and needs one on *every* step, so a usage that had no step
+    // yet waits in `pending_usage` for the tool that opens one.
+    let mut step_tokens: Option<(u32, u32, u32, u32)> = None;
+    let mut streamed_sent = false;
+    let mut pending_usage: Option<(u32, u32, u32, u32)> = None;
+    // Tool calls still running in this step: a call may ask for several at once,
+    // and the step is not over until the last one is back.
+    let mut open_tools = 0u32;
+    // When the step now being written had its model call dispatched: the turn's
+    // start, or the moment the previous step's last tool returned. Ante announces
+    // a step's thinking and answer only once the call is *done* (its deltas are
+    // not persisted, and the aggregates land in the same tick as the usage), so
+    // the content's own timestamp is the end of the call, not its beginning.
+    // Anchoring `started` here is what makes the client's `streamed - created` the
+    // call's own generation time instead of 0 — the same thing the real server
+    // reports `started` for (dispatch, before waiting on the provider).
+    let mut step_anchor = now_ms();
     let mut compact_block: Option<String> = None;
     let mut compact_text = String::new();
     // The session Herdr was last told about, so a switch is reported once.
@@ -2014,11 +2045,15 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
                 if !step_open {
                     step_open = true;
                     text_started = false;
-                    streamed = false;
                     reasoning_open = false;
                     reasoning_text.clear();
                     text_part = 0;
                     reasoning_part = 0;
+                    streamed_sent = false;
+                    open_tools = 0;
+                    // A usage published just before this step's tools belongs to
+                    // this step: that call asked for the tools and nothing else.
+                    step_tokens = pending_usage.take();
                     steps += 1;
                     message_id = step_message_id(&turn, steps);
                     let (provider, model) = store
@@ -2051,18 +2086,25 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
                             "assistantMessageID": message_id,
                             "agent": reported_agent(),
                             "model": { "id": model, "providerID": provider },
-                            "started": now_ms(),
+                            // The call's dispatch time, not the moment its content
+                            // showed up: the client derives the row's duration from
+                            // `streamed - created`, and both markers are published
+                            // at the step's end.
+                            "started": step_anchor,
                         }),
                         &session,
                     );
                 }
             };
         }
-        // The real server marks each step once it starts streaming.
-        macro_rules! ensure_streamed {
+        // Publish the step's `streamed` marker, once per step. The client folds
+        // this marker into `time.streamed` and needs it on *every* step of a turn
+        // -- one step missing it and the whole turn's tok/s disappears (its check
+        // is `durations.length !== steps.length`).
+        macro_rules! mark_streamed {
             () => {
-                if step_open && !streamed {
-                    streamed = true;
+                if step_open && !streamed_sent {
+                    streamed_sent = true;
                     store.publish_durable(
                         "session.step.streamed",
                         json!({ "sessionID": session, "assistantMessageID": message_id }),
@@ -2108,6 +2150,41 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
                         }),
                         &session,
                     );
+                }
+            };
+        }
+        // End the step. Ante announces a step's usage (and its content) only once
+        // its model call is done, so by the time its tools have settled the shim
+        // has both the duration and the token count -- the two numbers the
+        // client's tok/s is built from. `finish` distinguishes a call that asked
+        // for tools from the one that answered: the client hangs its footer (the
+        // row's `· N tok/s`) only on the latter, which is what keeps a multi-step
+        // turn from printing one footer per step.
+        //
+        // The marker is forced out here too: a step can close without ever having
+        // seen a usage of its own (an interrupted call, a tool-only call whose
+        // usage went elsewhere), and one step missing the marker costs the *whole
+        // turn* its tok/s. Such a step contributes 0 to the client's sum either
+        // way, so this only keeps the rest of the turn on.
+        macro_rules! close_step {
+            ($finish:expr) => {
+                if step_open {
+                    close_reasoning!();
+                    mark_streamed!();
+                    let (input, output, read, write) = step_tokens.unwrap_or((0, 0, 0, 0));
+                    store.publish_durable(
+                        "session.step.ended",
+                        json!({
+                            "sessionID": session,
+                            "assistantMessageID": message_id,
+                            "finish": $finish,
+                            "cost": 0,
+                            "tokens": tokens_json_cached(input, output, read, write),
+                        }),
+                        &session,
+                    );
+                    step_open = false;
+                    step_tokens = None;
                 }
             };
         }
@@ -2173,6 +2250,12 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
                 turn = turn_id.to_string();
                 steps = 0;
                 step_open = false;
+                step_tokens = None;
+                streamed_sent = false;
+                pending_usage = None;
+                open_tools = 0;
+                // Nothing has run yet, so the first call is dispatched now.
+                step_anchor = now_ms();
                 store.ante.set_busy(true);
                 herdr::report("working", None, Some(&session));
                 store.publish_durable(
@@ -2182,7 +2265,6 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
                 );
             }
             Evt::ThinkingDelta(delta) => {
-                ensure_streamed!();
                 ensure_step!();
                 open_reasoning!();
                 reasoning_text.push_str(&delta);
@@ -2210,7 +2292,6 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
                 close_reasoning!();
             }
             Evt::MessageDelta(delta) => {
-                ensure_streamed!();
                 ensure_step!();
                 // Thinking is over the moment the answer starts.
                 close_reasoning!();
@@ -2254,6 +2335,12 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
             }
             Evt::ToolStart(tool) => {
                 ensure_step!();
+                // A usage that arrived with no step open was this call's: it asked
+                // for the tool and produced no text to open a step with, so its
+                // numbers are already in `step_tokens` and its marker goes out
+                // here -- the client needs one on *every* step of the turn.
+                mark_streamed!();
+                open_tools += 1;
                 close_reasoning!();
                 let name = client_tool_name(&tool.name);
                 let args = client_tool_args(&tool.name, &tool.args);
@@ -2334,8 +2421,17 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
                 for form in store.drop_tool_forms(&session, &end.tool_use_id) {
                     store.publish_located("form.cancelled", json!({ "sessionID": session, "id": form }));
                 }
-                // The next content begins a fresh step (and message).
-                step_open = false;
+                // A call may ask for several tools at once; the step is over when
+                // the last one is back, not the first.
+                open_tools = open_tools.saturating_sub(1);
+                if open_tools == 0 {
+                    // Its usage already landed (Ante reports it before the tools
+                    // the call asked for), so the step has both numbers.
+                    close_step!("tool-calls");
+                    // The next call is built on this result, so it is dispatched
+                    // from here.
+                    step_anchor = now_ms();
+                }
             }
             // Ante reports a compaction as an info block (`compact-op_…`), not
             // through CompactStart/CompactEnd — those only fire for a real
@@ -2433,35 +2529,59 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
                 }
             }
             Evt::UsageUpdate { usage, .. } => {
-                tokens_in = usage.input_tokens;
-                tokens_out = usage.output_tokens;
+                // One usage per model call, delivered when the call is done. Ante
+                // reports a call as `[thinking] [answer] usage [tools …]`: the
+                // usage lands *before* the tools the call asked for, so it belongs
+                // to the step those tools are in — the one being written.
+                //
+                // A subagent reports its own usage on this same stream, landing
+                // while its `Agent` tool holds the parent's step open. Those come
+                // after the step's own usage, and the check below keeps the first
+                // one — the step's own numbers.
+                let numbers = Some((
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cache_read_tokens.unwrap_or(0),
+                    usage.cache_creation_tokens.unwrap_or(0),
+                ));
+                if step_open {
+                    if step_tokens.is_none() {
+                        step_tokens = numbers;
+                        // The call is over, so this is the step's streaming end.
+                        mark_streamed!();
+                    }
+                } else {
+                    // No step yet: the call asked for tools and nothing else, so
+                    // its step opens with the tool below. Hold the numbers for it.
+                    pending_usage = numbers;
+                }
             }
             Evt::TurnEnd { status, .. } => {
                 let failed = matches!(status, ante_sdk::protocol::TurnEndStatus::Error { .. });
                 // The turn is over either way — the TUI is taking input again.
                 herdr::report("idle", None, Some(&session));
+                // Whatever is still open is the turn's last step -- the one the
+                // client hangs `· N tok/s` on. A failure ends it too, so the row
+                // shows what it managed instead of hanging on a spinner.
+                close_step!(if failed { "error" } else { "stop" });
                 // A turn can end on thinking alone (interrupted, or a step that
                 // never answered); the block must not be left open.
                 close_reasoning!();
-                if step_open {
-                    store.publish_durable(
-                        "session.step.ended",
-                        json!({
-                            "sessionID": session,
-                            "assistantMessageID": message_id,
-                            "finish": if failed { "error" } else { "stop" },
-                            "cost": 0,
-                            "tokens": tokens_json(tokens_in, tokens_out),
-                        }),
-                        &session,
-                    );
-                    step_open = false;
-                }
                 let mut failure = None;
                 if let ante_sdk::protocol::TurnEndStatus::Error { kind, headline, details } = &status {
                     // Without this the failure is invisible: the turn ends with no
                     // text, so the TUI just sits there looking idle.
+                    //
+                    // The anchor is reset first: this step is not a model call, it
+                    // is the failure being reported, and leaving the old anchor on it
+                    // would hand the client a long duration with no tokens behind it
+                    // -- dragging down the turn's figure instead of adding to it.
+                    step_anchor = now_ms();
                     ensure_step!();
+                    // It is a step of the turn like any other, so it needs the mark
+                    // too: `step.failed` completes it but carries no `streamed`, and
+                    // one step without the mark costs the whole turn its tok/s.
+                    mark_streamed!();
                     let message = if details.is_empty() {
                         headline.clone()
                     } else {
@@ -3490,6 +3610,9 @@ fn replay_session(id: &str, handed: &[(String, String)]) -> Vec<Value> {
         blocks: u32,
         /// The step's answer is one text part; a later `AgentMessage` fills it.
         text: Option<usize>,
+        /// The call's token counts, reported once the call is done. Held here so
+        /// the step's close can write them, as the live path does.
+        tokens: Option<Value>,
     }
 
     let mut messages: Vec<Value> = Vec::new();
@@ -3497,6 +3620,19 @@ fn replay_session(id: &str, handed: &[(String, String)]) -> Vec<Value> {
     let mut turn = String::from("turn");
     let mut steps = 0u32;
     let mut step: Option<Step> = None;
+    // When the step being written was dispatched: the turn's start, or the moment
+    // the tools it was built on came back. Ante stamps a call's content with the
+    // time the call *finished*, so the log has no record of when it started --
+    // this anchor, taken from the event before it, is the closest thing to it, and
+    // it is what makes `streamed - created` a generation time rather than zero.
+    let mut anchor = 0i64;
+    // A call that asks only for tools reports its usage before the tools exist, so
+    // there is no step to hold the numbers yet. They wait here for the step the
+    // tool opens -- the same hand-off the live pump does.
+    let mut pending_usage: Option<Value> = None;
+    // A call can ask for several tools at once; the step is over when the last one
+    // is back, not the first.
+    let mut open_tools = 0u32;
     // Tool parts by call id, so `ToolEnd` can close the part `ToolStart` opened.
     let mut calls: std::collections::HashMap<String, (usize, usize)> = std::collections::HashMap::new();
     let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -3523,6 +3659,12 @@ fn replay_session(id: &str, handed: &[(String, String)]) -> Vec<Value> {
 
         // A step is one model call: these open it on the first content event and
         // close it when a tool ends, exactly as the live pump does.
+        //
+        // `created` is the anchor, not the event's own time: Ante stamps a call's
+        // content with the moment the call came back, so using it here would make
+        // every step's duration zero. `streamed` is written by the call's usage,
+        // which lands at that same moment -- the two together are the client's
+        // tok/s.
         macro_rules! ensure_step {
             () => {
                 if step.is_none() {
@@ -3543,9 +3685,32 @@ fn replay_session(id: &str, handed: &[(String, String)]) -> Vec<Value> {
                         "model": { "id": model, "providerID": provider },
                         "content": [],
                         "cost": 0,
-                        "time": { "created": created },
+                        // The dispatch anchor, or this event's own time when the log
+                        // gives no earlier one (a session whose first event is not a
+                        // `TurnStart`).
+                        "time": { "created": if anchor != 0 { anchor } else { created } },
                     }));
-                    step = Some(Step { message: messages.len() - 1, reasoning: None, blocks: 0, text: None });
+                    step = Some(Step {
+                        message: messages.len() - 1,
+                        reasoning: None,
+                        blocks: 0,
+                        text: None,
+                        tokens: pending_usage.take(),
+                    });
+                }
+            };
+        }
+        // Mark the step as having finished streaming. The client derives the row's
+        // duration from `streamed - created` and needs the mark on *every* step of
+        // a turn -- one missing and the whole turn's tok/s disappears (its check is
+        // `durations.length !== steps.length`). Set once, from the first event that
+        // proves the call is done.
+        macro_rules! mark_streamed {
+            () => {
+                if let Some(fold) = step.as_ref()
+                    && messages[fold.message]["time"].get("streamed").is_none()
+                {
+                    messages[fold.message]["time"]["streamed"] = json!(created);
                 }
             };
         }
@@ -3617,6 +3782,10 @@ fn replay_session(id: &str, handed: &[(String, String)]) -> Vec<Value> {
                 turn = turn_id.to_string();
                 steps = 0;
                 step = None;
+                open_tools = 0;
+                pending_usage = None;
+                // Nothing has run yet, so the first call is dispatched now.
+                anchor = created;
             }
             Evt::ThinkingDelta(delta) => {
                 open_reasoning!();
@@ -3663,6 +3832,11 @@ fn replay_session(id: &str, handed: &[(String, String)]) -> Vec<Value> {
             }
             Evt::ToolStart(tool) => {
                 ensure_step!();
+                // A call that asked only for tools got no content event, so its
+                // `streamed` mark comes from here -- it is over; the tools are what
+                // it produced.
+                mark_streamed!();
+                open_tools += 1;
                 close_reasoning!();
                 if let Some(fold) = step.as_mut() {
                     let content = messages[fold.message]["content"].as_array_mut().expect("content");
@@ -3705,23 +3879,58 @@ fn replay_session(id: &str, handed: &[(String, String)]) -> Vec<Value> {
                     part["executed"] = json!(true);
                     part["time"]["completed"] = json!(created);
                 }
-                // The next content begins a fresh step (and message).
-                step = None;
+                // The next content begins a fresh step (and message) -- once every
+                // tool this step asked for has come back.
+                open_tools = open_tools.saturating_sub(1);
+                if open_tools == 0 {
+                    if let Some(fold) = step.as_mut()
+                        && let Some(tokens) = fold.tokens.take()
+                    {
+                        messages[fold.message]["tokens"] = tokens;
+                    }
+                    step = None;
+                    // The next call is built on this result, so it is dispatched
+                    // from here.
+                    anchor = created;
+                }
             }
             Evt::UsageUpdate { usage, .. } => {
-                if let Some(fold) = step.as_ref() {
-                    messages[fold.message]["tokens"] = json!({
-                        "input": usage.input_tokens,
-                        "output": usage.output_tokens,
-                        "reasoning": 0,
-                        "cache": { "read": usage.cache_read_tokens, "write": usage.cache_creation_tokens },
-                    });
+                let numbers = json!({
+                    "input": usage.input_tokens,
+                    "output": usage.output_tokens,
+                    "reasoning": 0,
+                    "cache": { "read": usage.cache_read_tokens, "write": usage.cache_creation_tokens },
+                });
+                // Ante reports a call between its content and the tools it asked
+                // for, so this is the step's own numbers when a step is open (a
+                // subagent's usage lands later, while the parent's `Agent` tool
+                // runs, and the first one wins). With no step open the call asked
+                // for tools and nothing else; the step the tool opens takes them.
+                match step.as_mut() {
+                    Some(fold) => {
+                        if fold.tokens.is_none() {
+                            fold.tokens = Some(numbers);
+                        }
+                        // The call is done, so this is the instant the step finished
+                        // streaming -- one half of the duration the client reads.
+                        mark_streamed!();
+                    }
+                    None => pending_usage = Some(numbers),
                 }
             }
             Evt::TurnEnd { status, .. } => {
                 close_reasoning!();
+                // A step can end without ever proving it streamed (interrupted, or a
+                // call that produced nothing at all). The mark is filled here, while
+                // the step is still open, so the turn's other steps keep their
+                // figure: the client drops the *whole turn* when one step lacks it.
+                // This step adds no duration of its own.
+                mark_streamed!();
                 let failed = matches!(&status, ante_sdk::protocol::TurnEndStatus::Error { .. });
                 if let Some(fold) = step.take() {
+                    if let Some(tokens) = fold.tokens {
+                        messages[fold.message]["tokens"] = tokens;
+                    }
                     messages[fold.message]["finish"] = json!(if failed { "error" } else { "stop" });
                     messages[fold.message]["time"]["completed"] = json!(created);
                 }
@@ -3742,7 +3951,10 @@ fn replay_session(id: &str, handed: &[(String, String)]) -> Vec<Value> {
                         "cost": 0,
                         "error": { "type": kind.clone().unwrap_or_else(|| "error".to_string()), "message": message },
                         "finish": "error",
-                        "time": { "created": created, "completed": created },
+                        // Marked too: it is an assistant row of the turn, and the
+                        // client skips the turn's tok/s when any row of it lacks
+                        // the mark.
+                        "time": { "created": created, "streamed": created, "completed": created },
                     }));
                 }
             }
@@ -4625,7 +4837,7 @@ async fn main() {
         }
     });
     if port != args.port {
-        println!("端口 {} 被占，本实例改用 {port}", args.port);
+        println!("port {} is taken, using {port} instead", args.port);
     }
     let directory =
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(default_directory()));
@@ -4726,9 +4938,204 @@ mod tests {
         assert_eq!(ante.link().json()["since"], since);
     }
 
+    /// Drive the live pump with a scripted event stream, the way Ante delivers
+    /// one, and read back what it published. The `store.events` broadcast is the
+    /// same channel the HTTP layer consumes, so this is the live path's real
+    /// output, not a re-implementation of it.
+    ///
+    /// The stream always ends (that is how the pump returns), and its end is
+    /// itself an event: a dropped connection makes the shim report the outage as
+    /// a row of its own. Those rows are a different concern, so they are filtered
+    /// out -- these tests are about the turn.
+    fn run_pump(events: Vec<ante_sdk::protocol::Evt>) -> Vec<Value> {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async move {
+            let store = Store::new();
+            // The pump addresses every event by the session the connection is
+            // driving; without one it drops them all.
+            *store.ante.active.lock().unwrap() = Some("ses_test".to_string());
+            let mut feed = store.events.subscribe();
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            for event in events {
+                tx.send(ante_sdk::protocol::event_msg(event, None)).expect("queue event");
+            }
+            drop(tx);
+            pump_events(&store, rx).await;
+            drop(store);
+            let mut seen = Vec::new();
+            while let Ok(event) = feed.try_recv() {
+                let notice = event["data"]["assistantMessageID"]
+                    .as_str()
+                    .map(|id| id.starts_with("msg_offline"))
+                    .unwrap_or(false);
+                if !notice {
+                    seen.push(event);
+                }
+            }
+            seen
+        })
+    }
+
+    fn step_events(seen: &[Value], kind: &str) -> Vec<Value> {
+        seen.iter().filter(|event| event["type"] == json!(kind)).cloned().collect()
+    }
+
+    fn usage(input: u32, output: u32) -> ante_sdk::protocol::Evt {
+        ante_sdk::protocol::Evt::UsageUpdate {
+            usage: ante_sdk::protocol::Usage {
+                input_tokens: input,
+                output_tokens: output,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+            },
+            context: None,
+        }
+    }
+
+    fn tool(id: &str) -> ante_sdk::protocol::Evt {
+        ante_sdk::protocol::Evt::ToolStart(ante_sdk::protocol::ToolUse {
+            id: id.to_string(),
+            name: "Read".to_string(),
+            args: json!({ "file_path": "/tmp/a" }),
+            malformed_args: None,
+            signature: None,
+        })
+    }
+
+    fn tool_done(id: &str) -> ante_sdk::protocol::Evt {
+        ante_sdk::protocol::Evt::ToolEnd(ante_sdk::protocol::ToolEnd {
+            tool_use_id: id.to_string(),
+            tool_name: "Read".to_string(),
+            status: ante_sdk::protocol::ToolEndStatus::Completed,
+            result_json: json!("ok"),
+        })
+    }
+
+    fn turn_start() -> ante_sdk::protocol::Evt {
+        ante_sdk::protocol::Evt::TurnStart { turn_id: ante_sdk::protocol::Id::new("op_t") }
+    }
+
+    fn turn_end() -> ante_sdk::protocol::Evt {
+        ante_sdk::protocol::Evt::TurnEnd {
+            turn_id: ante_sdk::protocol::Id::new("op_t"),
+            status: ante_sdk::protocol::TurnEndStatus::Completed,
+            steps: 1,
+        }
+    }
+
     #[test]
-    fn the_offline_row_is_throttled() {
-        let ante = Ante::new();
+    fn every_step_of_a_turn_gets_its_streamed_marker() {
+        // A turn of three steps, in the shape Ante really uses: content and usage
+        // come together, the usage sits *before* the tools the call asked for, and
+        // one call asks for tools only (no content at all).
+        let seen = run_pump(vec![
+            turn_start(),
+            ante_sdk::protocol::Evt::Thinking("想想".to_string()),
+            ante_sdk::protocol::Evt::AgentMessage("第一步".to_string()),
+            usage(100, 50),
+            tool("t1"),
+            tool_done("t1"),
+            // Tools only: no content, so its usage arrives with no step open.
+            usage(200, 60),
+            tool("t2"),
+            tool_done("t2"),
+            ante_sdk::protocol::Evt::Thinking("再想想".to_string()),
+            ante_sdk::protocol::Evt::AgentMessage("最后".to_string()),
+            usage(300, 70),
+            turn_end(),
+        ]);
+
+        let started = step_events(&seen, "session.step.started");
+        let streamed = step_events(&seen, "session.step.streamed");
+        let ended = step_events(&seen, "session.step.ended");
+        assert_eq!(started.len(), 3, "three model calls, three steps");
+        // The client drops the *whole turn's* tok/s when one step lacks this mark,
+        // so every step must carry one -- including the tool-only step.
+        assert_eq!(streamed.len(), 3, "one marker per step, no misses");
+        assert_eq!(ended.len(), 3);
+
+        // Each step's own numbers, in order: a subagent's or a neighbour's must not
+        // leak into it.
+        let outputs: Vec<u64> = ended.iter().map(|e| e["data"]["tokens"]["output"].as_u64().unwrap()).collect();
+        assert_eq!(outputs, vec![50, 60, 70]);
+
+        // The one step that asked only for tools still carries its own numbers --
+        // it took them through `pending_usage`.
+        assert_eq!(ended[1]["data"]["tokens"]["input"], json!(200));
+        assert_eq!(ended[1]["data"]["finish"], json!("tool-calls"));
+        assert_eq!(ended[2]["data"]["finish"], json!("stop"));
+    }
+
+    #[test]
+    fn a_step_draws_its_duration_from_the_dispatch_anchor() {
+        // `created` is the dispatch anchor and `streamed` is the moment the call
+        // reported its usage: the gap between them is the generation time the
+        // client turns into tok/s. Anchoring `created` on the content's own
+        // timestamp instead would make every step zero-length.
+        let seen = run_pump(vec![
+            turn_start(),
+            ante_sdk::protocol::Evt::AgentMessage("答".to_string()),
+            usage(100, 50),
+            turn_end(),
+        ]);
+        let started = step_events(&seen, "session.step.started");
+        let streamed = step_events(&seen, "session.step.streamed");
+        assert_eq!(started.len(), 1);
+        let created = started[0]["data"]["started"].as_i64().expect("an anchor");
+        let done = streamed[0]["created"].as_i64().expect("a timestamp");
+        assert!(created <= done, "the anchor must not postdate the mark");
+    }
+
+    #[test]
+    fn a_step_that_never_reports_is_still_marked() {
+        // An interrupted call: the turn ends with the step still open and nothing
+        // ever streamed. The mark is forced at the close, because one step without
+        // it costs every other step of the turn its figure.
+        let seen = run_pump(vec![
+            turn_start(),
+            ante_sdk::protocol::Evt::Thinking("被打断了".to_string()),
+            turn_end(),
+        ]);
+        assert_eq!(step_events(&seen, "session.step.streamed").len(), 1);
+        assert_eq!(step_events(&seen, "session.step.ended").len(), 1);
+    }
+
+    #[test]
+    fn a_failed_turn_marks_its_error_step_too() {
+        // The failure row is an assistant step of the turn like any other: the
+        // client counts it, so it needs the mark or the turn shows no tok/s at all.
+        let seen = run_pump(vec![
+            turn_start(),
+            ante_sdk::protocol::Evt::TurnEnd {
+                turn_id: ante_sdk::protocol::Id::new("op_t"),
+                status: ante_sdk::protocol::TurnEndStatus::Error {
+                    kind: Some("rate_limited".to_string()),
+                    headline: "限流了".to_string(),
+                    details: Vec::new(),
+                },
+                steps: 1,
+            },
+        ]);
+        let started = step_events(&seen, "session.step.started");
+        let streamed = step_events(&seen, "session.step.streamed");
+        assert_eq!(started.len(), 1, "the failure is reported as its own step");
+        assert_eq!(streamed.len(), 1, "and carries the mark every step needs");
+
+        // Two `step.failed` land on that one row: the failure itself, then the
+        // stream ending, which the shim reports as an outage against the row still
+        // open. The client folds both into the same message, so the second is not a
+        // second step -- the count above is what says so.
+        let failed = step_events(&seen, "session.step.failed");
+        assert_eq!(failed.len(), 2);
+        assert_eq!(
+            failed[0]["data"]["assistantMessageID"],
+            failed[1]["data"]["assistantMessageID"],
+            "the outage is attached to the failed row, not a new one"
+        );
+    }
+
+    #[test]
+    fn the_offline_row_is_throttled() {        let ante = Ante::new();
         let floor = std::time::Duration::from_secs(20);
         assert!(ante.notice_due(floor), "第一条要放行");
         assert!(!ante.notice_due(floor), "紧接着的第二条要被挡住");
