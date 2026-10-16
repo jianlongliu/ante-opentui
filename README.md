@@ -1,8 +1,7 @@
-# antex
+# ANTEX = OpenTUI + Ante
 
 **把 opencode v2 自带的 TUI 接到 [Ante](https://github.com/jianlongliu) 后端上跑。**
-界面、主题、键位全用 opencode 的，数据由 Ante 提供——中间这层垫片（`antex`）实现 opencode 的 server API，
-让 `opencode --server <url>` 分辨不出真假。思路同「改接口，不改消费者」。
+界面、主题、键位全用 opencode 的，数据由 Ante 提供——中间这层垫片（`antex`）实现 opencode 的 server API. 
 
 [![release](https://img.shields.io/github/v/release/jianlongliu/ante-opentui?label=release&color=2f81f7)](https://github.com/jianlongliu/ante-opentui/releases)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -12,16 +11,6 @@
 
 ![antex 首页](docs/home.png)
 
-> 上图是自编客户端的默认界面：顶栏 Ante 面具 + `ANTEX`，composer 下是权限模式，右下角 `ante <后端版本> · antex <构建日期>`。
-> 这张图由 `script/shot-home.py` 生成（PTY + pyte 抓屏 → Pango 渲染）。**必须在干净环境里跑**：
-> 垫片的模型列表按「有凭证」筛，环境里带着 `DEEPSEEK_API_KEY` 之类的 key 时 composer 就会挂上模型名，
-> 而截图里刻意只留 `Auto`——模型名是本机 catalog 的事，不该进仓库。
->
-> ```sh
-> rm -rf /tmp/emptyhome && mkdir -p /tmp/emptyhome
-> env -i HOME="$HOME" PATH="$PATH" TERM=xterm-256color LANG=C.UTF-8 ANTE_HOME=/tmp/emptyhome \
->   ANTEX_MODEL= ANTEX_PROVIDER= uv run --with pyte script/shot-home.py --cmd "$HOME/.local/bin/antex 41994" --out docs/home.png
-> ```
 
 > 最后核对：2026-10-15 · 目标客户端 opencode 2.0.29 · Rust 1.99.0
 
@@ -30,11 +19,11 @@
 ## 目录
 
 - [这是什么](#这是什么)
-- [特性](#特性)
+- [功能](#功能)
 - [快速开始](#快速开始)
 - [装包（CI 产物）](#装包ci-产物)
 - [为什么这么做](#为什么这么做)
-- [状态：已实现 / 待定 / 遗弃](#状态已实现--待定--遗弃)
+- [待定与遗弃](#待定与遗弃)
 - [依赖与版本](#依赖与版本)
 - [目录结构](#目录结构)
 - [细节去哪了](#细节去哪了)
@@ -54,21 +43,25 @@ Ante（**你自己装的**：官方脚本装、`ante update` 升级）
 **Ante 不在本仓库里，也不用管它**——你装你的、它更它的，垫片按它的协议趴在上面。
 唯一耦合点就是协议：若 Ante 升级改了协议，改垫片即可（通常只动 `Cargo.toml` 里的 `ante-sdk` 版本 + `cargo build`）。
 
-## 特性
+## 功能
 
-| | |
+垫片把 Ante 的真事件翻译成 opencode 协议——界面里看到的每一条都是真数据，不是模拟。逐条实现细节与验证法在 [docs/implementation.md](docs/implementation.md)。
+
+| 功能 | 说明 |
 | --- | --- |
 | **真数据流** | 起界、提示词送达、流式文本、推理、工具调用、审批、失败可见——全由垫片喂 Ante 的真事件，不是模拟 |
-| **会话** | 列表、恢复、恢复后继续、删除（`Ctrl+D` 两下）；**打开一条会话即从它的 `events.jsonl` 重建整份记录**（每一步的思考、回答、工具都在） |
-| **插嘴与排队** | `Ctrl+S` 把排队消息插进正在跑的回合，带斜体 `Pending...` 角标；送到时机按 Ante 的真实边界判——**收下不算，下一个 step 开始才算模型读到** |
-| **输出速率（`· N tok/s`）** | 每步行尾的均值，来自 Ante 每次调用的 `UsageUpdate`；`session.step.started` 的 `started` 用**派发锚点**（回合开始或上一个工具返回），与 `session.step.streamed`（该次调用报出用量的时刻）之差即生成耗时。实时与回读（`events.jsonl` 重放）两条路同一套算法 |
-| **思考档位（`/variants`）** | opencode 的 `/variants`（别名 `/thinking`、`/effort`）就是 Ante 的 effort 档位选择器：`/api/model` 每个模型报出档位梯子，选中后随 `POST /api/session/{id}/model` 的 `variant` 落到 `SessionUpdate.model.effort`（新会话走 `StartSession`）。选中的档位会随会话列表回报——**报的是 Ante 实际在跑的档位**，provider 支持不了会被它向下取整 |
-| **`/connect`** | Ante 的供应商登录被翻译成 opencode 的 integration 接口：ChatGPT 由垫片自己跑 Codex OAuth，Antix 交给 `ante auth login antix`；凭证落 `~/.ante/auth/`，格式与 Ante 自己写的逐字一致 |
-| **侧栏额度面板** | `▼ Quota`：DeepSeek 余额、Command Code 的 5h/W/M + 余额、ChatGPT 订阅窗口、OpenCode Go 用量；数据垫片自己取（`src/quota.rs`），界面是自编客户端里的内置插件 |
-| **贴图** | 粘贴即发；超过 Ante 的接收上限（≈240KB base64）垫片先压到 160KB 以内，压不下就明说 |
-| **断线重连** | 退避重连 + `/api/health` 说真话 + 转录里一行说明；掉线期间排队的消息不丢 |
-| **常用命令** | `/compact`、`/rename`、`/copy`、`/export`、`/stats`、`/skills`、模型选择、`shift+tab` 权限模式、`@` 文件补全 |
-| **不装样子** | Ante 没有的概念（MCP、LSP、VCS、终端、子代理会话）从界面里摘掉，而不是留个点了没反应的入口 |
+| **会话** | 列表、恢复、恢复后继续、删除（`Ctrl+D` 两下）——删的是 Ante 自己那条存档目录；**打开一条会话即从它的 `events.jsonl` 重建整份记录**（每一步的思考、回答、工具都在，见 [docs/implementation.md](docs/implementation.md) 的「记录回读」） |
+| **插嘴与排队**（`Ctrl+S`） | 把排队消息插进正在跑的回合，带斜体 `Pending...` 角标；送到时机按 Ante 的真实边界判——**收下不算，下一个 step 开始才算模型读到** |
+| **输出速率**（`· N tok/s`） | 每步行尾的均值。客户端的算式是 `Σ(output+reasoning) ÷ Σ(streamed−created)`，而 Ante **从不落盘「第一个 token 何时到」**，所以两个时刻都由垫片反推：`created` 取派发锚点（回合开始或上一个工具返回），`streamed` 取该次调用 `UsageUpdate` 到达的时刻。**每步都必须有标记**（客户端是 `durations.length !== steps.length` 硬门槛，缺一步整个回合不显示），实时 pump 与 `events.jsonl` 回放两条路都发 |
+| **思考档位**（`/variants`，别名 `/thinking`、`/effort`） | opencode 的档位选择器就是 Ante 的 effort：`/api/model` 报出每个模型的档位梯子（Ante 的 `min`…`max`），选中后经 `POST /api/session/{id}/model` 的 `variant` 落到 `SessionUpdate.model.effort`（新会话的首次回合走 `StartSession`）。列表回报的是 **Ante 实际在跑的档位**——provider 支持不了会被它向下取整 |
+| **供应商登录**（`/connect`） | Ante 的供应商登录被翻译成 opencode 的 integration 接口：`/api/integration` 由 `ante catalog` 的**合并目录**生成（每个带 `env_key` / `oauth_preset` 的 provider 就是一条）；`connect/key` 写进 `auth/api_keys.json`，`connect/oauth` 分三种——**ChatGPT 由垫片自己跑 Codex OAuth**（client id / 回调 / `codex_cli_simplified_flow` 全取自 Ante 二进制）、**Antix 交给 `ante auth login antix`**、其余（Anthropic 订阅）明确报「还没实现」。凭证落 `~/.ante/auth/`，格式与 Ante 自己写的逐字一致；`/api/credential` 的列表与删除也接上了 |
+| **模型 / 供应商列表** | 按「连得上的」喂：`/api/model`、`/api/provider` 读 `ante catalog` 的合并目录，再筛掉没凭证的（Ante 自己的 `/providers` 就是这个口径）——所以 `/connect` 签完 ChatGPT 就能在 `/models` 里选到它 |
+| **侧栏额度面板**（`▼ Quota`） | DeepSeek 余额、Command Code 的 5h/W/M + 余额、ChatGPT 订阅窗口、OpenCode Go 用量；数据垫片自己取（`src/quota.rs`），界面是自编客户端里的一块**内置插件**（`feature-plugins/sidebar/quota.tsx`）。取数走 `POST /api/rpc/antex.quota/panel`（生成式 client 里唯一「任意 id + 任意方法」的通路，客户端补丁因此不必改生成代码），按 provider 缓存：成功 5 分钟、失败 60 秒，每 60 秒与每个 step 结束时刷新；凭据取环境变量 → `auth/api_keys.json`，ChatGPT 用 `/connect` 落下的 `auth/openai.json`（过期现刷、不写回）。**不装 opencode 插件**：插件那份的取数半边跑在 opencode 自己的 server 里，垫片不跑 JS（理由见 [docs/pitfalls.md](docs/pitfalls.md)） |
+| **贴图** | 粘贴即发。Ante 侧有硬上限（≈240KB base64、≈170KB 原文件），垫片先压到 160KB 以内，压不下就明说 |
+| **断线重连** | 退避重连 + `/api/health` 说真话 + 转录里一行说明，掉线期间排队的消息不丢。**回合没跑完就被杀掉的会话（盘上只剩 `events.jsonl`）Ante 打不开**，这种会话会新开一条继续 |
+| **常用命令** | `/compact`、`/rename`（走 Ante 自己的 `SessionUpdate.title`，别的前端也看得到；只有当前这条会话能这样改，别的会话改名落垫片自己的 `title.txt`）、`/copy`、`/export`（`GET …/experimental/session/{id}/export` 直接回垫片手上那份转录，`sanitize` 忽略——载荷本来就是 Ante 的日志，不重写路径）、`/stats`（数字全部来自 Ante 的 `meta.json`：会话数、token、活动日历、按 provider/model 分组；Ante 没写的报 0，协议里没有报价也没有子代理计数）、`/skills`（优先用 Ante 播报的技能清单——那是真能调用的集合，含项目域与 `no_skills`；首轮提示词之前才退到磁盘扫描） |
+| **交互** | 模型选择、`shift+tab` 权限模式、`@` 文件补全、Herdr 状态上报、boot 接口全套。多标签**临时**关掉（`tabs.mode = "off"` 只是个配置项，不是能力——它要服务端同时驱动多条会话，垫片只有一条连接；真做多标签见[待定与遗弃](#待定与遗弃)） |
+| **不装样子** | Ante 没有的概念（MCP、LSP、VCS、终端、子代理会话）从界面里摘掉，而不是留个点了没反应的入口——插件 / 键位 / 命令黑名单 / 侧栏卡片四层，见 [docs/client-patches.md](docs/client-patches.md) 的「屏蔽做不了的入口」 |
 | **两个平台** | CI 出 Arch 包 + macOS（Apple Silicon）tar.gz，见[装包](#装包ci-产物) |
 
 ## 快速开始
@@ -149,7 +142,7 @@ macOS 那份**只能在 macOS 上编**：垫片要 Apple SDK（Linux 上交叉�
 
 手写复刻 opencode 的 TUI 到不了它的完成度（它有 17k 行的界面层）。反过来做，垫片是**可丢弃**的一层：
 上游界面升级时，重新拉 TUI 即可，只需跟着修垫片。代价是 Ante 没有的概念（LSP、MCP、formatter、git 操作）必须打桩
-——`/connect` 不再打桩了：Ante 的供应商登录被翻译成 opencode 的 integration 接口（见「已实现」）。
+——`/connect` 不再打桩了：Ante 的供应商登录被翻译成 opencode 的 integration 接口（见[功能](#功能)）。
 思路同「改接口，不改消费者」（参照 `onarchi`——把 Omarchy 真移植到 niri 的那个仓，原名 omarchy-on-niri）。
 
 几条定下来的选择：
@@ -159,28 +152,9 @@ macOS 那份**只能在 macOS 上编**：垫片要 Apple SDK（Linux 上交叉�
 - **只做垫片、不 fork 界面**：日常使用不必依赖自建前端（源码模式要 3.1G `node_modules`），**只有要改界面本身才必须 fork**。
 - **映射原则**：Ante 真有对应概念的才做成真差别（`shift+tab`→权限模式、模型选择→provider/model）；没有的（LSP/formatter/VCS）打桩显示为空，不假装。
 
-## 状态：已实现 / 待定 / 遗弃
+## 待定与遗弃
 
-**绿勾 = 已实现（实测过）；空框 = 待定（做得到，没做）；删除线 = 遗弃（Ante 底层没这个概念，别再提议硬做）。**逐条细节与验证法在 [docs/implementation.md](docs/implementation.md)。
-
-### 已实现
-
-- [x] 起界、提示词送达、真 Ante 回复、流式文本、推理、工具调用、审批、失败可见 —— 全由垫片喂真数据
-- [x] 会话：列表、恢复、恢复后继续、删除（`Ctrl+D` 两下）—— 删的是 Ante 自己那条存档目录；**打开一条会话即从它的 `events.jsonl` 重建整份记录**（每一步的思考、回答、工具都在，见 [docs/implementation.md](docs/implementation.md) 的「记录回读」）
-- [x] 插嘴与排队（`Ctrl+S`）+ 斜体 `Pending...` 标记 —— 送到时机按 Ante 的真实边界判：**收下不算，下一个 step 开始才算模型读到**
-- [x] `/compact`、模型选择、`shift+tab` 权限模式、`@` 文件补全、贴图、herdr 上报、boot 接口全套
-- [x] `/rename` —— 走 Ante 自己的 `SessionUpdate.title`（真标题：别的前端也看得到）；只有**当前这条**会话能这样改，别的会话改名落垫片自己的 `title.txt`，会话列表读的就是它
-- [x] `/copy`、`/export` —— `GET …/experimental/session/{id}/export` 直接回垫片手上那份转录（回读自 `events.jsonl`）；`sanitize` 忽略——载荷本来就是 Ante 的日志，不重写路径
-- [x] `/stats` —— 数字全部来自 Ante 自己的 `meta.json`：会话数、token、活动日历、按 provider/model 分组；Ante 没写的报 0（协议里没有报价，也没有子代理计数）
-- [x] `/skills` —— 优先用 Ante 播报的技能清单（那是真能调用的集合，含项目域与 `no_skills`），首轮提示词之前才退到磁盘扫描
-- [x] 多标签**临时**关掉（`tabs.mode = "off"`，只是个配置项，不是能力）—— 它要服务端同时驱动多条会话，垫片只有一条连接；真做多标签见「待定」那条
-- [x] 做不了的入口从界面摘掉 —— 插件 / 键位 / 命令黑名单 / 侧栏卡片四层，见 [docs/client-patches.md](docs/client-patches.md) 的「屏蔽做不了的入口」
-- [x] `/connect` —— **Ante 的供应商登录**：`/api/integration` 由 `ante catalog` 的合并目录生成（每个带 `env_key` / `oauth_preset` 的 provider 就是一条 integration），`connect/key` 写进 `auth/api_keys.json`，`connect/oauth` 分三种：**ChatGPT 由垫片自己跑 Codex OAuth**（client id / 回调 / `codex_cli_simplified_flow` 全部取自 Ante 二进制），**Antix 交给 `ante auth login antix`**，其余（Anthropic 订阅）明确报「还没实现」。凭证落 `~/.ante/auth/`，格式与 Ante 自己写的逐字一致；`/api/credential` 的列表/删除也接上了。细节与验证法见 [docs/implementation.md](docs/implementation.md)
-- [x] 侧栏**额度面板**（`▼ Quota`）—— 数据由垫片自己取（`src/quota.rs`：DeepSeek 余额、Command Code 的 5h/W/M + 余额、ChatGPT 订阅窗口、OpenCode Go 用量），界面是自编客户端里的一块**内置插件**（`feature-plugins/sidebar/quota.tsx`）。**不装 opencode 插件**：插件那份的取数半边跑在 opencode 自己的 server 里，垫片不跑 JS（理由见 [docs/pitfalls.md](docs/pitfalls.md)）。取数走 `POST /api/rpc/antex.quota/panel`（生成式 client 里唯一「任意 id + 任意方法」的通路，客户端补丁因此不必改生成代码），按 provider 缓存：成功 5 分钟、失败 60 秒，每 60 秒与每个 step 结束时刷新；凭据取环境变量 → `auth/api_keys.json`，ChatGPT 用 `/connect` 落下的 `auth/openai.json`（过期现刷、不写回）
-- [x] 模型/供应商列表按「连得上的」喂 —— `/api/model`、`/api/provider` 读 `ante catalog` 的**合并目录**再筛掉没凭证的（Ante 自己的 `/providers` 就是这个口径），所以 `/connect` 签完 ChatGPT 就能在 `/models` 里选到它
-- [x] 断线重连，且掉线期间排队的消息不丢 —— 退避重连 + `health` 说真话 + 转录里一行说明；**回合没跑完就被杀掉的会话（盘上只有 `events.jsonl`）Ante 打不开**，这种会话会新开一条继续，见 [docs/implementation.md](docs/implementation.md) 那条
-- [x] 输出速率 `· N tok/s` —— 客户端的算式是 `Σ(output+reasoning) ÷ Σ(streamed−created)`，而 Ante **从不落盘「第一个 token 何时到」**，所以两个时刻都由垫片反推：`created` 取派发锚点、`streamed` 取该次调用 `UsageUpdate` 到达的时刻。**标记必须每步都有**（客户端是 `durations.length !== steps.length` 硬门槛，缺一步整个回合不显示），实时 pump 与 `events.jsonl` 回放两条路都发。细节与验证法见 [docs/implementation.md](docs/implementation.md) 的「输出速率」
-- [x] 思考档位 `/variants` —— `/api/model` 报出每个模型的档位梯子（Ante 的 `min`…`max`），`/variants` 选中后经 `session/model` 落到 Ante 的 effort；新会话的首次回合走 `StartSession`，切档位走 `SessionUpdate`。Ante 回报的**已解析**档位覆盖请求值，所以列表显示的是实际在跑的档位。细节见 [docs/implementation.md](docs/implementation.md) 的「思考档位」
+**空框 = 待定（做得到、还没做）；删除线 = 遗弃（Ante 底层没这个概念，别再提议硬做）。**已实现的部分在[功能](#功能)一节，逐条实现细节与验证法在 [docs/implementation.md](docs/implementation.md)。
 
 ### 待定
 
@@ -194,7 +168,7 @@ macOS 那份**只能在 macOS 上编**：垫片要 Apple SDK（Linux 上交叉�
 
 - [ ] ~~`/share`、`/unshare`~~ —— 云端分享，Ante 无此概念（客户端自己也直接报 "Sharing is not implemented for V2 sessions yet"）
 - [ ] ~~`/mcps`、`/status`、MCP 面板~~ —— 无 MCP
-- [ ] ~~`/pair`~~ —— 无设备配对（Ante 没有 pairing，`/api/pair` 只答空）。**`/connect` 已转正**，见「已实现」
+- [ ] ~~`/pair`~~ —— 无设备配对（Ante 没有 pairing，`/api/pair` 只答空）。**`/connect` 已转正**，见[功能](#功能)
 - [ ] ~~`/diff`、`/worktrees`~~ —— 无 diff / VCS / worktree 概念（`/api/vcs/*` 只能答空；`/api/vcs` 因此答**空分支** `{branch:{}}`，位置标签才不会挂上假 `:main`）
 - [ ] ~~`/terminal`、Terminals 面板、`!` shell 模式~~ —— 无 PTY、无 shell 会话 op（Bash 是工具调用，不是终端）
 - [ ] ~~`/plugins`、`/btw`~~ —— 无 opencode 插件系统；`/btw` 要的是「旁问」的独立 generate op
@@ -285,3 +259,5 @@ Ante 侧有硬上限：约 240KB base64（≈170KB 原文件）以上直接丢�
 打几个补丁接到 Ante 上——等于站在人家肩上，上游不再更新，这里也就跟着停。感谢 opencode 的作者和所有贡献者。
 
 许可跟上游一致（MIT，见 [`LICENSE`](LICENSE)）：随意分发修改。
+
+___Powered by Deepseek___
