@@ -117,6 +117,58 @@ fn active_model() -> (String, String) {
     (provider, model)
 }
 
+/// Ante's effort ladder, ascending — the wire tokens of
+/// `ante_protocol_shape`'s `Effort`, which are also the names the client shows.
+///
+/// opencode's `/variants` dialog (aliases `/thinking`, `/effort`) is an effort
+/// picker: it lists the `variants` array of `GET /api/model` and hands the
+/// chosen id back as `model.variant` on `POST /api/session/{id}/model`. Those
+/// ids have to be Ante's own level names, or nothing downstream can resolve
+/// them.
+const EFFORT_LADDER: [&str; 6] = ["min", "low", "medium", "high", "xhigh", "max"];
+
+/// The ladder to advertise for one catalog model entry.
+///
+/// A declared `supported_efforts` wins. Absent means Ante falls back to the
+/// provider's built-in model profile — a ladder this shim cannot read, so the
+/// full sweep is offered and Ante rounds a request it cannot honour down to
+/// the nearest level it can. An empty list is a model that takes no effort
+/// setting at all, and advertises nothing.
+fn model_ladder(model: &Value) -> Vec<Value> {
+    match model.get("supported_efforts").and_then(Value::as_array) {
+        Some(declared) => declared
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|level| EFFORT_LADDER.contains(level))
+            .map(|level| json!({ "id": level }))
+            .collect(),
+        None => EFFORT_LADDER.iter().map(|level| json!({ "id": level })).collect(),
+    }
+}
+
+/// The effort a client variant names.
+///
+/// `None` for an absent variant, the client's `default` entry, or a name Ante
+/// does not know: all three mean "leave it to the catalog default" rather than
+/// failing the switch. The client drops a variant its own model info does not
+/// list, so an unknown name only reaches here from a hand-edited preference.
+fn effort_for_variant(variant: Option<&str>) -> Option<ante_sdk::protocol::Effort> {
+    let name = variant?.trim();
+    if name.is_empty() || name == "default" {
+        return None;
+    }
+    EFFORT_LADDER.iter().find(|level| **level == name).and_then(|level| level.parse().ok())
+}
+
+/// The variant a client model payload carries (`{"variant": "high"}`).
+fn variant_of(model: &Value) -> Option<String> {
+    model
+        .get("variant")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|variant| effort_for_variant(Some(variant)).is_some())
+}
+
 async fn catalog_models() -> Vec<Value> {
     let (active_provider, active_model) = active_model();
     let mut providers: Vec<(String, Value)> = integrations::connected_providers()
@@ -145,7 +197,7 @@ async fn catalog_models() -> Vec<Value> {
                 "preferred": provider == active_provider && id == active_model,
                 "name": name,
                 "capabilities": {},
-                "variants": [],
+                "variants": model_ladder(model),
                 "time": { "created": now_ms() },
                 "cost": [],
                 "status": "active",
@@ -233,6 +285,10 @@ struct Ante {
     agent: Arc<Mutex<String>>,
     /// Provider and model the client last picked, as Ante names them.
     model: Arc<Mutex<Option<(String, String)>>>,
+    /// The effort level (`min`…`max`) the client last picked for that model —
+    /// what the TUI's `/variants` dialog sets. Kept next to the pair because a
+    /// model switch carries both, and the session list reports them together.
+    effort: Arc<Mutex<Option<String>>>,
     /// Last prompt, used as the `recent` field compaction events require.
     last_user: Arc<Mutex<String>>,
     /// A turn is running. Decides between handing text to Ante as a queued input
@@ -340,6 +396,7 @@ impl Ante {
             pending: Arc::new(Mutex::new(None)),
             agent: Arc::new(Mutex::new(reported_agent().to_string())),
             model: Arc::new(Mutex::new(None)),
+            effort: Arc::new(Mutex::new(None)),
             last_user: Arc::new(Mutex::new(String::new())),
             busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             archives: Arc::new(Mutex::new(HashMap::new())),
@@ -915,13 +972,26 @@ impl Store {
             .and_then(|slot| slot.clone())
             .unwrap_or_else(active_model)
     }
+
+    /// The variant the client last committed, in the client's own vocabulary
+    /// (`default` when none is set). The session list and `GET /session/{id}`
+    /// both report it, and the client reads it back to keep the `/variants`
+    /// selection in step.
+    fn current_variant(&self) -> String {
+        self.ante
+            .effort
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_else(|| "default".to_string())
+    }
 }
 
 fn loc_plain() -> Value {
     json!({ "directory": default_directory() })
 }
 
-fn session_info(id: &str, title: &str, model: (String, String)) -> Value {
+fn session_info(id: &str, title: &str, model: (String, String), variant: &str) -> Value {
     json!({
         "id": id,
         "projectID": "prj_shim",
@@ -929,7 +999,7 @@ fn session_info(id: &str, title: &str, model: (String, String)) -> Value {
         "cost": 0,
         "tokens": { "input": 0, "output": 0, "reasoning": 0, "cache": { "read": 0, "write": 0 } },
         "agent": reported_agent(),
-        "model": { "id": model.1, "providerID": model.0, "variant": "default" },
+        "model": { "id": model.1, "providerID": model.0, "variant": variant },
         "time": { "created": now_ms(), "updated": now_ms(), "idle": now_ms(), "viewed": now_ms() },
         "location": loc_plain(),
         "title": title,
@@ -1824,10 +1894,22 @@ async fn attach_session(
             // so what the TUI displays and what Ante runs are the same thing.
             let chosen = store.ante.model.lock().ok().and_then(|slot| slot.clone());
             let (provider, model) = chosen.unwrap_or_else(active_model);
+            // The effort comes along here, not only on a later `SessionUpdate`:
+            // the client commits its model *and* variant before the first prompt,
+            // but there is no live session yet for that switch to reach, so this
+            // is the only place the first turn's effort can be set.
+            let effort = store
+                .ante
+                .effort
+                .lock()
+                .ok()
+                .and_then(|slot| slot.clone())
+                .and_then(|variant| effort_for_variant(Some(&variant)));
             let request = SessionRequest {
                 permission_mode: Some(mode),
                 provider: Some(provider),
                 model: Some(model),
+                effort,
                 ..Default::default()
             };
             if let Err(err) = ops.send(ante_sdk::protocol::op_msg(Op::StartSession(request))).await {
@@ -2213,6 +2295,30 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
             Evt::SessionUpdated(info) => {
                 store.ante.remember_skills(&info.skills);
                 let archive = info.session_id.to_string();
+                // Ante echoes the *resolved* model back, effort included: a level
+                // the provider cannot honour comes home rounded down. That is the
+                // authoritative answer, so it replaces what the client asked for
+                // — the session list then shows the effort actually in force
+                // rather than the one that was requested.
+                if let Some(effort) = info.model.effort {
+                    let effort = effort.as_str().to_string();
+                    if let Ok(mut slot) = store.ante.effort.lock() {
+                        *slot = Some(effort.clone());
+                    }
+                    // The list and `GET /session/{id}` answer from the stored
+                    // copy, so the rounding has to land there too: the client
+                    // remembers the variant it committed and would otherwise
+                    // keep redrawing the level Ante just declined.
+                    if let Some(client) = store.ante.active.lock().ok().and_then(|slot| slot.clone())
+                        && let Ok(mut sessions) = store.sessions.lock()
+                        && let Some(entry) = sessions
+                            .iter_mut()
+                            .find(|session| session["id"].as_str() == Some(client.as_str()))
+                        && let Some(model) = entry.get_mut("model")
+                    {
+                        model["variant"] = json!(effort);
+                    }
+                }
                 if let Some(title) = info.title.as_deref().map(str::trim).filter(|text| !text.is_empty()) {
                     write_title(&archive, Some(title));
                     let client = store
@@ -2847,8 +2953,9 @@ async fn session_compact(
     Json(json!({ "data": item }))
 }
 
-/// The model picker lands here (`{model:{id,providerID}}`); Ante takes the pair
-/// directly, so the switch is real.
+/// The model picker lands here (`{model:{id,providerID,variant}}`); Ante takes
+/// the pair directly, so the switch is real. `variant` is the effort level the
+/// TUI's `/variants` dialog set, and rides along on the same `SessionUpdate`.
 async fn session_model(
     State(store): State<Store>,
     Path(session_id): Path<String>,
@@ -2869,30 +2976,44 @@ async fn session_model(
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .unwrap_or(fallback_provider);
-    // Read the outgoing pair before overwriting it, or `previous` ends up
-    // reporting the new model.
+    // The client's `default` (and an absent key) both mean "catalog default", so
+    // only a named level moves the stored effort.
+    let variant = variant_of(&model);
+    // Read the outgoing pair *and* its variant before overwriting either, or
+    // `previous` ends up reporting the new selection back as the old one.
     let previous = store
         .ante
         .model
         .lock()
         .ok()
         .and_then(|slot| slot.clone())
-        .map(|(provider, id)| json!({ "id": id, "providerID": provider }));
+        .map(|(provider, id)| {
+            json!({ "id": id, "providerID": provider, "variant": store.current_variant() })
+        });
     if let Ok(mut slot) = store.ante.model.lock() {
         *slot = Some((provider.clone(), id.clone()));
+    }
+    // The client's selection wins outright, including its absence: picking
+    // `Default` in the dialog sends the same keyless payload as a plain model
+    // switch, and both mean "no override" — carrying the previous level over
+    // would leave an old `high` in force after the user cleared it.
+    if let Ok(mut slot) = store.ante.effort.lock() {
+        *slot = variant.clone();
     }
     // The session list and `GET /session/{id}` answer from the stored copy, so
     // the switch has to land there too — otherwise they keep reporting the pair
     // the session was created with.
+    let reported_variant = store.current_variant();
     if let Ok(mut sessions) = store.sessions.lock()
         && let Some(info) = sessions.iter_mut().find(|s| s["id"] == session_id.as_str())
     {
-        info["model"] = json!({ "id": id.clone(), "providerID": provider.clone(), "variant": "default" });
+        info["model"] =
+            json!({ "id": id.clone(), "providerID": provider.clone(), "variant": reported_variant.clone() });
     }
     if let Some(session) = store.ante.active.lock().ok().and_then(|s| s.clone()) {
         let mut payload = json!({
             "sessionID": session,
-            "model": { "id": id.clone(), "providerID": provider.clone() },
+            "model": { "id": id.clone(), "providerID": provider.clone(), "variant": reported_variant },
         });
         if let Some(previous) = previous {
             payload["previous"] = previous;
@@ -2906,7 +3027,11 @@ async fn session_model(
     {
         let update = ante_sdk::protocol::SessionUpdate {
             provider: Some(provider),
-            model: Some(ante_sdk::protocol::ModelSpec { id, ..Default::default() }),
+            model: Some(ante_sdk::protocol::ModelSpec {
+                id,
+                effort: effort_for_variant(variant.as_deref()),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         if let Err(err) = ops.send(ante_sdk::protocol::op_msg(Op::UpdateSession(update))).await {
@@ -3150,7 +3275,7 @@ async fn models() -> Json<Value> {
             "id": model, "modelID": model, "providerID": provider,
             "name": model.clone(),
             "capabilities": {},
-            "variants": [],
+            "variants": EFFORT_LADDER.iter().map(|level| json!({ "id": level })).collect::<Vec<_>>(),
             "time": { "created": now_ms() },
             "cost": [],
             "status": "active",
@@ -3499,7 +3624,15 @@ async fn session_create(
     {
         *slot = Some((provider.to_string(), id.to_string()));
     }
-    let info = session_info(&id, "Ante session", store.current_model());
+    // A variant on the create payload is the same effort pick the model switch
+    // carries, with the same meaning: the payload's choice wins outright, and a
+    // create that names no level clears any leftover one.
+    if let Some(model) = body.as_ref().and_then(|Json(value)| value.get("model"))
+        && let Ok(mut slot) = store.ante.effort.lock()
+    {
+        *slot = variant_of(model);
+    }
+    let info = session_info(&id, "Ante session", store.current_model(), &store.current_variant());
     if let Ok(mut sessions) = store.sessions.lock() {
         sessions.push(info.clone());
     }
@@ -3566,7 +3699,7 @@ async fn session_get(State(store): State<Store>, Path(id): Path<String>) -> Json
     let info = store
         .session(&id)
         .or_else(|| ante_session_info(&id))
-        .unwrap_or_else(|| session_info(&id, "Ante session", store.current_model()));
+        .unwrap_or_else(|| session_info(&id, "Ante session", store.current_model(), &store.current_variant()));
     // The route's schema is `{data: Session.Info}` with additionalProperties:false;
     // a bare object makes the client read `.id` off undefined.
     Json(json!({ "data": info }))
@@ -4066,7 +4199,9 @@ async fn session_export(State(store): State<Store>, Path(id): Path<String>) -> J
     let info = store
         .session(&id)
         .or_else(|| ante_session_info(&id))
-        .unwrap_or_else(|| session_info(&id, &derived_title(&archive), store.current_model()));
+        .unwrap_or_else(|| {
+            session_info(&id, &derived_title(&archive), store.current_model(), &store.current_variant())
+        });
     let messages = replay_session(&archive, &store.handed());
     Json(json!({ "data": { "info": info, "messages": messages } }))
 }
@@ -5429,5 +5564,67 @@ mod tests {
         assert!(!same_series("0.3.0", "0.2.7"));
         // Unparsable reads as a mismatch: the warning is the safe answer.
         assert!(!same_series("unknown", "0.2.7"));
+    }
+
+    /// The `/variants` dialog lists whatever the model info advertises, so the
+    /// advertised ladder decides what the user can pick.
+    #[test]
+    fn a_declared_effort_ladder_is_advertised_as_it_stands() {
+        let ladder = model_ladder(&json!({ "id": "m", "supported_efforts": ["low", "high", "max"] }));
+        assert_eq!(ladder, json!([{ "id": "low" }, { "id": "high" }, { "id": "max" }]).as_array().unwrap().clone());
+    }
+
+    /// An empty ladder is a model that takes no effort setting — advertising
+    /// the full sweep would offer levels Ante cannot honour.
+    #[test]
+    fn a_model_that_takes_no_effort_advertises_nothing() {
+        assert!(model_ladder(&json!({ "id": "m", "supported_efforts": [] })).is_empty());
+    }
+
+    /// No declaration means the provider's built-in profile supplies the
+    /// ladder, which this shim cannot read; the full sweep is offered and Ante
+    /// rounds down. Names outside the six levels are dropped.
+    #[test]
+    fn an_undeclared_ladder_falls_back_to_the_full_sweep() {
+        let sweep = model_ladder(&json!({ "id": "m" }));
+        assert_eq!(sweep.len(), EFFORT_LADDER.len());
+        assert_eq!(sweep.first(), Some(&json!({ "id": "min" })));
+        assert_eq!(sweep.last(), Some(&json!({ "id": "max" })));
+        let filtered = model_ladder(&json!({ "supported_efforts": ["low", "bogus", "max"] }));
+        assert_eq!(filtered, json!([{ "id": "low" }, { "id": "max" }]).as_array().unwrap().clone());
+    }
+
+    /// The client's `default` entry clears the override rather than naming a
+    /// level, and anything outside the ladder is left to the catalog default.
+    #[test]
+    fn variant_names_map_onto_antes_effort_levels() {
+        use ante_sdk::protocol::Effort;
+        assert_eq!(effort_for_variant(Some("high")), Some(Effort::High));
+        assert_eq!(effort_for_variant(Some("xhigh")), Some(Effort::XHigh));
+        assert_eq!(effort_for_variant(Some("min")), Some(Effort::Min));
+        for clearing in [None, Some("default"), Some(""), Some("  "), Some("bogus")] {
+            assert_eq!(effort_for_variant(clearing), None, "{clearing:?} should clear");
+        }
+        // A payload only carries a variant the client could have picked.
+        assert_eq!(variant_of(&json!({ "id": "m", "variant": "high" })), Some("high".to_string()));
+        assert_eq!(variant_of(&json!({ "id": "m", "variant": "default" })), None);
+        assert_eq!(variant_of(&json!({ "id": "m" })), None);
+    }
+
+    /// Picking `Default` sends a keyless payload, the same shape as a plain
+    /// model switch, so the stored effort has to be cleared rather than kept —
+    /// otherwise an old level stays in force after the user cleared it.
+    #[test]
+    fn clearing_the_variant_clears_the_stored_effort() {
+        let store = Store::new();
+        let switch = |model: Value| {
+            if let Ok(mut slot) = store.ante.effort.lock() {
+                *slot = variant_of(&model);
+            }
+        };
+        switch(json!({ "id": "m", "variant": "high" }));
+        assert_eq!(store.current_variant(), "high");
+        switch(json!({ "id": "m" }));
+        assert_eq!(store.current_variant(), "default");
     }
 }

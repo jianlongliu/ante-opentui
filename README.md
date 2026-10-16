@@ -62,6 +62,7 @@ Ante（**你自己装的**：官方脚本装、`ante update` 升级）
 | **会话** | 列表、恢复、恢复后继续、删除（`Ctrl+D` 两下）；**打开一条会话即从它的 `events.jsonl` 重建整份记录**（每一步的思考、回答、工具都在） |
 | **插嘴与排队** | `Ctrl+S` 把排队消息插进正在跑的回合，带斜体 `Pending...` 角标；送到时机按 Ante 的真实边界判——**收下不算，下一个 step 开始才算模型读到** |
 | **输出速率（`· N tok/s`）** | 每步行尾的均值，来自 Ante 每次调用的 `UsageUpdate`；`session.step.started` 的 `started` 用**派发锚点**（回合开始或上一个工具返回），与 `session.step.streamed`（该次调用报出用量的时刻）之差即生成耗时。实时与回读（`events.jsonl` 重放）两条路同一套算法 |
+| **思考档位（`/variants`）** | opencode 的 `/variants`（别名 `/thinking`、`/effort`）就是 Ante 的 effort 档位选择器：`/api/model` 每个模型报出档位梯子，选中后随 `POST /api/session/{id}/model` 的 `variant` 落到 `SessionUpdate.model.effort`（新会话走 `StartSession`）。选中的档位会随会话列表回报——**报的是 Ante 实际在跑的档位**，provider 支持不了会被它向下取整 |
 | **`/connect`** | Ante 的供应商登录被翻译成 opencode 的 integration 接口：ChatGPT 由垫片自己跑 Codex OAuth，Antix 交给 `ante auth login antix`；凭证落 `~/.ante/auth/`，格式与 Ante 自己写的逐字一致 |
 | **侧栏额度面板** | `▼ Quota`：DeepSeek 余额、Command Code 的 5h/W/M + 余额、ChatGPT 订阅窗口、OpenCode Go 用量；数据垫片自己取（`src/quota.rs`），界面是自编客户端里的内置插件 |
 | **贴图** | 粘贴即发；超过 Ante 的接收上限（≈240KB base64）垫片先压到 160KB 以内，压不下就明说 |
@@ -179,6 +180,7 @@ macOS 那份**只能在 macOS 上编**：垫片要 Apple SDK（Linux 上交叉�
 - [x] 模型/供应商列表按「连得上的」喂 —— `/api/model`、`/api/provider` 读 `ante catalog` 的**合并目录**再筛掉没凭证的（Ante 自己的 `/providers` 就是这个口径），所以 `/connect` 签完 ChatGPT 就能在 `/models` 里选到它
 - [x] 断线重连，且掉线期间排队的消息不丢 —— 退避重连 + `health` 说真话 + 转录里一行说明；**回合没跑完就被杀掉的会话（盘上只有 `events.jsonl`）Ante 打不开**，这种会话会新开一条继续，见 [docs/implementation.md](docs/implementation.md) 那条
 - [x] 输出速率 `· N tok/s` —— 客户端的算式是 `Σ(output+reasoning) ÷ Σ(streamed−created)`，而 Ante **从不落盘「第一个 token 何时到」**，所以两个时刻都由垫片反推：`created` 取派发锚点、`streamed` 取该次调用 `UsageUpdate` 到达的时刻。**标记必须每步都有**（客户端是 `durations.length !== steps.length` 硬门槛，缺一步整个回合不显示），实时 pump 与 `events.jsonl` 回放两条路都发。细节与验证法见 [docs/implementation.md](docs/implementation.md) 的「输出速率」
+- [x] 思考档位 `/variants` —— `/api/model` 报出每个模型的档位梯子（Ante 的 `min`…`max`），`/variants` 选中后经 `session/model` 落到 Ante 的 effort；新会话的首次回合走 `StartSession`，切档位走 `SessionUpdate`。Ante 回报的**已解析**档位覆盖请求值，所以列表显示的是实际在跑的档位。细节见 [docs/implementation.md](docs/implementation.md) 的「思考档位」
 
 ### 待定
 

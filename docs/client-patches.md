@@ -76,7 +76,7 @@ Ante 没有 VCS/diff、MCP、revert、分享、PTY。垫片对这些一律答 **
 
 ⚠ **靠文件的那两层丢了就回面板**（症状：`/diff`、`/plugins`、`/btw` 重新出现在面板里，`<leader>t`、`<leader>u` 这些键又活了）⇒ 文件里要有，垫片（`.6` 起）也把它们钉住。**`keybinds` 那层不是装饰**：`config/keybind.ts` 给 `session.undo/redo`、`terminal.toggle/select/close`、`session.background` 都配了默认键（`<leader>u/r/t/down/up`、`ctrl+b`），而客户端补丁的黑名单只把它们从**面板**里摘掉，**按键照样触发**——那些请求垫片一律答 200 + 空，点了就是静默无反应。
 
-**不摘的**：`/cd`、`/editor`、`/timeline`、`/variants`、`/themes`、`/settings`、`/debug`、`/open`、`/sessions`——要么纯客户端、要么垫片答得出真数据；`/cd` 现在会明确报「Ante 没有换目录接口」而不是静默。
+**不摘的**：`/cd`、`/editor`、`/timeline`、`/variants`、`/themes`、`/settings`、`/debug`、`/open`、`/sessions`——要么纯客户端、要么垫片答得出真数据；`/cd` 现在会明确报「Ante 没有换目录接口」而不是静默；**`/variants` 有真实现了**（垫片把模型档位梯子报进 `/api/model` 的 `variants`，选中后落到 Ante 的 effort，见 [implementation.md](implementation.md)「思考档位」）。
 
 **验收**：进 TUI 敲 `/un`、`/for`、`/mcps`、`/up` 应全是 `No matching commands`；`/` 列表里不该出现 `undo` `redo` `share` `unshare` `fork` `worktrees` `terminal` `update`（这些走客户端补丁的黑名单，与配置文件无关）。**靠 `cli.json` 那两层摘的**（`/di`、`/pl`、`/btw`）同样不该出现，只是它们不在补丁黑名单里——文件里那批 `-opencode.*` 一旦丢了就回到面板，见上一节的 ⚠。**已转正**（2026-10-02）：`/rename`、`/copy`、`/export`、`/stats`、`/skills` 四处屏蔽都撤了，`/` 列表里**应该**能看到它们，点进去有真效果（见 [implementation.md](implementation.md) 那五条）。**`/connect` 同日转正**（2026-10-14）：`/` 列表里能看到，选中后应弹出 `Connect an integration`，`Popular` 里第一屏就是 `OpenAI Subscription` / `Antix OAuth`，已连着凭证的行带 `✓`（env key 显示 `$NAME`，`auth/api_keys.json` 里的另算一条）。**PTY 验收法**：`uv run --with pyte script/tui_drive.py --cmd "./target/release/antex" --send '7:/connect' --send '9:\r' --after 5`（第一次回车是提交斜杠命令、第二次才是选中 integration）。
 

@@ -106,6 +106,18 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 
 **这里只放手上的活与开放问题；功能缺口（空框）看 [README](../README.md)「状态」清单。**
 
+**思考档位（`/variants`）**
+
+- **两端是同一样东西**：opencode 的 `/variants`（别名 `/thinking`、`/effort`）就是「模型的推理档位」选择器，对应 Ante 的 `Effort`（`min` `low` `medium` `high` `xhigh` `max`，`ante-protocol-shape` 的 `Effort`，serde 名即这些 token）。档位名两边逐字相同，不需要改名映射。
+- **列表来自 `/api/model` 的 `variants`**：客户端在模型信息里读 `variants[].id` 填对话框（`component/dialog-variant.tsx`）。每项只需 `{id}`。梯子由 `model_ladder()` 决定：catalog 写了 `supported_efforts` 就照它；**没写则给全 6 档**（Ante 会回落到 provider 内建 profile，那份垫片读不到，请求不支持的档位时 Ante 向下取整，不会报错）；`supported_efforts: []` 是「该模型不吃 effort」，一个都不给。未知档位名会被过滤掉。
+- **两条落地路径**（都在 `src/main.rs`）：
+  - **切档位 / 切模型**：客户端 `POST /api/session/{id}/model`，body `{model:{id,providerID,variant}}` —— 那个 `variant` 就是档位。垫片把它经 `effort_for_variant()` 转成 `Effort`，塞进 `SessionUpdate.model.effort`。
+  - **新会话首个回合**：客户端建会话时就带 `variant`，但那时**还没有 live 会话**，`SessionUpdate` 发不出去 —— 首回合的档位只能靠 `StartSession` 的 `SessionRequest.effort` 带（`attach_session` 的 `None` 分支读 `store.ante.effort`）。**漏了这条，新会话的第一轮一定跑默认档位**。
+- **Ante 回报的才是真的**：`Evt::SessionUpdated` 带回**已解析**的 `model.effort`（provider 支持不了就取整，例如 `max` → `xhigh`）。垫片用它覆盖请求值，并同步进 `store.sessions` 里那份副本——否则 `GET /session/{id}` 会继续报用户请求的档位，和实际在跑的不一致。
+- **`default` 的语义**：客户端的 `default` 项、缺键、空串、未知名，一律折算成「不设 effort」（`effort_for_variant` 返回 `None`），即沿用 catalog 默认，而不是把切换判失败。
+- **验法**：`cargo test`（`a_declared_effort_ladder_is_advertised_as_it_stands`、`a_model_that_takes_no_effort_advertises_nothing`、`an_undeclared_ladder_falls_back_to_the_full_sweep`、`variant_names_map_onto_antes_effort_levels`）；接口级 —— `antex serve PORT` → `curl localhost:PORT/api/model` 每个模型都应带 `variants`（没声明的给 6 档、声明 `[]` 的给空）→ `POST /api/session` 带 `{"model":{…,"variant":"max"}}` → prompt 一条（**真回合，会花额度、落一条真会话，测完删掉那条目录**）→ 看 `~/.ante/sessions/<新目录>/events.jsonl` 里 `SessionUpdated.model.effort`：它就是 Ante 实际跑的档位（实测该 provider 把 `max` 取整成 `xhigh`）。**回退**：不给 `variant` 即回到 catalog 默认档位，无需改代码。
+- **调试提示**：`log_line` 在 `serve` 模式输出到 **stdout**（重定向到你的日志文件），不是 `/tmp/antex.log` —— 那个文件只有 one-command 模式才写。
+
 **输出速率（`· N tok/s`）**
 
 - **客户端的算式**：`turnTokensPerSecond`（`packages/tui/src/routes/session/rows.ts`）＝ `Σ(step.tokens.output + step.tokens.reasoning) ÷ Σ(step.time.streamed − step.time.created)`（最后再 ×1000），逐个 **assistant step** 求和。渲染在每步的行尾（`routes/session/index.tsx`），由 `config.session.tps` 开关（默认开）。
