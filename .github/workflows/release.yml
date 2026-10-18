@@ -123,9 +123,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 定 tag（同 PKGBUILD 的 pkgver）
+      - name: 定 tag 与通道（同 PKGBUILD 的 pkgver）
         id: ver
-        run: echo "tag=v$(sed -n 's/^pkgver=//p' PKGBUILD)" >> "$GITHUB_OUTPUT"
+        run: |
+          pkgver=$(sed -n 's/^pkgver=//p' PKGBUILD)
+          echo "tag=v$pkgver" >> "$GITHUB_OUTPUT"
+          # 通道由版本号里的字母后缀决定：`2026.10.18rc1` 是预览，`2026.10.18` 是正式。
+          # 纯日期号（含当日序号 `.2`）里不会有字母，所以「有字母 = 预览」这条判据够稳，
+          # 也不必再加一个开关 —— 通道只影响 Release 的标记，不影响版本号的排序。
+          if printf '%s' "$pkgver" | grep -qiE 'rc|beta|alpha|pre'; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - uses: actions/download-artifact@v4
         with:
@@ -142,3 +152,6 @@ jobs:
             artifacts/arch-pkg/*.pkg.tar.zst
             artifacts/macos/*.tar.gz
           generate_release_notes: true
+          # 预览走 prerelease 通道。GitHub 不允许 prerelease 成为 latest，
+          # 所以正式版的 `/releases/latest` 不会被它顶掉，这里不必再写 make_latest。
+          prerelease: ${{ steps.ver.outputs.prerelease }}

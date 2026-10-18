@@ -138,6 +138,22 @@ macOS 那份**只能在 macOS 上编**：垫片要 Apple SDK（Linux 上交叉�
 那个脚本只给**同平台**出产物（`item.os !== process.platform` 直接跳过，见 `vendor/opencode/packages/cli/script/build.ts`）。
 所以 CI 里跑在 `macos-latest`（arm64）——**不需要一台 Mac 去编**，只有要验跑起来才需要。
 
+### 两个通道：预览与正式
+
+版本号一律是 `日期 + 当日序号`，**通道由后缀区分**：
+
+| 版本号 | 通道 | Release 标记 |
+| --- | --- | --- |
+| `2026.10.18` | 正式 | latest |
+| `2026.10.18rc1` | 预览 | prerelease |
+
+- **升级关系天然成立**：`2026.10.18rc1` < `2026.10.18rc2` < `2026.10.18`（Arch 的 `vercmp` 判定），
+  所以装了预览版也能正常升到正式版；预览编号写两位数（`rc10`）同样正确。
+- **正式版不会被预览顶掉**：GitHub 不允许 prerelease 成为 latest，所以 `/releases/latest` 始终指向正式版。
+- 后缀只能用字母（`rc` / `beta` / `alpha` / `pre`），**别加点**：`2026.10.18.rc.1` 会被 `vercmp` 判成比 `2026.10.18`
+  **更新**（点分开了新段），`pacman` 就会把预览当升级装上去。写成 `2026.10.18rc1` 才对。
+- 正式版和预览版共用一个 `PKGBUILD` 的 `pkgver`，tag 必须逐字等于 `v$pkgver`（CI 会校验并拦下不一致的）。
+
 ## 为什么这么做
 
 手写复刻 opencode 的 TUI 到不了它的完成度（它有 17k 行的界面层）。反过来做，垫片是**可丢弃**的一层：
