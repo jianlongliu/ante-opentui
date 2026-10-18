@@ -233,6 +233,25 @@ Cargo.toml           axum + tokio + serde
 `自检：… → ante 0.2.11；antex 编译于 ante-sdk 0.2.10，同一版本系列`）。自检过了还没反应，就看日志里
 「未连接 / 事件流结束 / 消息被丢弃」那几句——它不会静默。
 
+**启动后模型列表要等几秒才出来？**
+垫片喂模型/供应商列表时，每个请求都 spawn 一个 `ante catalog` 读合并目录（不缓存），TUI 起来时会并发拉三个；
+而 `ante catalog` 这个进程自身要等 **OpenTelemetry 导出**——Ante 二进制里内嵌了 OTLP 端点，进程退出前要把指标刷出去，
+网络一慢就是那几秒（同一二进制的 `ante --version` 只要几毫秒，可作对照）。
+
+不想要遥测就把它关掉，`ante catalog` 会从秒级掉到十几毫秒：
+
+```sh
+export ANTE_TELEMETRY=off      # 写进 ~/.zshenv 之类对 antex 生效的地方
+```
+
+取值照 Ante 的约定：`off` / `false` / `0` / `disable` / `disabled`（大小写不敏感）。只停 OTLP 导出，Ante 自己的本地日志
+（`~/.ante/logs/`）与功能都不受影响。验证：
+
+```sh
+time ante catalog              # 关掉前后差一个数量级
+curl -s -o /dev/null -w '%{time_total}\n' localhost:41999/api/model
+```
+
 **贴的图模型说看不到？**
 Ante 侧有硬上限：约 240KB base64（≈170KB 原文件）以上直接丢弃。垫片会先压到 160KB 以内，压不下会明说。
 模型本身不看图（提示 `no vision support`）那是 catalog 里那个模型缺 `support_vision: true`，与体积无关。
