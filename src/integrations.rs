@@ -130,6 +130,22 @@ async fn providers() -> Vec<Provider> {
         .collect()
 }
 
+/// Whether one catalog entry's credentials are present right now: an env key, a
+/// key in `auth/api_keys.json`, or an OAuth credential under `auth/`. An entry
+/// that asks for nothing at all counts as reachable.
+///
+/// This is the bare rule, with no exceptions — [`connected_providers`] adds one
+/// on top of it, and [`credentialed_ids`] deliberately does not.
+fn has_credentials(spec: &Value, keys: &Map<String, Value>, presets: &[String]) -> bool {
+    let (env_key, preset) = auth_of(spec);
+    match (env_key, preset) {
+        (None, None) => true,
+        (Some(env), _) if std::env::var_os(&env).is_some() || keys.contains_key(&env) => true,
+        (_, Some(preset)) => presets.iter().any(|held| held == &preset),
+        _ => false,
+    }
+}
+
 /// The providers Ante can actually reach right now: an env key exported in this
 /// process, a key pasted into `auth/api_keys.json`, an OAuth credential under
 /// `auth/`, or a provider that asks for nothing at all. The model picker is fed
@@ -149,14 +165,26 @@ pub async fn connected_providers() -> Vec<Value> {
             if active.as_deref().is_some() && active.as_deref() == id {
                 return true;
             }
-            let (env_key, preset) = auth_of(spec);
-            match (env_key, preset) {
-                (None, None) => true,
-                (Some(env), _) if std::env::var_os(&env).is_some() || keys.contains_key(&env) => true,
-                (_, Some(preset)) => presets.iter().any(|held| held == &preset),
-                _ => false,
-            }
+            has_credentials(spec, &keys, &presets)
         })
+        .collect()
+}
+
+/// The ids whose credentials are actually present — [`has_credentials`] with no
+/// exceptions, so the configured provider is *not* grandfathered in.
+///
+/// The quota panel gates on this: the picker's exception exists so the composer
+/// never loses the pair it opens with, but a panel that showed a block for a
+/// provider whose key was deleted would be reporting a subscription that is not
+/// there.
+pub async fn credentialed_ids() -> std::collections::HashSet<String> {
+    let keys = read_api_keys();
+    let presets = stored_presets();
+    merged_catalog()
+        .await
+        .into_iter()
+        .filter(|spec| has_credentials(spec, &keys, &presets))
+        .filter_map(|spec| Some(spec.get("id")?.as_str()?.to_string()))
         .collect()
 }
 

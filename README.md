@@ -56,7 +56,7 @@ Ante（**你自己装的**：官方脚本装、`ante update` 升级）
 | **思考档位**（`/variants`，别名 `/thinking`、`/effort`） | opencode 的档位选择器就是 Ante 的 effort：`/api/model` 报出每个模型的档位梯子（Ante 的 `min`…`max`），选中后经 `POST /api/session/{id}/model` 的 `variant` 落到 `SessionUpdate.model.effort`（新会话的首次回合走 `StartSession`）。列表回报的是 **Ante 实际在跑的档位**——provider 支持不了会被它向下取整 |
 | **供应商登录**（`/connect`） | Ante 的供应商登录被翻译成 opencode 的 integration 接口：`/api/integration` 由 `ante catalog` 的**合并目录**生成（每个带 `env_key` / `oauth_preset` 的 provider 就是一条）；`connect/key` 写进 `auth/api_keys.json`，`connect/oauth` 分三种——**ChatGPT 由垫片自己跑 Codex OAuth**（client id / 回调 / `codex_cli_simplified_flow` 全取自 Ante 二进制）、**Antix 交给 `ante auth login antix`**、其余（Anthropic 订阅）明确报「还没实现」。凭证落 `~/.ante/auth/`，格式与 Ante 自己写的逐字一致；`/api/credential` 的列表与删除也接上了 |
 | **模型 / 供应商列表** | 按「连得上的」喂：`/api/model`、`/api/provider` 读 `ante catalog` 的合并目录，再筛掉没凭证的（Ante 自己的 `/providers` 就是这个口径）——所以 `/connect` 签完 ChatGPT 就能在 `/models` 里选到它 |
-| **侧栏额度面板**（`▼ Quota`） | DeepSeek 余额、Command Code 的 5h/W/M + 余额、ChatGPT 订阅窗口、OpenCode Go 用量；数据垫片自己取（`src/quota.rs`），界面是自编客户端里的一块**内置插件**（`feature-plugins/sidebar/quota.tsx`）。取数走 `POST /api/rpc/antex.quota/panel`（生成式 client 里唯一「任意 id + 任意方法」的通路，客户端补丁因此不必改生成代码），按 provider 缓存：成功 5 分钟、失败 60 秒，每 60 秒与每个 step 结束时刷新；凭据取环境变量 → `auth/api_keys.json`，ChatGPT 用 `/connect` 落下的 `auth/openai.json`（过期现刷、不写回）。**不装 opencode 插件**：插件那份的取数半边跑在 opencode 自己的 server 里，垫片不跑 JS（理由见 [docs/pitfalls.md](docs/pitfalls.md)） |
+| **侧栏额度面板**（`▼ Quota`） | DeepSeek 余额、Command Code 的 5h/W/M + 余额、ChatGPT 订阅窗口、OpenCode Go 用量；数据垫片自己取（`src/quota.rs`），界面是自编客户端里的一块**内置插件**（`feature-plugins/sidebar/quota.tsx`）。**配过凭据的才显示**——没凭据、或凭据在但订阅用不了（401/403）的那几家整块不出现，`Unavailable` 只留给真故障。取数走 `POST /api/rpc/antex.quota/panel`（生成式 client 里唯一「任意 id + 任意方法」的通路，客户端补丁因此不必改生成代码），按 provider 缓存：成功 5 分钟、失败 60 秒，每 60 秒与每个 step 结束时刷新；凭据取环境变量 → `auth/api_keys.json`，ChatGPT 用 `/connect` 落下的 `auth/openai.json`（过期现刷、不写回）。**不装 opencode 插件**：插件那份的取数半边跑在 opencode 自己的 server 里，垫片不跑 JS（理由见 [docs/pitfalls.md](docs/pitfalls.md)） |
 | **贴图** | 粘贴即发。Ante 侧有硬上限（≈240KB base64、≈170KB 原文件），垫片先压到 160KB 以内，压不下就明说 |
 | **断线重连** | 退避重连 + `/api/health` 说真话 + 转录里一行说明，掉线期间排队的消息不丢。**回合没跑完就被杀掉的会话（盘上只剩 `events.jsonl`）Ante 打不开**，这种会话会新开一条继续 |
 | **常用命令** | `/compact`、`/rename`（走 Ante 自己的 `SessionUpdate.title`，别的前端也看得到；只有当前这条会话能这样改，别的会话改名落垫片自己的 `title.txt`）、`/copy`、`/export`（`GET …/experimental/session/{id}/export` 直接回垫片手上那份转录，`sanitize` 忽略——载荷本来就是 Ante 的日志，不重写路径）、`/stats`（数字全部来自 Ante 的 `meta.json`：会话数、token、活动日历、按 provider/model 分组；Ante 没写的报 0，协议里没有报价也没有子代理计数）、`/skills`（优先用 Ante 播报的技能清单——那是真能调用的集合，含项目域与 `no_skills`；首轮提示词之前才退到磁盘扫描） |
@@ -261,11 +261,13 @@ Ante 侧有硬上限：约 240KB base64（≈170KB 原文件）以上直接丢�
 改自编客户端（内置插件，见 [docs/client-patches.md](docs/client-patches.md)），或让垫片直接喂数据
 （例如额度面板走的 `POST /api/rpc/…`）。
 
-**侧栏额度显示 `Unavailable` / `Status: no Go subscription`？**
-面板文案是英文（跟 TUI 走，见 [docs/client-patches.md](docs/client-patches.md) 的「文案语言」）。`Unavailable` 多半是凭据或网络：
-垫片按顺序找环境变量（`DEEPSEEK_API_KEY`、`CMD_API_KEY`、`OPENCODE_ZEN_API_KEY`…）
-→ `~/.ante/auth/api_keys.json`；ChatGPT 那一行要先 `/connect`。OpenCode Go 显示 `Status: no Go subscription`，
-那是订阅本身的状态（`/zen/go/v1/usage` 会回 `403 EntitlementError`），不是面板坏了。
+**侧栏额度显示 `Unavailable`？**
+面板文案是英文（跟 TUI 走，见 [docs/client-patches.md](docs/client-patches.md) 的「文案语言」）。哪几家出现由凭据决定：
+
+- **没凭据的不显示**。凭据取环境变量（`DEEPSEEK_API_KEY`、`CMD_API_KEY`/`COMMANDCODE_API_KEY`、`OPENCODE_GO_API_KEY`…）
+  或 `~/.ante/auth/api_keys.json`；ChatGPT 那一行要先 `/connect`（认 `auth/openai.json`）。想隐藏某家，删掉它的凭据即可。
+- **订阅不可用（401/403、没订阅）也不显示**——凭据在但这家用不了，跟没配一样收起来，原因写进垫片日志。
+- 因此 `Unavailable` 只留给**真故障**（断网、超时、响应看不懂）：接口坏了要能看见，不能看着像「这家没了」。
 
 **装完没生效 / 改了界面没变化？**
 在跑的进程不会自己换二进制：装完包要重开 `antex`。改的是客户端源码（`vendor/opencode/`）时，还要先

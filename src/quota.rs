@@ -5,12 +5,17 @@
 //! 文本行。走 rpc 而不是自造一个 `/api/quota`，是因为客户端的生成式 client 里
 //! 只有 `rpc.call` 是「任意 id + 任意方法」的通路 —— 打客户端补丁不必改生成代码。
 //!
-//! 取数一律是各家自己的接口，不依赖 opencode 的插件：
+//! 取数一律是各家自己的接口，不依赖 opencode 的插件。清单只有一份：[`PROVIDERS`]，
+//! 一行一家（id、表头、要什么凭据、取数函数）。面板照着它走，所以**没落在表里的供应商
+//! 不会出现** —— 没有配额接口可取，硬写也出不了数。加一家＝在表里加一行 + 写一个取数函数。
 //!
 //! - DeepSeek      `GET api.deepseek.com/user/balance`
 //! - Command Code  `GET api.commandcode.ai/alpha/billing/credits`（差 M 窗口时再问 subscriptions）
 //! - ChatGPT       `GET chatgpt.com/backend-api/wham/usage`
-//! - OpenCode Go   `GET opencode.ai/zen/go/v1/usage`
+//! - OpenCode Go   `GET opencode.ai/zen/go/v1/usage`（有 console 令牌时走 `console/api/go/status`）
+//!
+//! **有凭据才问，有数才显示**（[`Provider::ready`] 与 [`step`]）：没 key、没登录的供应商
+//! 整块不出现，也不为它发请求。面板上只留能看的数，而不是一排 `Unavailable`。
 //!
 //! 凭据顺序：环境变量 → Ante 自己的 `auth/api_keys.json`。ChatGPT 用 `/connect`
 //! 落下的 `auth/openai.json`，过期就现刷一次 —— 只用于本次请求，不写回文件（续期
@@ -19,7 +24,7 @@
 //! 缓存：成功 5 分钟、失败 60 秒。侧栏每 60 秒问一次，而这些接口都算敏感，失败
 //! 还去重试只会更快被限流。5 分钟对得上上游插件的 `minIntervalMs` 默认值。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
@@ -54,6 +59,10 @@ const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KH
 /// （与 `integrations.rs` 的预设一致，续期要用同一个）。
 const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
+/// OpenCode 的 console（网页登录）会话令牌：它在 catalog 之外，但一样能证明「这家配过」。
+/// 它只用于 console 那条路，别当 API key 发到 zen 去。
+const CONSOLE_TOKEN: &str = "OPENCODE_CONSOLE_TOKEN";
+
 /// Command Code 的月度额度不随 credits 接口给出，得按 planId 查表（同 omarchy 的
 /// ai-subs 插件；官方没有别的说法）。
 const COMMANDCODE_ALLOWANCES: &[(&str, f64)] = &[
@@ -70,7 +79,78 @@ const COMMANDCODE_ALLOWANCES: &[(&str, f64)] = &[
     ("ultra", 300.0),
 ];
 
+/// 面板的供应商清单：**唯一的一份**。表里有几行，面板最多就有几块 —— 不在表里的
+/// 供应商没有配额接口可取（每家都是专用 endpoint），凭空也变不出一块来。
+///
+/// `id` 是 Ante catalog 里的供应商 id（与选模型那份列表同一个名字）；`env_keys` 是
+/// catalog 之外还能证明「这家配过」的凭据（OpenCode 的 console 会话令牌就不在
+/// catalog 里）。**配过才发请求** —— 没配的整块不出现，也不为它多打一次上游。
+struct Provider {
+    id: &'static str,
+    env_keys: &'static [&'static str],
+    header: &'static str,
+    /// 取数函数。收自己的 `env_keys`，于是「拿哪些名字去找凭据」只有一处 ——
+    /// 表说配过、取数却说没配，这种对不上正是本表要消掉的那类 bug。
+    /// 装成 boxed future，只为了让四家能放在同一张表里。
+    fetch: fn(&'static [&'static str]) -> Fetch,
+}
+
+type Fetch =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Quota, String>> + Send>>;
+
+/// 一家取回来的东西：数据行，加上「这些行是不是真额度数据」。
+/// 表头不在这里 —— 那是 [`PROVIDERS`] 的事，写两处早晚会对不上。
+struct Quota {
+    rows: Vec<Row>,
+    available: bool,
+}
+
+impl Provider {
+    /// 这家现在值不值得问一次。
+    ///
+    /// 认两种「配过」：Ante 那边认的凭据（[`integrations::credentialed_ids`]，与选模型
+    /// 那份列表同一把尺子 —— 本机有没有这个 key、有没有这个 OAuth 凭据），以及自己
+    /// 这一行另列的 `env_keys`（catalog 里没有、但确实能用的凭据，例如 OpenCode 的
+    /// console 会话令牌）。两样都没有就整块跳过：面板上不留一行 `Unavailable`。
+    fn ready(&self, connected: &HashSet<String>) -> bool {
+        connected.contains(self.id)
+            || self
+                .env_keys
+                .iter()
+                .any(|name| credential(&[*name]).is_some())
+    }
+}
+
+static PROVIDERS: &[Provider] = &[
+    Provider {
+        id: "deepseek",
+        env_keys: &["DEEPSEEK_API_KEY"],
+        header: "[DeepSeek]",
+        fetch: |keys| Box::pin(deepseek(keys)),
+    },
+    Provider {
+        id: "command-code",
+        env_keys: &["CMD_API_KEY", "COMMANDCODE_API_KEY"],
+        header: "[Command Code]",
+        fetch: |keys| Box::pin(commandcode(keys)),
+    },
+    // 凭据是 `/connect` 落下的 `auth/openai.json`，由 catalog 的 `oauth_preset` 认出来。
+    Provider {
+        id: "openai-subscription",
+        env_keys: &[],
+        header: "[ChatGPT]",
+        fetch: |_keys| Box::pin(chatgpt()),
+    },
+    Provider {
+        id: "opencode-go",
+        env_keys: &["OPENCODE_GO_API_KEY", "OPENCODE_ZEN_API_KEY", "OPENCODE_CONSOLE_TOKEN"],
+        header: "[OpenCode Go]",
+        fetch: |keys| Box::pin(opencode(keys)),
+    },
+];
+
 /// 面板的一行标题（`[名字]`，客户端会把这种行加粗）加若干数据行。
+#[derive(Clone)]
 struct Block {
     header: String,
     rows: Vec<Row>,
@@ -79,6 +159,7 @@ struct Block {
     available: bool,
 }
 
+#[derive(Clone)]
 enum Row {
     /// 有配额窗口的行：一条「名字 + 重置倒计时」加一条「进度条 + 百分比」。
     Window {
@@ -116,15 +197,23 @@ fn error(status: StatusCode, kind: &str, message: String) -> Response {
     (status, Json(json!({ "type": kind, "message": message }))).into_response()
 }
 
-/// 四家各出自己那一块，失败只影响自己那一块（面板照常显示其余部分）。
+/// 表里配过的每家各出一块，失败只影响自己那一块（面板照常显示其余部分）。
+///
+/// 两道闸门合起来就是「没登记就隐藏」：**没配凭据**的连请求都不发（[`Provider::ready`]），
+/// 配了但当场取不到数的仍然出块（`Unavailable` 那行是消息，不是噪音 —— 键过期、断网
+/// 这类事只有这一处会说）。所以取消订阅不该显示的空块，而该显示的故障不会被吞掉。
 async fn panel(session: Option<&str>) -> (Vec<String>, usize) {
-    let (deepseek, commandcode, chatgpt, opencode) = tokio::join!(
-        cached("deepseek", deepseek()),
-        cached("commandcode", commandcode()),
-        cached("chatgpt", chatgpt()),
-        cached("opencode", opencode()),
-    );
-    let blocks = [deepseek, commandcode, chatgpt, opencode];
+    let connected = crate::integrations::credentialed_ids().await;
+    let blocks: Vec<Block> = futures::future::join_all(
+        PROVIDERS
+            .iter()
+            .filter(|provider| provider.ready(&connected))
+            .map(|provider| cached(provider, &connected)),
+    )
+    .await
+    .into_iter()
+    .flatten()
+    .collect();
     let active = blocks.iter().filter(|block| block.available).count();
     let mut lines: Vec<String> = Vec::new();
     for block in blocks.iter() {
@@ -143,78 +232,70 @@ async fn panel(session: Option<&str>) -> (Vec<String>, usize) {
 
 // ------------------------------------------------------------------ 取数缓存 --
 
-static CACHE: LazyLock<Mutex<HashMap<&'static str, (Instant, Duration, Block)>>> =
+static CACHE: LazyLock<Mutex<HashMap<&'static str, (Instant, Duration, Option<Block>)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// 「这家没有可显示的东西」，与「这一趟没问到」的分界。
+///
+/// 401 / 403 与「没有订阅」说的是同一件事：凭据在这儿、但这家的额度问不出来 ——
+/// 没充钱、订阅过期、key 被吊销都归这类。**整块收起来**，和没配凭据一样处理；
+/// 面板上那一行 `Unavailable` 只留给真故障（断网、超时、5xx、响应看不懂），
+/// 否则接口坏了会被误读成「这家没了」。原因进日志，不丢。
+fn unusable(message: &str) -> bool {
+    message.contains("HTTP 401")
+        || message.contains("HTTP 403")
+        || message.contains("no Go subscription")
+        || message.contains("Entitlement")
+}
+
 /// 按 provider 缓存整块，失败也缓存（短一些）——失败比成功更容易被限流。
-async fn cached<F>(key: &'static str, fetch: F) -> Block
-where
-    F: std::future::Future<Output = Result<Block, String>>,
-{
+/// 没配凭据、或者配了但上游说这家用不了的回 `None`：整块不出现。
+async fn cached(provider: &'static Provider, connected: &HashSet<String>) -> Option<Block> {
+    if !provider.ready(connected) {
+        return None;
+    }
     let now = Instant::now();
-    if let Some((at, ttl, block)) = CACHE.lock().await.get(key) {
+    if let Some((at, ttl, block)) = CACHE.lock().await.get(provider.id) {
         if now.duration_since(*at) < *ttl {
-            return clone_block(block);
+            return block.clone();
         }
     }
-    let (ttl, block) = match fetch.await {
-        Ok(block) => (CACHE_TTL, block),
+    let entry = match (provider.fetch)(provider.env_keys).await {
+        Ok(quota) => (
+            CACHE_TTL,
+            Some(Block {
+                header: provider.header.to_string(),
+                rows: quota.rows,
+                available: quota.available,
+            }),
+        ),
+        Err(message) if unusable(&message) => {
+            crate::log_line(&format!(
+                "额度面板：{} 这块收起来了（{message}）—— 订阅或凭据不可用，不是取数故障",
+                provider.id
+            ));
+            (FAILURE_TTL, None)
+        }
         Err(message) => (
             FAILURE_TTL,
-            Block {
-                header: header(key),
+            Some(Block {
+                header: provider.header.to_string(),
                 rows: vec![Row::Value {
                     label: "Unavailable".to_string(),
                     value: message,
                 }],
                 available: false,
-            },
+            }),
         ),
     };
-    CACHE.lock().await.insert(key, (now, ttl, clone_block(&block)));
-    block
-}
-
-fn clone_block(block: &Block) -> Block {
-    Block {
-        header: block.header.clone(),
-        available: block.available,
-        rows: block
-            .rows
-            .iter()
-            .map(|row| match row {
-                Row::Window {
-                    label,
-                    used_percent,
-                    reset_ms,
-                } => Row::Window {
-                    label: label.clone(),
-                    used_percent: *used_percent,
-                    reset_ms: *reset_ms,
-                },
-                Row::Value { label, value } => Row::Value {
-                    label: label.clone(),
-                    value: value.clone(),
-                },
-            })
-            .collect(),
-    }
-}
-
-fn header(key: &str) -> String {
-    match key {
-        "deepseek" => "[DeepSeek]",
-        "commandcode" => "[Command Code]",
-        "chatgpt" => "[ChatGPT]",
-        _ => "[OpenCode Go]",
-    }
-    .to_string()
+    CACHE.lock().await.insert(provider.id, (now, entry.0, entry.1.clone()));
+    entry.1
 }
 
 // -------------------------------------------------------------------- 取数 --
 
-async fn deepseek() -> Result<Block, String> {
-    let key = credential(&["DEEPSEEK_API_KEY"]).ok_or("no DEEPSEEK_API_KEY")?;
+async fn deepseek(keys: &[&str]) -> Result<Quota, String> {
+    let key = credential(keys).ok_or_else(|| missing(keys))?;
     let body = get_json("https://api.deepseek.com/user/balance", &key, &[]).await?;
     let info = body
         .get("balance_infos")
@@ -223,8 +304,7 @@ async fn deepseek() -> Result<Block, String> {
         .ok_or("the balance response has no balance_infos")?;
     let currency = info.get("currency").and_then(Value::as_str).unwrap_or("CNY");
     let total = info.get("total_balance").and_then(Value::as_str).unwrap_or("0");
-    Ok(Block {
-        header: header("deepseek"),
+    Ok(Quota {
         rows: vec![Row::Value {
             label: "Balance".to_string(),
             value: format!("{currency} {total}"),
@@ -233,8 +313,8 @@ async fn deepseek() -> Result<Block, String> {
     })
 }
 
-async fn commandcode() -> Result<Block, String> {
-    let key = credential(&["CMD_API_KEY", "COMMANDCODE_API_KEY"]).ok_or("no CMD_API_KEY")?;
+async fn commandcode(keys: &[&str]) -> Result<Quota, String> {
+    let key = credential(keys).ok_or_else(|| missing(keys))?;
     let body = get_json("https://api.commandcode.ai/alpha/billing/credits", &key, &[]).await?;
     let limits = body.get("windowLimits").and_then(Value::as_object);
     let mut rows = Vec::new();
@@ -281,8 +361,7 @@ async fn commandcode() -> Result<Block, String> {
     if rows.is_empty() {
         return Err("the API returned no windows".to_string());
     }
-    Ok(Block {
-        header: header("commandcode"),
+    Ok(Quota {
         rows,
         available: true,
     })
@@ -310,7 +389,7 @@ async fn commandcode_month_window(key: &str, remaining: f64) -> Option<(f64, Opt
     Some(((used / allowance * 100.0).clamp(0.0, 100.0), reset))
 }
 
-async fn chatgpt() -> Result<Block, String> {
+async fn chatgpt() -> Result<Quota, String> {
     let credential = openai_credential().await?;
     let account = account_id(&credential.access);
     let mut headers: Vec<(&str, &str)> = vec![("Authorization", credential.access.as_str())];
@@ -342,8 +421,7 @@ async fn chatgpt() -> Result<Block, String> {
     if rows.is_empty() {
         return Err("no usage windows (this account may not share ChatGPT usage)".to_string());
     }
-    Ok(Block {
-        header: header("chatgpt"),
+    Ok(Quota {
         rows,
         available: true,
     })
@@ -416,10 +494,10 @@ fn account_id(access: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-async fn opencode() -> Result<Block, String> {
+async fn opencode(keys: &[&str]) -> Result<Quota, String> {
     // console（网页登录）那条路能看到 Go 的 5h/周/月窗口，但它要的是 console 会话令牌；
-    // 没有就退回 API key 的用量接口。
-    if let Some(token) = credential(&["OPENCODE_CONSOLE_TOKEN"]) {
+    // 没有就退回 API key 的用量接口。令牌名单独挑出来，免得被当成 API key 发出去。
+    if let Some(token) = credential(&[CONSOLE_TOKEN]) {
         let org = credential(&["OPENCODE_CONSOLE_ORG_ID"]).unwrap_or_default();
         let headers: Vec<(&str, &str)> = if org.is_empty() {
             vec![("Authorization", token.as_str())]
@@ -431,36 +509,30 @@ async fn opencode() -> Result<Block, String> {
             Err(message) => return Err(message),
         }
     }
-    let key = credential(&["OPENCODE_ZEN_API_KEY"]).ok_or("no OPENCODE_ZEN_API_KEY")?;
+    let api_keys: Vec<&str> = keys.iter().copied().filter(|name| *name != CONSOLE_TOKEN).collect();
+    let key = credential(&api_keys).ok_or_else(|| missing(&api_keys))?;
     let body = match get_json("https://opencode.ai/zen/go/v1/usage", &key, &[]).await {
         Ok(body) => body,
         Err(message) => {
-            // 403 EntitlementError 不是「拿不到」而是「没有订阅」，如实说清楚，
-            // 免得看着像面板坏了。
-            return Ok(Block {
-                header: header("opencode"),
-                rows: vec![Row::Value {
-                    label: "Status".to_string(),
-                    value: if message.contains("Entitlement") {
-                        "no Go subscription".to_string()
-                    } else {
-                        message
-                    },
-                }],
-                available: false,
+            // 403 不是「这一趟没问到」，而是「这个订阅不存在」；两者都只是错误文本，
+            // 块留不留由凭据决定（见 [`Provider::ready`]）。
+            return Err(if message.contains("Entitlement") {
+                "no Go subscription".to_string()
+            } else {
+                message
             });
         }
     };
-    let block = console_block(&body);
-    if block.rows.is_empty() {
+    let quota = console_block(&body);
+    if quota.rows.is_empty() {
         return Err("the usage API returned no windows".to_string());
     }
-    Ok(block)
+    Ok(quota)
 }
 
 /// console 的 `/api/go/status` 与用量接口的 meter 形状：`access.meters.{fiveHour,week,month}`
 /// 记的是微分（micro-cents）。
-fn console_block(body: &Value) -> Block {
+fn console_block(body: &Value) -> Quota {
     let meters = body
         .get("access")
         .and_then(|access| access.get("meters"))
@@ -481,9 +553,8 @@ fn console_block(body: &Value) -> Block {
             reset_ms: meter.get("resetAt").and_then(Value::as_i64),
         });
     }
-    Block {
+    Quota {
         available: !rows.is_empty(),
-        header: header("opencode"),
         rows,
     }
 }
@@ -728,9 +799,14 @@ async fn get_json(url: &str, bearer: &str, extra: &[(&str, &str)]) -> Result<Val
     Ok(body)
 }
 
+/// 缺凭据时的错误文本，按表里列的名字现拼 —— 面板上说的名字与实际找的名字
+/// 是同一个，不会像先前那样一个说 `OPENCODE_GO_API_KEY`、一个说 `OPENCODE_ZEN_API_KEY`。
+fn missing(names: &[&str]) -> String {
+    format!("no {}", names.join(" / "))
+}
+
 /// 环境变量 → `auth/api_keys.json`（`/connect` 存 API key 也是存这里）。
-fn credential(names: &[&str]) -> Option<String> {
-    for name in names {
+fn credential(names: &[&str]) -> Option<String> {    for name in names {
         if let Ok(value) = std::env::var(name) {
             if !value.trim().is_empty() {
                 return Some(value.trim().to_string());
@@ -768,4 +844,99 @@ fn rfc3339_ms(ms: i64) -> String {
         .single()
         .map(|at| at.to_rfc3339_opts(SecondsFormat::Millis, true))
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider(id: &'static str, env_keys: &'static [&'static str]) -> Provider {
+        Provider {
+            id,
+            env_keys,
+            header: "[x]",
+            fetch: |_keys| Box::pin(async { Err("unused".to_string()) }),
+        }
+    }
+
+    /// 没配凭据的整块不出现：不认这份凭据就不问。`env_keys` 留空是为了不碰环境变量
+    /// —— 带 `env_key` 的那几家只在 catalog 认出来（`connected` 里有它）时才算数。
+    #[test]
+    fn a_provider_without_credentials_is_not_asked() {
+        let connected: HashSet<String> = ["deepseek".to_string()].into_iter().collect();
+        assert!(provider("deepseek", &[]).ready(&connected));
+        assert!(!provider("openai-subscription", &[]).ready(&connected));
+    }
+
+    /// `env_keys` 是给 catalog 之外的凭据留的口子：列了就不看 catalog。
+    #[test]
+    fn an_extra_env_key_stands_on_its_own() {
+        let empty: HashSet<String> = HashSet::new();
+        // 名字一定不存在，否则这条测试会随本机环境变色。
+        assert!(!provider("opencode-go", &["ANTEX_TEST_KEY_THAT_IS_NOT_SET"]).ready(&empty));
+    }
+
+    /// 面板按 36 列排版，值行与条行都不能超；CJK 算两列。
+    #[test]
+    fn rows_fit_the_sidebar_width() {
+        let window = Row::Window {
+            label: "W".to_string(),
+            used_percent: 12.0,
+            reset_ms: Some(now_ms() + 3 * 86_400_000),
+        };
+        for line in row_lines(&window) {
+            assert!(display_width(&line) <= WIDTH, "{line:?}");
+        }
+        let value = Row::Value {
+            label: "Balance".to_string(),
+            value: "CNY 33.70".to_string(),
+        };
+        for line in row_lines(&value) {
+            assert!(display_width(&line) <= WIDTH, "{line:?}");
+        }
+    }
+
+    /// 长状态文字走折行，不能被 `pad_left` 从左边切掉半个词。
+    #[test]
+    fn a_long_status_wraps_instead_of_losing_its_head() {
+        let row = Row::Value {
+            label: "Unavailable".to_string(),
+            value: "HTTP 403 Forbidden: the API rejected the request".to_string(),
+        };
+        let lines = row_lines(&row);
+        assert!(lines.len() > 1, "{lines:?}");
+        assert!(lines[0].starts_with("Unavailable"), "{lines:?}");
+        for line in lines {
+            assert!(display_width(&line) <= WIDTH, "{line:?}");
+        }
+    }
+
+    /// 只有用掉额度才显示重置倒计时（与上游一致）。
+    #[test]
+    fn an_untouched_window_shows_no_countdown() {
+        let row = Row::Window {
+            label: "5h".to_string(),
+            used_percent: 0.0,
+            reset_ms: Some(now_ms() + 60_000),
+        };
+        assert_eq!(row_lines(&row).len(), 2);
+        assert!(!row_lines(&row)[0].contains('m'));
+    }
+
+    #[test]
+    fn the_countdown_counts_down_in_the_right_units() {
+        assert_eq!(countdown(Some(now_ms() + 90_000)), "1m");
+        assert_eq!(countdown(Some(now_ms() + 3 * 3_600_000 + 1_200_000)), "3h 20m");
+        assert_eq!(countdown(Some(now_ms() + 2 * 86_400_000 + 3 * 3_600_000)), "2d 3h");
+        assert_eq!(countdown(None), "");
+    }
+
+    /// 表里那几家的 id 必须能在 catalog 里找到同名的（表头对不上就是打错字了）。
+    #[test]
+    fn every_provider_carries_an_id_and_a_header() {
+        for provider in PROVIDERS {
+            assert!(!provider.id.is_empty());
+            assert!(provider.header.starts_with('['), "{}", provider.header);
+        }
+    }
 }
