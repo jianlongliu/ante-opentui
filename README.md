@@ -1,18 +1,18 @@
 # ANTEX = OpenTUI + Ante
 
-**把 opencode v2 自带的 TUI 接到 [Ante](https://github.com/jianlongliu) 后端上跑。**
-界面、主题、键位全用 opencode 的，数据由 Ante 提供——中间这层垫片（`antex`）实现 opencode 的 server API. 
+**把 opencode v2 自带的 TUI 接到 [Ante](https://github.com/AntigmaLabs/ante) 后端上跑。**
+界面、主题、键位全用 opencode 的，数据全来自 Ante——中间这层垫片（`antex`）实现 opencode 的 server API。
 
 [![release](https://img.shields.io/github/v/release/jianlongliu/ante-opentui?label=release&color=2f81f7)](https://github.com/jianlongliu/ante-opentui/releases)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Arch%20%7C%20macOS-4b5563)](#装包ci-产物)
-[![rustc](https://img.shields.io/badge/rustc-1.99%20%C2%B7%20edition%202024-dea584)](#依赖与版本)
+[![rustc](https://img.shields.io/badge/rustc-1.99.1%20%C2%B7%20edition%202024-dea584)](#依赖与版本)
 [![client](https://img.shields.io/badge/opencode-v2%20%2F%202.0.29-111827)](#依赖与版本)
 
 ![antex 首页](docs/home.png)
 
 
-> 最后核对：2026-10-15 · 目标客户端 opencode 2.0.29 · Rust 1.99.0
+> 最后核对：2026-10-22 · 目标客户端 opencode 2.0.29 · Rust 1.99.1
 
 ---
 
@@ -62,7 +62,7 @@ Ante（**你自己装的**：官方脚本装、`ante update` 升级）
 | **常用命令** | `/compact`、`/rename`（走 Ante 自己的 `SessionUpdate.title`，别的前端也看得到；只有当前这条会话能这样改，别的会话改名落垫片自己的 `title.txt`）、`/copy`、`/export`（`GET …/experimental/session/{id}/export` 直接回垫片手上那份转录，`sanitize` 忽略——载荷本来就是 Ante 的日志，不重写路径）、`/stats`（数字全部来自 Ante 的 `meta.json`：会话数、token、活动日历、按 provider/model 分组；Ante 没写的报 0，协议里没有报价也没有子代理计数）、`/skills`（优先用 Ante 播报的技能清单——那是真能调用的集合，含项目域与 `no_skills`；首轮提示词之前才退到磁盘扫描） |
 | **交互** | 模型选择、`shift+tab` 权限模式、`@` 文件补全、Herdr 状态上报、boot 接口全套。多标签**临时**关掉（`tabs.mode = "off"` 只是个配置项，不是能力——它要服务端同时驱动多条会话，垫片只有一条连接；真做多标签见[待定与遗弃](#待定与遗弃)） |
 | **回溯**（`/undo`、`/redo`） | 客户端的两步 revert 接到 Ante 的 `Op::RewindSession`：`/undo` 只登记边界、下一次提交才真正截断（**Ante 会改写自己的 `events.jsonl` 与 `meta.json`**，不是前端遮一层），`/redo` 撤掉未提交的那次。边界 id 要从客户端的 message id 翻成 Ante 的 turn id，靠发提示时埋的对照表；只认本会话发出的提示，恢复来的旧对话会明说回溯不了 |
-| **MCP 服务器**（`/mcps`、侧栏 `▼ MCP`） | Ante 按会话从 `mcp_servers` 连服务器，连上后经 `ExtensionRefreshed` 把**每个服务器与它的工具**报给垫片（`McpServerInfo`，含远程服务器的 `url`）——垫片记下来，按客户端的 `Mcp.Server` 形状答 `/api/mcp`（有工具＝`connected`，没工具＝`failed`），并在每次 `ExtensionRefreshed` 后发一条带 location 的 `mcp.status.changed` 让面板刷新。**启停做不了**：Ante 的协议里没有运行时开关，服务器固定来自 `settings.json`、每会话连一次，所以 `connect`/`disconnect`/`add`/`remove` 一律回 400 + 一句写明改哪儿，而不是假装成功。**首轮提示词之前列表是空的**——Ante 侧会话要等首个 prompt 才启动 |
+| **MCP 服务器**（`/mcps`、侧栏 `▼ MCP`） | **三条要知道的**：配在 `~/.ante/settings.json` 的 `mcp_servers` 里（不是 opencode 的配置）；**第一个提示词之前列表是空的**（Ante 侧的会话要等首个 prompt 才启动、才连服务器）；**面板里不能启停**，只能在那个文件里改完再开新会话。细节：Ante 按会话连服务器，连上后经 `ExtensionRefreshed` 把**每个服务器与它的工具**报给垫片（`McpServerInfo`，含远程服务器的 `url`）——垫片记下来，按客户端的 `Mcp.Server` 形状答 `/api/mcp`（有工具＝`connected`，没工具＝`failed`），并在每次 `ExtensionRefreshed` 后发一条带 location 的 `mcp.status.changed` 让面板刷新。**启停做不了**：Ante 的协议里没有运行时开关，服务器固定来自 `settings.json`、每会话连一次，所以 `connect`/`disconnect`/`add`/`remove` 一律回 400 + 一句写明改哪儿，而不是假装成功 |
 | **不装样子** | Ante 没有的概念（LSP、VCS、终端、子代理会话）从界面里摘掉，而不是留个点了没反应的入口——插件 / 键位 / 命令黑名单 / 侧栏卡片四层，见 [docs/client-patches.md](docs/client-patches.md) 的「屏蔽做不了的入口」 |
 | **两个平台** | CI 出 Arch 包 + macOS（Apple Silicon）tar.gz，见[装包](#装包ci-产物) |
 
@@ -176,25 +176,23 @@ macOS 那份**只能在 macOS 上编**：垫片要 Apple SDK（Linux 上交叉�
 
 ### 待定
 
-- [ ] 会话内 `/cd` —— **Ante 没有换目录的接口**：目录在建会话时由 `SessionRequest.cwd` 定死，`SessionUpdate` 里没有这个字段，所以现在会明确报错（400 + 原因）而不是静默；退一步是「按新目录重开会话」（丢历史、会话列表多一行）
-- [ ] `/undo`、`/redo`、消息菜单的 Revert —— **从「遗弃」转回「待定」**：Ante 0.2.8 已经有 `Op::RewindSession` / `Evt::SessionRewound`（`ante-sdk` 0.2.7 起，就是它自己的 `/rewind`），只是垫片还没接。**接法**：客户端是 stage → commit 两段（`/api/session/{id}/revert/stage|clear|commit`），所以垫片要「stage 只记边界、commit 才发 `RewindSession`」，`clear`＝丢掉边界（正好对上 `/redo`）。**已知偏差**：Ante 只回退对话，不动文件——上游那条「N files reverted」的卡片在这里恒为空；`to` 取不到（会话是 resume 来的、或中间被压缩/换过 provider）时后端会**拒绝**，得如实回给界面
-- [ ] `/fork` —— **同样从「遗弃」转回「待定」**：Ante 0.2.8 有 `Op::ForkSession` / `Evt::SessionForked`（附带 `SessionInfo.forked_from`）。客户端走 `POST /api/session/{id}/fork`（`before` ＝ 从哪条输入切），对应 op 的 `at`；fork 出来的是**新会话、不自动开始**，界面要跳到它（`/fork` 的导航语义）
+- [ ] 会话内 `/cd` —— **Ante 没有换目录的接口**：目录在建会话时由 `SessionRequest.cwd` 定死，`SessionUpdate` 里没有这个字段。会话内 `/cd` 走 `POST /api/session/{id}/move`，垫片回 400 + 一句「新建一个会话」的提示，TUI 原样弹在 toast 里；**没开会话时**的 `/cd` 是纯客户端行为（换的是界面目录），照常可用。退一步是「按新目录重开会话」（丢历史、会话列表多一行）
+- [ ] `/fork` —— **做得到、还没做**：Ante 有 `Op::ForkSession` / `Evt::SessionForked`（附带 `SessionInfo.forked_from`）。客户端走 `POST /api/session/{id}/fork`（`before` ＝ 从哪条输入切），对应 op 的 `at`；fork 出来的是**新会话、不自动开始**，界面要跳到它（`/fork` 的导航语义）
+- [ ] `!` shell 模式 —— **做得到、还没做**：客户端 `session.shell` ↔ Ante `Op::ShellInput`，`Evt::ShellOutput{command,stdout,stderr,exit_code}` 直接对应它的 `session.shell.started/ended`，是干净的 1:1（比回溯少了 id 翻译那一层）。要自造的只有客户端 `Shell.Info` 里 Ante 不给的那几个字段（`file`/`pid`/`cwd`/`shell`）
 - [ ] 真多标签（session tabs）—— **待定**：先验证 Ante 侧能否并发驱动多条会话，再谈垫片改造（现在只是把入口临时关掉）
 - [ ] 断线时的终端还原 —— TUI 只弹 `Connection lost · Reconnecting to the server automatically.`，终端留一屏裸 SGR；抓原始字节：用 PTY 跑一次（`script/tui_drive.py` 就是这条路子），把读到的 chunk **先原样落盘再喂 `pyte`**——SGR 序列只在原始字节里看得见
 
 ### 遗弃
 
 - [ ] ~~`/share`、`/unshare`~~ —— 云端分享，Ante 无此概念（客户端自己也直接报 "Sharing is not implemented for V2 sessions yet"）
-- [x] **`/mcps`、MCP 面板已转正**（2026-10-22）——Ante 0.2.12 起报 MCP 服务器与工具，垫片接上后 `/mcps` 与侧栏 `▼ MCP` 都显示真数据；**启停仍不可用**（协议无运行时开关，按 `space` 会弹出原因）
 - [ ] ~~`/status`~~ —— 无会话状态接口
 - [ ] ~~`/pair`~~ —— 无设备配对（Ante 没有 pairing，`/api/pair` 只答空）。**`/connect` 已转正**，见[功能](#功能)
 - [ ] ~~`/diff`、`/worktrees`~~ —— 无 diff / VCS / worktree 概念（`/api/vcs/*` 只能答空；`/api/vcs` 因此答**空分支** `{branch:{}}`，位置标签才不会挂上假 `:main`）
-- [ ] ~~`/terminal`、Terminals 面板、`!` shell 模式~~ —— 无 PTY、无 shell 会话 op（Bash 是工具调用，不是终端）
+- [ ] ~~`/terminal`、Terminals 面板~~ —— 无 PTY：Ante 没有终端会话（Bash 是工具调用，不是终端）。**`!` shell 模式另算**：那条走的是 `POST /api/session/{id}/shell` ↔ `Op::ShellInput` / `Evt::ShellOutput`，Ante 有这个 op，垫片还没接（见「待定」）
 - [ ] ~~`/plugins`、`/btw`~~ —— 无 opencode 插件系统；`/btw` 要的是「旁问」的独立 generate op
-- [x] **`/undo`、`/redo` 已转正**（2026-10-22）—— 见[功能](#功能)的「回溯」
 - [ ] ~~`/reload`、`/update`、`/restart`、`Ctrl+B` 后台化工具~~ —— 重新加载服务端配置 / 更新 opencode / 把工具调用扔后台，对 Ante 都无意义（**暂时遗弃**：等哪天有对应 op 再说）
 - [ ] ~~LSP、formatter~~ —— 无对应概念，打桩显示为空（入口已摘；**暂时遗弃**）
-- [ ] ~~子代理面板 / 点进子代理~~ —— 客户端的子代理 UI（内联块点进去看子会话、composer 的 subagents tab、mini 的 footer inspector）**整套都挂在「子代理 = 独立 child session」上**（`session.parentID` + 自己的事件流 + `sessionFamily()`）。Ante 没有这个概念：子代理只是父会话里的一次 `Agent` 工具调用，内部活动不推给前端——本机 188 条会话日志里 `ToolUpdate` 事件 **0 条**，一次 68 秒的 `Agent` 调用（14:42:20→14:43:28）中途**零事件**，结果只在 `ToolEnd.result_json.report` 里一次交付；协议里也没有 agent id / parent turn（`SessionInfo.subagents` 只是可委派清单）。硬造 child session 只有空壳，还会污染会话列表。能做的只有把 `Agent` 调用按客户端的 subagent 块渲染（已做）
+- [ ] ~~子代理面板 / 点进子代理~~ —— 客户端的子代理 UI（内联块点进去看子会话、composer 的 subagents tab、mini 的 footer inspector）**整套都挂在「子代理 = 独立 child session」上**（`session.parentID` + 自己的事件流 + `sessionFamily()`）。Ante 没有这个概念：子代理只是父会话里的一次 `Agent` 工具调用，**内部活动不推给前端**（`ToolUpdate` 只在子代理排队等 slot 时才发，会话日志里基本没有），结果只在 `ToolEnd.result_json.report` 里一次交付；协议里也没有 agent id / parent turn（`SessionInfo.subagents` 只是可委派清单）。硬造 child session 只有空壳，还会污染会话列表。能做的只有把 `Agent` 调用按客户端的 subagent 块渲染（已做）
 
 ## 依赖与版本
 
@@ -202,7 +200,7 @@ macOS 那份**只能在 macOS 上编**：垫片要 Apple SDK（Linux 上交叉�
 
 | 项 | 版本 |
 | --- | --- |
-| rustc / cargo | **1.99.0**（Arch `rust 1:1.99.0-1`） |
+| rustc / cargo | **1.99.1**（Arch `rust 1:1.99.1-1`） |
 | edition | **2024**（`let` 链语法需要，改回 2021 会编译失败） |
 
 Cargo 依赖（`Cargo.lock` 实际解析值，非 `Cargo.toml` 的约束范围）：
@@ -215,6 +213,12 @@ Cargo 依赖（`Cargo.lock` 实际解析值，非 `Cargo.toml` 的约束范围�
 | serde | 1.0.229 | 派生（features: derive） |
 | serde_json | 1.0.151 | 信封与事件载荷 |
 | futures | 0.3.34 | 流拼接 |
+| ante-sdk | 0.2.14 | 连 Ante（`Op`/`Evt` 协议）；版本跟着 Ante 的 0.2.x 走 |
+| reqwest | 0.12.28 | `/connect` 的 OAuth 往返、额度面板取数（rustls） |
+| image | 0.25.10 | 贴图压缩（png/jpeg/gif/webp/bmp/tiff） |
+| base64 | 0.22.1 | 内联 `data:` URL 的收发 |
+| sha2 | 0.10.9 | 附件去重 |
+| chrono | 0.4.45 | 读 Ante 日志里的 RFC3339 时间戳 |
 
 外部依赖：
 
@@ -229,7 +233,10 @@ Cargo 依赖（`Cargo.lock` 实际解析值，非 `Cargo.toml` 的约束范围�
 
 ```
 docs/                本 README 的细节分册（见下「细节去哪了」）
-src/                 垫片本体：路由、信封、SSE、会话/消息存储
+src/main.rs          垫片本体：路由、信封、SSE、会话/消息存储、事件翻译
+src/attachments.rs   贴图：内联 data: URL ↔ Ante 的 @path 提及
+src/integrations.rs  /connect：Ante 的供应商登录 ↔ opencode 的 integration 接口
+src/quota.rs         侧栏额度面板的取数与排版
 build.rs             把编译用的 ante-sdk 版本写进二进制（启动自检要用）
 script/              build-tui.sh（重建客户端）、upgrade-upstream.sh（拉上游 + 重建，一条命令）、shot-home.py（把首页渲染成 PNG，README 那张图就是它出的）、tui_drive.py（在 PTY 里驱动客户端：按秒发键 + 抓最终屏文本，验收自动化探针）
 vendor/opencode/     上游 opencode（subtree，跟主线）——魔改对象
