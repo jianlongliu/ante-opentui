@@ -61,7 +61,8 @@ Ante（**你自己装的**：官方脚本装、`ante update` 升级）
 | **断线重连** | 退避重连 + `/api/health` 说真话 + 转录里一行说明，掉线期间排队的消息不丢。**回合没跑完就被杀掉的会话（盘上只剩 `events.jsonl`）Ante 打不开**，这种会话会新开一条继续 |
 | **常用命令** | `/compact`、`/rename`（走 Ante 自己的 `SessionUpdate.title`，别的前端也看得到；只有当前这条会话能这样改，别的会话改名落垫片自己的 `title.txt`）、`/copy`、`/export`（`GET …/experimental/session/{id}/export` 直接回垫片手上那份转录，`sanitize` 忽略——载荷本来就是 Ante 的日志，不重写路径）、`/stats`（数字全部来自 Ante 的 `meta.json`：会话数、token、活动日历、按 provider/model 分组；Ante 没写的报 0，协议里没有报价也没有子代理计数）、`/skills`（优先用 Ante 播报的技能清单——那是真能调用的集合，含项目域与 `no_skills`；首轮提示词之前才退到磁盘扫描） |
 | **交互** | 模型选择、`shift+tab` 权限模式、`@` 文件补全、Herdr 状态上报、boot 接口全套。多标签**临时**关掉（`tabs.mode = "off"` 只是个配置项，不是能力——它要服务端同时驱动多条会话，垫片只有一条连接；真做多标签见[待定与遗弃](#待定与遗弃)） |
-| **不装样子** | Ante 没有的概念（MCP、LSP、VCS、终端、子代理会话）从界面里摘掉，而不是留个点了没反应的入口——插件 / 键位 / 命令黑名单 / 侧栏卡片四层，见 [docs/client-patches.md](docs/client-patches.md) 的「屏蔽做不了的入口」 |
+| **MCP 服务器**（`/mcps`、侧栏 `▼ MCP`） | Ante 按会话从 `mcp_servers` 连服务器，连上后经 `ExtensionRefreshed` 把**每个服务器与它的工具**报给垫片（`McpServerInfo`，含远程服务器的 `url`）——垫片记下来，按客户端的 `Mcp.Server` 形状答 `/api/mcp`（有工具＝`connected`，没工具＝`failed`），并在每次 `ExtensionRefreshed` 后发一条带 location 的 `mcp.status.changed` 让面板刷新。**启停做不了**：Ante 的协议里没有运行时开关，服务器固定来自 `settings.json`、每会话连一次，所以 `connect`/`disconnect`/`add`/`remove` 一律回 400 + 一句写明改哪儿，而不是假装成功。**首轮提示词之前列表是空的**——Ante 侧会话要等首个 prompt 才启动 |
+| **不装样子** | Ante 没有的概念（LSP、VCS、终端、子代理会话）从界面里摘掉，而不是留个点了没反应的入口——插件 / 键位 / 命令黑名单 / 侧栏卡片四层，见 [docs/client-patches.md](docs/client-patches.md) 的「屏蔽做不了的入口」 |
 | **两个平台** | CI 出 Arch 包 + macOS（Apple Silicon）tar.gz，见[装包](#装包ci-产物) |
 
 ## 快速开始
@@ -113,7 +114,7 @@ opencode2 --server http://127.0.0.1:41999     # 终端 B
 - **可以多开**：一体化模式下端口被占会**自动往后顺延**（并打印改用哪个），所以第二个、第三个 `antex` 直接跑就行。`serve` 模式相反——按你给的端口，被占就明确报错（换端口会让人连错服务）。
 - 环境变量：`ANTE_BIN` 指定 `ante` 可执行文件（默认 `$PATH`，再退到 `~/.ante/bin/ante`）；`ANTEX_CLIENT` 指定客户端（默认 `~/.local/bin/antex-tui`，再退到 `opencode2` → `opencode`）。**所以不必先 export PATH。**
 - **一体化模式下请求日志写 `/tmp/antex.log`**——写 stdout 会糊在 TUI 上；`serve` 模式仍打在 stdout。
-- **启动自检**：找不到 `ante` 就直接报错退出（否则 TUI 能开、消息全石沉大海）；`ante --version` 与二进制里编进去的 `ante-sdk` **不在同一版本系列**（前两段，如 `0.2.x`）才**警告**。判据是**系列不是全等**：Ante 自己的版本与它发的 `ante-sdk` 本来就不同步（0.2.11 发的是 sdk 0.2.10），比全等会每次启动都误报。运行期连不上、事件流断掉、消息被丢弃也写同一处日志，不留哑谜：`tail /tmp/antex.log`。
+- **启动自检**：找不到 `ante` 就直接报错退出（否则 TUI 能开、消息全石沉大海）；`ante --version` 与二进制里编进去的 `ante-sdk` **不在同一版本系列**（前两段，如 `0.2.x`）才**警告**。判据是**系列不是全等**：Ante 自己的版本与它发的 `ante-sdk` 本来就不同步（0.2.14 发的就是 sdk 0.2.14，但 0.2.11 发的是 sdk 0.2.10），比全等会每次启动都误报。运行期连不上、事件流断掉、消息被丢弃也写同一处日志，不留哑谜：`tail /tmp/antex.log`。
 
 **macOS 上多两件事**（其余同上；已在 macOS 27 / arm64 上实测一条命令能起）：
 
@@ -157,7 +158,7 @@ macOS 那份**只能在 macOS 上编**：垫片要 Apple SDK（Linux 上交叉�
 ## 为什么这么做
 
 手写复刻 opencode 的 TUI 到不了它的完成度（它有 17k 行的界面层）。反过来做，垫片是**可丢弃**的一层：
-上游界面升级时，重新拉 TUI 即可，只需跟着修垫片。代价是 Ante 没有的概念（LSP、MCP、formatter、git 操作）必须打桩
+上游界面升级时，重新拉 TUI 即可，只需跟着修垫片。代价是 Ante 没有的概念（LSP、formatter、git 操作）必须打桩
 ——`/connect` 不再打桩了：Ante 的供应商登录被翻译成 opencode 的 integration 接口（见[功能](#功能)）。
 思路同「改接口，不改消费者」（参照 `onarchi`——把 Omarchy 真移植到 niri 的那个仓，原名 omarchy-on-niri）。
 
@@ -183,7 +184,8 @@ macOS 那份**只能在 macOS 上编**：垫片要 Apple SDK（Linux 上交叉�
 ### 遗弃
 
 - [ ] ~~`/share`、`/unshare`~~ —— 云端分享，Ante 无此概念（客户端自己也直接报 "Sharing is not implemented for V2 sessions yet"）
-- [ ] ~~`/mcps`、`/status`、MCP 面板~~ —— 无 MCP
+- [x] **`/mcps`、MCP 面板已转正**（2026-10-22）——Ante 0.2.12 起报 MCP 服务器与工具，垫片接上后 `/mcps` 与侧栏 `▼ MCP` 都显示真数据；**启停仍不可用**（协议无运行时开关，按 `space` 会弹出原因）
+- [ ] ~~`/status`~~ —— 无会话状态接口
 - [ ] ~~`/pair`~~ —— 无设备配对（Ante 没有 pairing，`/api/pair` 只答空）。**`/connect` 已转正**，见[功能](#功能)
 - [ ] ~~`/diff`、`/worktrees`~~ —— 无 diff / VCS / worktree 概念（`/api/vcs/*` 只能答空；`/api/vcs` 因此答**空分支** `{branch:{}}`，位置标签才不会挂上假 `:main`）
 - [ ] ~~`/terminal`、Terminals 面板、`!` shell 模式~~ —— 无 PTY、无 shell 会话 op（Bash 是工具调用，不是终端）
@@ -219,7 +221,7 @@ Cargo 依赖（`Cargo.lock` 实际解析值，非 `Cargo.toml` 的约束范围�
 | 网络 | 本机现在**直连即可**（代理在路由器上做透明转发）。若哪天又只用本地 mihomo，再 `export http_proxy=https_proxy=http://127.0.0.1:7890`——`script/*.sh` 已改成「只有 7890 真在监听才设代理」 |
 | opencode 客户端 | **2.0.29**，来自本仓库 `vendor/opencode/`（subtree 上游 tag `v2.0.29`），用 `script/build-tui.sh` 自编；官方脚本那份仍装在 `~/.opencode/bin`（`opencode`/`opencode2` 指向它，**2.0.18**，只作兜底） |
 | 跟上游的口子 | `./script/upgrade-upstream.sh [ref]`——默认跟上游**主线**（默认分支 `dev`），也可传 tag（如 `v2.0.29`）。**原先跟的 `v2` 分支 2026-10-10 停更了**（版本停在 2.0.26），别再拿它当上游 |
-| Ante | 接后端时用 **`ante-sdk` 0.2.10**——**已发布 crates.io**，直接写 `ante-sdk = "0.2.10"` 即可（是 `^0.2.10`，跟着 Ante 的 0.2.x 走）。实测对着 Ante **0.2.11** |
+| Ante | 接后端时用 **`ante-sdk` 0.2.14**——**已发布 crates.io**，直接写 `ante-sdk = "0.2.14"`（`^0.2.14`，跟着 Ante 的 0.2.x 走）。实测对着 Ante **0.2.14**；启动自检会比对两边的次版本号 |
 
 ## 目录结构
 
@@ -246,7 +248,7 @@ Cargo.toml           axum + tokio + serde
 
 **界面在跑，发消息却没反应？**
 先 `tail /tmp/antex.log`（macOS 上是 `$TMPDIR/antex.log`）：启动自检那行会明说 `ante` 找没找到、版本是不是同一系列（例如
-`自检：… → ante 0.2.11；antex 编译于 ante-sdk 0.2.10，同一版本系列`）。自检过了还没反应，就看日志里
+`自检：… → ante 0.2.14；antex 编译于 ante-sdk 0.2.14，同一版本系列`）。自检过了还没反应，就看日志里
 「未连接 / 事件流结束 / 消息被丢弃」那几句——它不会静默。
 
 **启动后模型列表要等几秒才出来？**

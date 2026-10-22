@@ -325,8 +325,10 @@ function useLeaderActive() {
 /// list removes them from the palette *and* slash completion at once, because
 /// both are built from it; their keybinds are switched off in `cli.json`.
 /// `/connect` is *not* here: the shim serves the integration API and signs in.
+/// `/mcps` is *not* here either (2026-10-22): Ante reports its MCP servers and
+/// their tools over the wire, so the dialog has real content — only its
+/// connect/disconnect action is refused (Ante has no runtime switch).
 const ANTE_MISSING = new Set([
-  "mcps",
   "status",
   "pair",
   "reload",

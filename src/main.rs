@@ -2,9 +2,10 @@
 //!
 //! The point of this shim is to let opencode's *own* TUI run unchanged:
 //! `opencode2 --server http://127.0.0.1:PORT` cannot tell it apart from the real
-//! server. Everything Ante has no concept of (LSP, MCP, formatters, OAuth, git
+//! server. Everything Ante has no concept of (LSP, formatters, OAuth, git
 //! operations) is stubbed, and the pieces Ante does have (a session with a
-//! streaming reply) are translated into the message/event shapes the TUI reads.
+//! streaming reply, the MCP servers it connects) are translated into the
+//! message/event shapes the TUI reads.
 //!
 //! Shapes come from `packages/protocol/openapi.json` on opencode's `v2` branch.
 //! Note the envelope is *not* uniform: most reads answer `{location, data}`,
@@ -18,8 +19,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ante_sdk::{
     ConnectOptions, EventReceiver, OpSender, connect,
     protocol::{
-        Evt, Id, Op, PermissionMode, ReviewDecision, SessionRequest, SessionUpdate, SkillMetadata,
-        ToolDecision, ToolUse, TurnPauseReason,
+        Evt, Id, McpServerInfo, Op, PermissionMode, ReviewDecision, SessionRequest, SessionUpdate,
+        SkillMetadata, ToolDecision, ToolUse, TurnPauseReason,
     },
 };
 use axum::{
@@ -306,6 +307,12 @@ struct Ante {
     /// project scope and all), so the dialog cannot offer a skill the session
     /// does not have.
     skills: Arc<Mutex<Vec<Value>>>,
+    /// The MCP servers Ante announced for the session it is driving, in the
+    /// client's `Mcp.Server` shape. Ante pushes these in `ExtensionRefreshed`:
+    /// one carry-all at session start (empty servers) and another once warm-up
+    /// finishes, so the later one replaces rather than merges. `/mcps` and the
+    /// sidebar card answer from here — the shim never speaks MCP itself.
+    mcp: Arc<Mutex<Vec<Value>>>,
     /// Where the connection to Ante stands. See [`Link`].
     link: Arc<Mutex<Link>>,
     /// When the last "backend is gone" row went into the transcript.
@@ -401,6 +408,7 @@ impl Ante {
             busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             archives: Arc::new(Mutex::new(HashMap::new())),
             skills: Arc::new(Mutex::new(Vec::new())),
+            mcp: Arc::new(Mutex::new(Vec::new())),
             link: Arc::new(Mutex::new(Link::Connecting)),
             notice_at: Arc::new(Mutex::new(None)),
         }
@@ -485,6 +493,20 @@ impl Ante {
 
     fn announced_skills(&self) -> Vec<Value> {
         self.skills.lock().map(|slot| slot.clone()).unwrap_or_default()
+    }
+
+    /// Keep the MCP servers the session announced. Ante sends the whole set each
+    /// time — at session start (before warm-up, so empty) and again once the
+    /// servers settle — so this replaces rather than merges, and the second one
+    /// is what the dialogs end up showing.
+    fn remember_mcp(&self, servers: &[McpServerInfo]) {
+        if let Ok(mut slot) = self.mcp.lock() {
+            *slot = servers.iter().map(mcp_server_info).collect();
+        }
+    }
+
+    fn announced_mcp(&self) -> Vec<Value> {
+        self.mcp.lock().map(|slot| slot.clone()).unwrap_or_default()
     }
 
     /// The archive [`attach_session`] may hand to `ResumeSession`: the one Ante
@@ -1034,6 +1056,28 @@ fn skill_info(skill: &SkillMetadata) -> Value {
     info
 }
 
+/// Ante's announcement as the client's `Mcp.Server`: `{name, status}`.
+///
+/// The two sides disagree on what "status" means. Ante is a one-shot report —
+/// it only says which servers it configured and which tools each exposed, and a
+/// server whose handshake failed shows up with an empty tool list (the reason
+/// itself only ever reaches the transcript, via the warm-up info block). So a
+/// server with tools is `connected` and one without is `failed`: that is the
+/// whole truth available over the wire, and it is the distinction the dialog
+/// draws differently.
+///
+/// There is no `disabled` and no `needs_auth` here on purpose — Ante has no
+/// runtime switch and no per-server sign-in, so claiming either would offer the
+/// user an action the backend cannot take (see [`mcp_runtime_unsupported`]).
+fn mcp_server_info(server: &McpServerInfo) -> Value {
+    let status = if server.tools.is_empty() {
+        json!({ "status": "failed", "error": "Ante connected no tools for this server" })
+    } else {
+        json!({ "status": "connected" })
+    };
+    json!({ "name": server.name, "status": status })
+}
+
 /// The directories Ante discovers skills from: the user's own, its system scope,
 /// and the working directory's. `/skills` reads the same three when a session has
 /// not announced its list yet (nothing is announced until the first prompt).
@@ -1486,14 +1530,12 @@ async fn ante_version(bin: &std::path::Path) -> Option<String> {
 /// stats, the opencode plugin system, `/btw`, the sidebar's MCP card. The client
 /// takes `plugins` as an ordered list where an `-opencode.<id>` entry turns a
 /// builtin off (`tui/plugin/context.tsx`), matching by exact id or `<prefix>.*`.
-const DISABLED_PLUGINS: &[&str] = &[
-    "-opencode.diffs",
-    "-opencode.plugins",
-    "-opencode.btw",
-    "-opencode.sidebar.mcp",
-];
+const DISABLED_PLUGINS: &[&str] = &["-opencode.diffs", "-opencode.plugins", "-opencode.btw"];
 // `-opencode.stats` is gone from this list: `/stats` is served now, off Ante's own
 // session summaries (`/api/experimental/session/stats`).
+// `-opencode.sidebar.mcp` is gone too (2026-10-22): Ante announces its MCP servers
+// and their tools, so the sidebar card and `/mcps` draw real data. It renders
+// nothing while the list is empty, so a session with no servers is unchanged.
 
 /// Binds that ship live for commands with nothing behind them
 /// (`tui/config/keybind.ts`: `<leader>t`, `ctrl+b`, `<leader>u`, `<leader>r`,
@@ -2276,6 +2318,10 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
             // while the client's id is the active one.
             Evt::SessionStart(info) => {
                 store.ante.remember_skills(&info.skills);
+                // A new session starts its own MCP set: whatever the last one
+                // announced would otherwise be shown as this one's until the
+                // first refresh lands.
+                store.ante.remember_mcp(&[]);
                 if let Some(client) = store.ante.active.lock().ok().and_then(|slot| slot.clone()) {
                     let archive = info.session_id.to_string();
                     if archive != client {
@@ -2340,6 +2386,18 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
                         json!({ "sessionID": client, "title": title }),
                         &client,
                     );
+                }
+            }
+            // MCP servers coming online. Ante announces them twice: an empty set
+            // at session start, then the real one once warm-up settled. The
+            // client only learns of a change from `mcp.status.changed`, which it
+            // routes *by location* — publishing it without one is read and
+            // dropped silently, so this goes out through `publish_located`.
+            Evt::ExtensionRefreshed(refresh) => {
+                store.ante.remember_skills(&refresh.skills);
+                store.ante.remember_mcp(&refresh.mcp_servers);
+                for server in &refresh.mcp_servers {
+                    store.publish_located("mcp.status.changed", json!({ "server": server.name }));
                 }
             }
             // Ante took an input. It is *not* delivered yet: `Op::UserInput` and
@@ -3137,6 +3195,37 @@ async fn vcs_base_empty() -> Json<Value> {
 
 async fn mcp_resources_empty() -> Json<Value> {
     envelope(json!({ "resources": [], "templates": [] }))
+}
+
+/// `GET /api/mcp` — `/mcps` and the sidebar card.
+///
+/// The list is whatever Ante last announced for the live session, so it is empty
+/// until a session has started and warm-up has reported. That is honest: the
+/// shim has no MCP of its own and cannot discover servers outside a session.
+async fn mcp_servers(State(store): State<Store>) -> Json<Value> {
+    envelope(json!(store.ante.announced_mcp()))
+}
+
+/// `PUT`/`DELETE /api/experimental/mcp/{server}` and its `connect`/`disconnect`
+/// pair: the client's "toggle" action in the `/mcps` dialog.
+///
+/// Ante has no runtime switch — its servers are fixed by `mcp_servers` in
+/// `settings.json` and connected once per session, and the protocol carries no
+/// op to start or stop one. Answering 200 with an empty body (what the shim used
+/// to do for the whole family) would leave the dialog toggling a status that
+/// never changes, so this refuses in the shape the client decodes: a declared
+/// status carrying a `message` it puts straight into a toast.
+async fn mcp_runtime_unsupported(Path(server): Path<String>) -> Response {
+    (
+        axum::http::StatusCode::BAD_REQUEST,
+        Json(json!({
+            "server": server,
+            "message": "Ante connects MCP servers per session from mcp_servers in \
+                        ~/.ante/settings.json and cannot start or stop one at runtime. \
+                        Edit that file, then start a new session.",
+        })),
+    )
+        .into_response()
 }
 
 async fn session_terminals_empty() -> Json<Value> {
@@ -4887,7 +4976,19 @@ async fn main() {
         .route("/api/rpc/{rpc_id}/{method}", post(quota::rpc))
         .route("/api/skill", get(skills))
         .route("/api/command", get(empty_reads))
-        .route("/api/mcp", get(empty_reads))
+        .route("/api/mcp", get(mcp_servers))
+        .route(
+            "/api/experimental/mcp/{server}",
+            axum::routing::put(mcp_runtime_unsupported).delete(mcp_runtime_unsupported),
+        )
+        .route(
+            "/api/experimental/mcp/{server}/connect",
+            post(mcp_runtime_unsupported),
+        )
+        .route(
+            "/api/experimental/mcp/{server}/disconnect",
+            post(mcp_runtime_unsupported),
+        )
         .route("/api/experimental/migration/v1", get(migration))
         .route("/api/experimental/capabilities", get(empty_reads))
         .route("/api/experimental/session/stats", get(session_stats))
@@ -5372,7 +5473,7 @@ mod tests {
 
         // Every key can be spoken for, and then there is nothing to inject.
         let mine = r#"{"tabs":{"mode":"on"},"session":{"image_preview":false},"prompt":{"image_preview":false},
-            "plugins":["-opencode.diffs","-opencode.plugins","-opencode.btw","-opencode.sidebar.mcp"],
+            "plugins":["-opencode.diffs","-opencode.plugins","-opencode.btw"],
             "keybinds":{"session.undo":"none","session.redo":"none","session.background":"none",
                         "terminal.toggle":"none","terminal.select":"none","terminal.close":"none"}}"#;
         assert_eq!(client_config_override(Some(mine), false), None);
@@ -5434,12 +5535,16 @@ mod tests {
             .map(|entry| entry.as_str().expect("a string"))
             .collect();
         assert_eq!(plugins[0], "./herdr-opencode");
-        for entry in ["-opencode.diffs", "-opencode.sidebar.mcp", "-opencode.btw"] {
+        for entry in ["-opencode.diffs", "-opencode.plugins", "-opencode.btw"] {
             assert!(plugins.contains(&entry), "{entry} is pinned");
         }
+        assert!(
+            !plugins.contains(&"-opencode.sidebar.mcp"),
+            "the MCP card is live now: Ante announces its servers"
+        );
 
         // A file that already says them is left alone: no duplicates, no key.
-        let mine = r#"{"plugins":["-opencode.diffs","-opencode.plugins","-opencode.btw","-opencode.sidebar.mcp"]}"#;
+        let mine = r#"{"plugins":["-opencode.diffs","-opencode.plugins","-opencode.btw"]}"#;
         let filled = client_config_override(Some(mine), false).expect("the keybinds are still unsaid");
         let value: Value = serde_json::from_str(&filled).expect("valid JSON");
         assert!(value.get("plugins").is_none(), "nothing to add means nothing to inject");
@@ -5626,5 +5731,52 @@ mod tests {
         assert_eq!(store.current_variant(), "high");
         switch(json!({ "id": "m" }));
         assert_eq!(store.current_variant(), "default");
+    }
+
+    /// A server Ante reported without tools is the only failure signal the wire
+    /// carries, and the dialog draws `failed` differently from `connected`.
+    #[test]
+    fn an_mcp_server_with_no_tools_reads_as_failed() {
+        let connected = mcp_server_info(&McpServerInfo {
+            name: "probe".to_string(),
+            command: "npx".to_string(),
+            args: vec!["-y".to_string()],
+            url: None,
+            tools: vec![ante_sdk::protocol::McpToolInfo {
+                name: "echo".to_string(),
+                qualified_name: "mcp__probe__echo".to_string(),
+                description: "Echoes back the input string".to_string(),
+                parameters: Vec::new(),
+            }],
+        });
+        assert_eq!(connected["name"], json!("probe"));
+        assert_eq!(connected["status"]["status"], json!("connected"));
+
+        let failed = mcp_server_info(&McpServerInfo {
+            name: "broken".to_string(),
+            command: "/nonexistent/mcp-bin".to_string(),
+            args: Vec::new(),
+            url: None,
+            tools: Vec::new(),
+        });
+        assert_eq!(failed["status"]["status"], json!("failed"));
+        assert!(failed["status"]["error"].as_str().is_some_and(|text| !text.is_empty()));
+    }
+
+    /// Ante's later announcement is the whole set, so a session whose warm-up
+    /// came back empty must not keep showing the previous session's servers.
+    #[test]
+    fn the_mcp_list_is_replaced_not_merged() {
+        let store = Store::new();
+        store.ante.remember_mcp(&[McpServerInfo {
+            name: "first".to_string(),
+            command: "a".to_string(),
+            args: Vec::new(),
+            url: None,
+            tools: Vec::new(),
+        }]);
+        assert_eq!(store.ante.announced_mcp().len(), 1);
+        store.ante.remember_mcp(&[]);
+        assert!(store.ante.announced_mcp().is_empty());
     }
 }
