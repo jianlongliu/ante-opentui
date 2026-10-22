@@ -209,7 +209,13 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 
 - **发版插曲（`tag v2026.10.14` 那次 CI 挂了）**：`ld.lld: error: undefined symbol: ring_core_0_17_14__…`。根因是 makepkg 默认把 `-flto=auto` 塞进 CFLAGS，而本版新引入的 ring（`reqwest → rustls`）的汇编目标在 `lld + -Wl,--gc-sections` 下会丢符号——本机 `cargo build --release` 不带那份 CFLAGS，所以本地怎么试都编得过，只能在容器里复现。修法一行：`PKGBUILD` 的 `options` 加 `'!lto'`（在 archlinux 容器里实测；另两条已验证的绕法是 `-Clink-arg=-fuse-ld=bfd`、`-Clink-arg=-Wl,--no-gc-sections`）。**`v2026.10.14` 这个 tag 就作废了**（CI 失败、也没产物），版本按规矩往前走到 `2026.10.15`；排查过程见 [pitfalls.md](pitfalls.md)。验包：`tar --zstd -xOf <包> usr/bin/antex | grep -c antex.quota` 应 ≥1，`usr/bin/antex-tui` 里应能找到 `antex.sidebar.quota`。
 
-**`2026.10.22`（待发）：跟到 Ante 0.2.14，MCP 面板转正**
+**`2026.10.22.1`（已出）：补发 2026.10.22 的包（CI 修好了）**
+
+- **`v2026.10.22` 的 macOS job 挂在补丁应用**：`hunk #10 does not apply to photon_rs.js (expected at line 4509)`。根因不是依赖漂移，是上游 photon 补丁的 hunk #10 有 3 行上下文多了一个前导空格（`;` 该 4 空格、`};` 该无缩进、空行该是真空行）；bun ≤1.4.3 按行号盲贴能过，1.4.4 改成按上下文严格匹配（"like `git apply`"）就暴露了。`release` job 因此被 skip，Release 没有包（**Linux 的 `arch-pkg` 产物本身是好的**，当时用 `gh run download <run> -n arch-pkg` 取来装过）。
+- **修法**：`vendor/opencode/patches/@silvia-odwyer%2Fphoton-node@0.3.4.patch` 的 hunk #10 上下文改回与文件一致；CI 的 bun 从 `latest` 钉到 `1.4.4`（升之前先在 `vendor/opencode` 跑一遍 `bun install --frozen-lockfile` 验补丁）。验证：`git apply --check` 10 个 hunk 全过；bun 1.4.2 / 1.4.4 下安装都能装出 `OPENCODE_PHOTON_WASM_PATH` 那行。
+- **产物**：Release `v2026.10.22.1` = `antex-2026.10.22.1-1-x86_64.pkg.tar.zst` + `antex-2026.10.22.1-macos-arm64.tar.gz`；功能与 2026.10.22 相同，差别只是能正常出包。
+
+**`2026.10.22`（已出）：跟到 Ante 0.2.14，MCP 面板转正**
 
 - **`ante-sdk` 0.2.10 → 0.2.14**：0.2.13 的 `ante-protocol-shape` 只改了一处线格式——`McpServerInfo` 加 `url`（远程 MCP 服务器，0.2.12 起 Ante 支持 Streamable HTTP），其余是文档与测试删减；0.2.14 是 TLS 信任根（`webpki-roots` 1.0.10）与依赖跟进。垫片把它们一起提上来，顺带接住 `ExtensionRefreshed` 的 `mcp_servers`（见上面「MCP 服务器」那条）。
 - **接口面**：`/api/mcp` 从 `empty_reads` 换成答真数据；新增 `/api/experimental/mcp/{server}` 的 `PUT`/`DELETE` 与 `…/connect`、`…/disconnect` 四个明确拒绝的路由。**没有新增 op**：Ante 的运行时启停确实不存在。
