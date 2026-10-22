@@ -47,6 +47,15 @@ if [ -z "${http_proxy:-}" ] && [ -z "${https_proxy:-}" ] && ss -ltn 2>/dev/null 
   export https_proxy=http://127.0.0.1:7890
 fi
 
+# 上游 `packages/script/src/index.ts` 在没给 `OPENCODE_VERSION`、channel 又不是
+# `latest` 时会自己拼 `0.0.0-<channel>-<时间戳>`——这就是 `antex-tui --version`
+# 吐 `opencode v0.0.0-makepkg-202610221558` 的来源（subtree 里没有 git 分支可读）。
+# 把 vendor 的 `package.json` 版本喂进去，这条命令才说人话。
+OPENCODE_VERSION="$(grep -m1 '"version"' "$repo/vendor/opencode/package.json" \
+  | sed 's/.*"version": *"\([^"]*\)".*/\1/')"
+export OPENCODE_VERSION
+echo "客户端版本：opencode $OPENCODE_VERSION"
+
 cd "$repo/vendor/opencode/packages/cli"
 bun run script/build.ts --single --skip-web-ui
 

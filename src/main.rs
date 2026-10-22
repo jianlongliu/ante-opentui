@@ -55,6 +55,12 @@ fn default_directory() -> String {
 /// antex has no release cadence of its own — it follows whatever Ante and
 /// opencode are on — so its version is the day the binary was built.
 const ANTEX_VERSION: &str = env!("ANTEX_VERSION");
+/// Declared in PKGBUILD (CI builds from the tag of the same name). Separate
+/// from `ANTEX_VERSION` on purpose: this answers "which package", that one
+/// answers "which source". A local `cargo build` moves only the latter.
+const ANTEX_PKG_VERSION: &str = env!("ANTEX_PKG_VERSION");
+/// Upstream opencode release the vendored client was built from.
+const ANTEX_CLIENT_VERSION: &str = env!("ANTEX_CLIENT_VERSION");
 /// The Ante backend's version, read once by the startup self-check. `health`
 /// reports *this* as `version`: the shim stands in for Ante, so the client's
 /// own version number (what it used to answer) said nothing about either end.
@@ -5393,21 +5399,73 @@ fn frame(event: &Value) -> Event {
 }
 
 const USAGE: &str = "\
-antex — 用 opencode 的 TUI 驱动 Ante
+antex — drive Ante through opencode's own TUI
 
-用法:
-  antex                  起服务并直接进 TUI（一条命令，退出时服务一起停）
-  antex PORT             同上，指定端口（默认 41999）
-  antex serve [PORT]     只起服务，留在前台；另开终端连它
-  antex -h | --help      显示本帮助
+USAGE
+  antex                  Start the shim and hand the terminal to the TUI
+                         (one command: the shim stops when the TUI exits)
+  antex PORT             Same, on PORT (default 41999)
+  antex serve [PORT]     Start only the shim, stay in the foreground
+  antex -h | --help      Show this help
+  antex -v | --version   Show backend, client and shim versions
 
-只起服务时，客户端这样连：
+CONNECTING A CLIENT
   opencode2 --server http://127.0.0.1:41999
 
-环境变量:
-  ANTE_BIN       指定 ante 可执行文件（默认 $PATH，再退到 ~/.ante/bin/ante）
-  ANTEX_CLIENT   指定 opencode 客户端（默认 $PATH 上的 opencode2，再退到 opencode）
+CLIENT SUBCOMMANDS STAY WITH THE CLIENT
+  antex-tui --help       The client this shim hands the terminal to
+                         (upstream opencode v2 CLI). antex forwards nothing.
+  serve / service / upgrade / uninstall belong to stock opencode: they start
+  its server and install its packages, not this shim.
+
+ENVIRONMENT
+  ANTE_BIN       Path to the `ante` binary (default: $PATH, then ~/.ante/bin/ante)
+  ANTEX_CLIENT   Client to run (default: ~/.local/bin/antex-tui, then opencode2 → opencode)
 ";
+
+/// The three versions that get confused with each other. `backend` and
+/// `client` are probed live, because both can be swapped under us ($ANTE_BIN,
+/// $ANTEX_CLIENT) and a compiled-in answer would then be a lie.
+fn print_version() {
+    println!("antex {ANTEX_PKG_VERSION}");
+    println!(
+        "  shim      built {ANTEX_VERSION} · ante-sdk {}",
+        env!("ANTE_SDK_VERSION")
+    );
+
+    match ante_executable() {
+        Some(exe) => match probe_version(&exe) {
+            Some(line) => println!("  backend   {line}"),
+            None => println!("  backend   ante ({}) — version unavailable", exe.display()),
+        },
+        None => println!("  backend   ante — not found"),
+    }
+
+    let client = client_executable();
+    match probe_version(&client) {
+        // A stock opencode answers with its own real version.
+        Some(line) => println!("  client    {line}  ({})", client.display()),
+        // Our build prints a PKGBUILD placeholder (`opencode v0.0.0-makepkg-…`),
+        // so fall back to the upstream release it was compiled from.
+        None => println!(
+            "  client    opencode {ANTEX_CLIENT_VERSION}  ({}, built from that release)",
+            client.display()
+        ),
+    }
+}
+
+/// The first line of `<exe> --version`, or `None` when it cannot run or only
+/// prints a placeholder that names no release.
+fn probe_version(exe: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new(exe).arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().next()?.trim().to_string();
+    let placeholder = line.contains("0.0.0") || line.contains("makepkg");
+    (!line.is_empty() && !placeholder).then_some(line)
+}
 
 struct Args {
     port: u16,
@@ -5425,14 +5483,18 @@ fn parse_args(args: Vec<String>) -> Result<Option<Args>, String> {
                 print!("{USAGE}");
                 return Ok(None);
             }
+            "-v" | "-V" | "--version" => {
+                print_version();
+                return Ok(None);
+            }
             "serve" => parsed.serve_only = true,
             "--port" => {
-                let value = rest.next().ok_or("--port 后面要跟端口号")?;
-                parsed.port = value.parse().map_err(|_| format!("端口不是数字: {value}"))?;
+                let value = rest.next().ok_or("--port needs a port number")?;
+                parsed.port = value.parse().map_err(|_| format!("not a port number: {value}"))?;
             }
             other => match other.parse::<u16>() {
                 Ok(value) => parsed.port = value,
-                Err(_) => return Err(format!("不认识的参数: {other}")),
+                Err(_) => return Err(format!("unknown argument: {other}")),
             },
         }
     }
@@ -5445,7 +5507,7 @@ async fn main() {
         Ok(Some(args)) => args,
         Ok(None) => return,
         Err(err) => {
-            eprintln!("错误：{err}\n\n{USAGE}");
+            eprintln!("error: {err}\n\n{USAGE}");
             std::process::exit(2);
         }
     };

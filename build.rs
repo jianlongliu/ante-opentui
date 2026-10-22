@@ -24,6 +24,50 @@ fn main() {
     // not read at runtime: the binary should not claim a different version
     // tomorrow than it is now.
     println!("cargo:rustc-env=ANTEX_VERSION={}", build_date());
+
+    // The package version is what a user means by "which antex is installed",
+    // and PKGBUILD is where it is declared — CI builds from a tag of the same
+    // name, so the two cannot drift. The build date above deliberately stays
+    // separate: it answers "which source was this binary made from".
+    println!("cargo:rerun-if-changed=PKGBUILD");
+    println!("cargo:rustc-env=ANTEX_PKG_VERSION={}", pkg_version());
+
+    // The upstream opencode release this client was built from. `antex-tui
+    // --version` prints a PKGBUILD placeholder (`opencode v0.0.0-makepkg-…`)
+    // that names nothing, so this is the only honest static answer.
+    println!("cargo:rerun-if-changed=vendor/opencode/package.json");
+    println!("cargo:rustc-env=ANTEX_CLIENT_VERSION={}", client_version());
+}
+
+/// The `pkgver=` line of PKGBUILD. `unknown` when it is absent, so a stray
+/// `cargo build` outside the repo still produces a compilable binary.
+fn pkg_version() -> String {
+    let path = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"))
+        .join("PKGBUILD");
+    let Ok(text) = fs::read_to_string(&path) else {
+        println!("cargo:warning=PKGBUILD missing; `antex --version` will not name the package");
+        return "unknown".to_string();
+    };
+    text.lines()
+        .find_map(|line| line.strip_prefix("pkgver="))
+        .map(|value| value.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The `version` field of the vendored opencode `package.json` — i.e. which
+/// upstream release the client binary was built from.
+fn client_version() -> String {
+    let path = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"))
+        .join("vendor/opencode/package.json");
+    let Ok(text) = fs::read_to_string(&path) else {
+        println!("cargo:warning=vendored package.json missing; client version will read unknown");
+        return "unknown".to_string();
+    };
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("\"version\":"))
+        .and_then(|rest| rest.split('"').nth(1))
+        .map(str::to_string)
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// Local `YYYY-MM-DD`. Falls back to `unknown` rather than failing the build.

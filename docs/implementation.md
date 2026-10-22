@@ -209,6 +209,13 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 
 - **发版插曲（`tag v2026.10.14` 那次 CI 挂了）**：`ld.lld: error: undefined symbol: ring_core_0_17_14__…`。根因是 makepkg 默认把 `-flto=auto` 塞进 CFLAGS，而本版新引入的 ring（`reqwest → rustls`）的汇编目标在 `lld + -Wl,--gc-sections` 下会丢符号——本机 `cargo build --release` 不带那份 CFLAGS，所以本地怎么试都编得过，只能在容器里复现。修法一行：`PKGBUILD` 的 `options` 加 `'!lto'`（在 archlinux 容器里实测；另两条已验证的绕法是 `-Clink-arg=-fuse-ld=bfd`、`-Clink-arg=-Wl,--no-gc-sections`）。**`v2026.10.14` 这个 tag 就作废了**（CI 失败、也没产物），版本按规矩往前走到 `2026.10.15`；排查过程见 [pitfalls.md](pitfalls.md)。验包：`tar --zstd -xOf <包> usr/bin/antex | grep -c antex.quota` 应 ≥1，`usr/bin/antex-tui` 里应能找到 `antex.sidebar.quota`。
 
+**`2026.10.23`（已出）：加 `--version` / `--help`**
+
+- **`--version` 报三方版本**：`backend` 现问 `ante --version`；`client` 先问客户端自己的 `--version`，遇到 `antex-tui` 那种 `opencode v0.0.0-makepkg-…` 的假串就回退到编进去的上游版本；`shim` 是 `pkgver · 构建日期 · ante-sdk`。后端与客户端都**运行时 probe**——它们能被 `$ANTE_BIN` / `$ANTEX_CLIENT` 换掉，写死就是撒谎；probe 不到只降级显示，不报错。
+- **两个新编译期常量**（`build.rs`）：`ANTEX_PKG_VERSION` 读 `PKGBUILD` 的 `pkgver`（与 `pacman -Q` 和 tag 对得上）、`ANTEX_CLIENT_VERSION` 读 `vendor/opencode/package.json`。构建日期 `ANTEX_VERSION` 保持独立——**本地 `cargo build` 只动它，别拿它判断包版本**。
+- **`--help` 全英文**，并写明客户端子命令归客户端（`serve` / `service` / `upgrade` / `uninstall` 走的是官方 opencode，不是垫片）。错误参数 = 一行 `error: …` + 整份 help + `exit 2`，都走 stderr。
+- **`antex-tui --version` 的假串也治了**：根因在上游 `packages/script/src/index.ts`——没给 `OPENCODE_VERSION`、channel 又不是 `latest` 时它自己拼 `0.0.0-<channel>-<时间戳>`。`script/build-tui.sh` 现在把 vendor 的版本喂进去，**在下次重建客户端时生效**；本版没重建，所以包里的 `antex-tui --version` 仍是旧串，`antex --version` 已经绕开它。
+
 **`2026.10.22.1`（已出）：补发 2026.10.22 的包（CI 修好了）**
 
 - **`v2026.10.22` 的 macOS job 挂在补丁应用**：`hunk #10 does not apply to photon_rs.js (expected at line 4509)`。根因不是依赖漂移，是上游 photon 补丁的 hunk #10 有 3 行上下文多了一个前导空格（`;` 该 4 空格、`};` 该无缩进、空行该是真空行）；bun ≤1.4.3 按行号盲贴能过，1.4.4 改成按上下文严格匹配（"like `git apply`"）就暴露了。`release` job 因此被 skip，Release 没有包（**Linux 的 `arch-pkg` 产物本身是好的**，当时用 `gh run download <run> -n arch-pkg` 取来装过）。
