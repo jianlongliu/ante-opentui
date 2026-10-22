@@ -82,9 +82,14 @@ jobs:
           test -n "$pkgver"
           echo "pkgver=$pkgver" >> "$GITHUB_OUTPUT"
 
+      # 不用 latest：bun 1.4.4 把 patch 的 hunk 从「按行号贴」改成「按上下文严格匹配」
+      # （release notes：hunks were applied by line number alone… now matched by context,
+      # like `git apply`）。上游 photon 补丁的 hunk #10 有 3 行上下文多一个空格，只有按
+      # 行号盲贴才过得去，1.4.4 一升就整条 macOS 构建挂掉（2026-10-22 的 v2026.10.22）。
+      # 升这个版本前，先在 vendor/opencode 里跑一遍 bun install --frozen-lockfile 验补丁。
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.4.4
 
       - name: 编译垫片
         run: cargo build --release --locked
