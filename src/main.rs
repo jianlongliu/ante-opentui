@@ -298,6 +298,18 @@ struct Ante {
     /// `Ok`, an `Evt::Error` as `Err`; a dropped sender leaves the caller's
     /// timeout to report it.
     rewind_wait: Arc<Mutex<Option<tokio::sync::oneshot::Sender<Result<(), String>>>>>,
+    /// `!command` runs in flight, by the op id Ante will answer with.
+    ///
+    /// `Op::ShellInput` is answered once, with `Evt::ShellOutput` carrying the
+    /// command, its merged output and the exit code — and that event's `parent`
+    /// is the op id, which is the only thing tying an answer to its request.
+    /// The client's `POST …/shell` stays open until then, so this is where the
+    /// stored answer is parked for a later read.
+    shells: Arc<Mutex<HashMap<String, Value>>>,
+    /// Shells awaiting their `ShellOutput`, by op id: what the answer has to be
+    /// published under (`sessionID`, `shellID`, `started`). Removed when the
+    /// output lands, or when the client gives up waiting.
+    shell_waits: Arc<Mutex<HashMap<String, Value>>>,
     /// Which opencode session the events belong to. One Ante session is
     /// mirrored, so this is the most recent one the TUI opened.
     active: Arc<Mutex<Option<String>>>,
@@ -426,6 +438,8 @@ impl Ante {
             turning: Arc::new(Mutex::new(HashMap::new())),
             revert: Arc::new(Mutex::new(HashMap::new())),
             rewind_wait: Arc::new(Mutex::new(None)),
+            shells: Arc::new(Mutex::new(HashMap::new())),
+            shell_waits: Arc::new(Mutex::new(HashMap::new())),
             active: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(None)),
             agent: Arc::new(Mutex::new(reported_agent().to_string())),
@@ -677,7 +691,7 @@ impl Ante {
     /// whole turn — and the turn-end sweep then announced `delivered` after the
     /// reply, which the client answers by moving that prompt to the end of the
     /// transcript: under its own answer.
-    fn dropping(&self, event: &Evt) -> Replay {
+    fn dropping(&self, event: &Evt, parent: Option<&str>) -> Replay {
         let Ok(mut slot) = self.replay_turn.lock() else {
             return Replay::Pass;
         };
@@ -691,6 +705,18 @@ impl Ante {
                 Some(arm) => Replay::Ours { session: arm.session, inbox: arm.inbox },
                 None => Replay::Pass,
             };
+        }
+        // A resume replays the conversation, shell results included: the client
+        // already drew those from its own read, so a replayed one must not come
+        // through again. A `!command` sent *after* the switch, though, runs while
+        // this guard is still armed — and its output is the answer that request
+        // is waiting on, not history. `parent` tells them apart: the one we are
+        // waiting for names an op this process minted.
+        if let Evt::ShellOutput { .. } = event {
+            let awaited = parent.is_some_and(|parent| {
+                self.shell_waits.lock().is_ok_and(|waits| waits.contains_key(parent))
+            });
+            return if awaited { Replay::Pass } else { Replay::Replay };
         }
         let refused = matches!(event, Evt::Error(_));
         if refused || armed.elapsed() > REPLAY_GUARD {
@@ -1191,6 +1217,53 @@ fn mcp_server_info(server: &McpServerInfo) -> Value {
         json!({ "status": "connected" })
     };
     json!({ "name": server.name, "status": status })
+}
+
+/// Ante's `Evt::ShellOutput` as the client's `session.shell.ended` payload.
+///
+/// The two sides report different amounts: Ante gives the command, its stdout and
+/// stderr kept apart, and the exit code — nothing else. The client's `Shell.Info`
+/// wants an id, a status, a working directory and a combined-output size, and
+/// since `!cmd` runs to completion inside one request there is no live tail to
+/// page: the whole output is in this one answer, so `OutputOutput` reports it as
+/// a single page with the cursor already at the end.
+fn shell_ended(session: &str, shell_id: &str, command: &str, stdout: &str, stderr: &str, exit_code: Option<i32>) -> Value {
+    // Ante keeps the streams apart; the client's cell draws one block, so they
+    // are joined in the order a terminal would have shown them.
+    let mut text = stdout.to_string();
+    if !stderr.is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(stderr);
+    }
+    let size = text.len();
+    let info = json!({
+        "id": shell_id,
+        "status": "exited",
+        "command": command,
+        "cwd": default_directory(),
+        // Ante runs the command itself; the client only draws this string.
+        "shell": "sh",
+        // No file backstage: the output travels in the event, so this is a
+        // label the client shows and never reads.
+        "file": format!("shell:{shell_id}"),
+        "exit": exit_code,
+        "metadata": {},
+        "time": { "started": now_ms(), "completed": now_ms() },
+    });
+    json!({
+        "sessionID": session,
+        "shell": info,
+        "output": { "output": text, "cursor": size, "size": size, "truncated": false },
+    })
+}
+
+/// An empty `Shell.Info` for a shell this shim never started (an id from a
+/// previous run, or the client asking after the output of one it lost). Answering
+/// an empty object keeps the schema check happy and reads as "nothing to show".
+fn shell_unknown() -> Value {
+    json!({})
 }
 
 /// The directories Ante discovers skills from: the user's own, its system scope,
@@ -2244,7 +2317,7 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
         trace_ante(&msg.event);
         // A resume hands the whole persisted conversation back; the client
         // already fetched that history, so rendering it again would double it.
-        let unresumed = match store.ante.dropping(&msg.event) {
+        let unresumed = match store.ante.dropping(&msg.event, msg.parent.as_ref().map(|id| id.to_string()).as_deref()) {
             Replay::Replay => continue,
             Replay::Pass => false,
             Replay::Unresumed => true,
@@ -2976,6 +3049,25 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
                     );
                 }
             }
+            // `!command` finished. Ante answers the `ShellInput` once, with the
+            // merged result; the request that sent it is waiting on this.
+            Evt::ShellOutput { command, stdout, stderr, exit_code } => {
+                let waited = msg
+                    .parent
+                    .as_ref()
+                    .and_then(|parent| store.ante.shell_waits.lock().ok()?.remove(&parent.to_string()));
+                if let Some(waited) = waited {
+                    let shell_id = waited["shellID"].as_str().unwrap_or_default().to_string();
+                    let payload = shell_ended(&session, &shell_id, &command, &stdout, &stderr, exit_code);
+                    // Held for the request that is still waiting: the answer has
+                    // to reach it, because it closes the client's call.
+                    if let Ok(mut shells) = store.ante.shells.lock() {
+                        shells.insert(shell_id.clone(), payload.clone());
+                    }
+                    store.publish_durable("session.shell.started", json!({ "sessionID": session, "shell": payload["shell"], "shellID": shell_id }), &session);
+                    store.publish_durable("session.shell.ended", payload, &session);
+                }
+            }
             // Ante pauses the turn for a decision; the TUI shows this as a
             // permission prompt and answers on the reply route.
             Evt::TurnPause {
@@ -3411,6 +3503,126 @@ async fn session_wait(State(store): State<Store>, Path(_id): Path<String>) -> Re
 
 async fn session_terminals_empty() -> Json<Value> {
     Json(json!({ "data": [] }))
+}
+
+/// `POST /api/session/{id}/shell` — `!command` in the composer.
+///
+/// This one blocks on purpose, because that is the contract the client expects:
+/// its transport treats the HTTP response as the completion signal and reads the
+/// live rows from the shell events. Ante's `Op::ShellInput` has the matching
+/// shape — one op in, one `Evt::ShellOutput` out — so the shim sends the op, waits
+/// for the pump to park the answer, and replies with nothing.
+///
+/// **The session has to be the one Ante is driving.** `ShellInput` carries no
+/// session of its own: Ante runs the command in whatever session the connection
+/// has open. So a shell aimed elsewhere switches the connection over first, the
+/// same way a prompt does — and leaves it there, because that is where the user
+/// just ran something.
+async fn session_shell(
+    State(store): State<Store>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(command) = body.get("command").and_then(Value::as_str).map(str::to_string) else {
+        return refused(axum::http::StatusCode::BAD_REQUEST, "command is required".to_string());
+    };
+    if command.trim().is_empty() {
+        return axum::http::StatusCode::NO_CONTENT.into_response();
+    }
+    if store.ante.busy() {
+        // Ante drives one turn at a time; a shell sent into a running turn is not
+        // refused by the protocol but it does compete with it, and the turn's own
+        // events would arrive interleaved. Say so instead of guessing.
+        return refused(
+            axum::http::StatusCode::CONFLICT,
+            "Ante is in the middle of a turn; finish or stop it before running a command."
+                .to_string(),
+        );
+    }
+    // The op id is minted here: `ShellOutput` names it as `parent`, which is how
+    // the answer finds its request.
+    let input = ante_sdk::protocol::op_msg(Op::ShellInput(command));
+    let op_id = input.id.to_string();
+    let shell_id = format!("sh_{}", op_id.trim_start_matches("op_"));
+    let hot = store.ante.ops.lock().await.clone();
+    let Some(ops) = hot else {
+        return refused(
+            axum::http::StatusCode::CONFLICT,
+            "Ante is not connected right now; try again in a moment.".to_string(),
+        );
+    };
+    // Point the pump at this session before the op goes out: it publishes nothing
+    // for an event it cannot attribute, and the output is the answer this request
+    // is waiting on. A prompt does the same thing for the same reason.
+    if let Ok(mut active) = store.ante.active.lock() {
+        *active = Some(id.clone());
+    }
+    if store.ante.live_id().as_deref() != Some(id.as_str()) {
+        // Switching runs through a resume, whose replay the guard drops; the
+        // shell op follows, and its output is what this call is waiting on.
+        attach_session(&store, &ops, &id, current_permission_mode(&store), &input.id, &op_id).await;
+    }
+    if let Ok(mut waits) = store.ante.shell_waits.lock() {
+        waits.insert(op_id.clone(), json!({ "sessionID": id, "shellID": shell_id }));
+    }
+    if let Err(err) = ops.send(input).await {
+        if let Ok(mut waits) = store.ante.shell_waits.lock() {
+            waits.remove(&op_id);
+        }
+        return refused(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Could not reach Ante: {err}"),
+        );
+    }
+    // Ante answers once. A host that dies mid-command never does, so the wait is
+    // bounded — and the command itself may legitimately run for a while.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    while std::time::Instant::now() < deadline {
+        if store.ante.shells.lock().ok().is_some_and(|shells| shells.contains_key(&shell_id)) {
+            return axum::http::StatusCode::NO_CONTENT.into_response();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    if let Ok(mut waits) = store.ante.shell_waits.lock() {
+        waits.remove(&op_id);
+    }
+    refused(
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "Ante did not report the command's result in time.".to_string(),
+    )
+}
+
+/// `GET /api/shell/{id}/output` — the whole of what `!command` printed.
+///
+/// There is nothing to page through: the run is over before the client ever asks,
+/// and the text came back in one `ShellOutput`. So this answers the single page
+/// that holds all of it, with the cursor already at the end — which is also what
+/// tells the client it has caught up.
+async fn shell_output(State(store): State<Store>, Path(shell_id): Path<String>) -> Json<Value> {
+    let payload = store
+        .ante
+        .shells
+        .lock()
+        .ok()
+        .and_then(|shells| shells.get(&shell_id).cloned());
+    match payload {
+        Some(payload) => envelope(payload["output"].clone()),
+        None => envelope(json!({ "output": "", "cursor": 0, "size": 0, "truncated": false })),
+    }
+}
+
+/// `GET /api/shell/{id}` — what `/shell`'s output dialog reads before paging.
+async fn shell_get(State(store): State<Store>, Path(shell_id): Path<String>) -> Json<Value> {
+    let payload = store
+        .ante
+        .shells
+        .lock()
+        .ok()
+        .and_then(|shells| shells.get(&shell_id).cloned());
+    match payload {
+        Some(payload) => envelope(payload["shell"].clone()),
+        None => envelope(json!(null)),
+    }
 }
 
 /// A refusal in one of the client's declared error shapes, so it reaches the
@@ -5333,6 +5545,9 @@ async fn main() {
         .route("/api/session/{id}/move", post(session_move))
         .route("/api/session/{id}/message", get(session_messages))
         .route("/api/session/{id}/prompt", post(session_prompt))
+        .route("/api/session/{id}/shell", post(session_shell))
+        .route("/api/shell/{id}", get(shell_get))
+        .route("/api/shell/{id}/output", get(shell_output))
         .route("/api/session/{id}/interrupt", post(session_interrupt))
         .route("/api/session/{id}/permission", get(session_permissions))
         .route("/api/session/{id}/permission/{request_id}/reply", post(permission_reply))
@@ -6166,5 +6381,61 @@ mod tests {
             Some(("msg_a".to_string(), "op_a".to_string()))
         );
         assert!(store.ante.staged_revert("ses_a").is_none());
+    }
+
+    /// Ante keeps stdout and stderr apart and the client draws one block; the
+    /// joined text is what the cell shows, in the order a terminal would have.
+    #[test]
+    fn a_shell_result_merges_both_streams_for_the_cell() {
+        let payload = shell_ended("ses_a", "sh_1", "false", "out\n", "err\n", Some(1));
+        assert_eq!(payload["output"]["output"], json!("out\nerr\n"));
+        assert_eq!(payload["shell"]["command"], json!("false"));
+        assert_eq!(payload["shell"]["exit"], json!(1));
+        // A complete answer: the cursor is already at the end, which is what
+        // tells the client it has caught up.
+        assert_eq!(payload["output"]["cursor"], payload["output"]["size"]);
+        assert_eq!(payload["sessionID"], json!("ses_a"));
+    }
+
+    /// Nothing on stderr means no separator gets invented, and an empty result
+    /// still has to be a well-formed page.
+    #[test]
+    fn a_shell_result_leaves_an_empty_stream_alone() {
+        let payload = shell_ended("ses_a", "sh_1", "true", "only\n", "", Some(0));
+        assert_eq!(payload["output"]["output"], json!("only\n"));
+
+        let empty = shell_ended("ses_a", "sh_2", "true", "", "", Some(0));
+        assert_eq!(empty["output"]["output"], json!(""));
+        assert_eq!(empty["output"]["size"], json!(0));
+        assert_eq!(empty["output"]["cursor"], json!(0));
+    }
+
+    /// A `!command` sent after a session switch runs while the resume guard can
+    /// still be armed; its output is the answer that request is waiting on, not
+    /// history. Anything else that looks like a shell result is a replay.
+    #[test]
+    fn only_an_awaited_shell_result_survives_the_replay_guard() {
+        let store = Store::new();
+        store.ante.expect_turn(ReplayArm {
+            turn: "op_expected".to_string(),
+            session: "ses_a".to_string(),
+            inbox: "msg_a".to_string(),
+            armed: std::time::Instant::now(),
+        });
+        // Without a matching wait entry there is no request to answer: this is a
+        // replayed row and must be dropped.
+        let replay = store.ante.dropping(
+            &Evt::ShellOutput { command: "ls".into(), stdout: "x".into(), stderr: String::new(), exit_code: Some(0) },
+            Some("op_old"),
+        );
+        assert!(matches!(replay, Replay::Replay));
+
+        // The awaited op id gets through.
+        store.ante.shell_waits.lock().unwrap().insert("op_new".to_string(), json!({}));
+        let fresh = store.ante.dropping(
+            &Evt::ShellOutput { command: "ls".into(), stdout: "x".into(), stderr: String::new(), exit_code: Some(0) },
+            Some("op_new"),
+        );
+        assert!(matches!(fresh, Replay::Pass));
     }
 }
