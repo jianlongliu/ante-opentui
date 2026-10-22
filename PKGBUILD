@@ -5,7 +5,7 @@
 #
 # 本地试跑（不想连 GitHub、或 tag 还没推）：
 #   git tag v2026.10.01.2                     # tag 得先在本地存在
-#   ANTEX_SRC=git+file:///path/to/ante-opentui makepkg -f
+#   ANTEX_SRC=git+file:///path/to/antex makepkg -f
 #
 # 装完之后 antex 认哪个客户端：源码里写死 `$HOME/.local/bin/antex-tui`，再退到 PATH 上的
 # `opencode2` / `opencode`（src/main.rs 的 resolve client）。所以这里除了装 antex-tui，
@@ -15,7 +15,7 @@ pkgver=2026.10.22.1
 pkgrel=1
 pkgdesc="Ante agent, driven by the opencode v2 TUI (antex)"
 arch=('x86_64')
-url="https://github.com/jianlongliu/ante-opentui"
+url="https://github.com/jianlongliu/antex"
 # 仓库根有 LICENSE（MIT）。vendor/opencode 是上游的 MIT，各是各的。
 license=('MIT')
 depends=()
@@ -29,7 +29,7 @@ makedepends=('rust' 'bun' 'git')
 # 这个包的结果是 Rust 二进制，LTO 只作用到那个 C 依赖，关掉不影响别处。
 options=('!strip' '!lto')
 
-_src="${ANTEX_SRC:-git+https://github.com/jianlongliu/ante-opentui.git#tag=v$pkgver}"
+_src="${ANTEX_SRC:-git+https://github.com/jianlongliu/antex.git#tag=v$pkgver}"
 source=("$pkgname-$pkgver::$_src")
 sha256sums=('SKIP')
 

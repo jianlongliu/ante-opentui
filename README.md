@@ -3,7 +3,7 @@
 **把 opencode v2 自带的 TUI 接到 [Ante](https://github.com/AntigmaLabs/ante) 后端上跑。**
 界面、主题、键位全用 opencode 的，数据全来自 Ante——中间这层垫片（`antex`）实现 opencode 的 server API。
 
-[![release](https://img.shields.io/github/v/release/jianlongliu/ante-opentui?label=release&color=2f81f7)](https://github.com/jianlongliu/ante-opentui/releases)
+[![release](https://img.shields.io/github/v/release/jianlongliu/antex?label=release&color=2f81f7)](https://github.com/jianlongliu/antex/releases)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Arch%20%7C%20macOS-4b5563)](#装包ci-产物)
 [![rustc](https://img.shields.io/badge/rustc-1.99.1%20%C2%B7%20edition%202024-dea584)](#依赖与版本)
@@ -76,7 +76,7 @@ antex 只是前端那一层，**Ante 要你自己装**（官方脚本装到 `~/.
 
 ### 1. 装 antex
 
-**Arch（推荐，日常就这么用）**——从 [Releases](https://github.com/jianlongliu/ante-opentui/releases) 取包：
+**Arch（推荐，日常就这么用）**——从 [Releases](https://github.com/jianlongliu/antex/releases) 取包：
 
 ```sh
 pkexec pacman -U antex-<版本>-1-x86_64.pkg.tar.zst
@@ -92,7 +92,7 @@ cp antex-<版本>-macos-arm64/bin/* ~/.local/bin/
 **源码**（改代码时才需要）：
 
 ```sh
-cd ~/Projects/ante-opentui
+cd ~/Projects/antex
 cargo build --release        # crates.io 直连即可；只在本地 mihomo（127.0.0.1:7890）里通就先 export http_proxy/https_proxy
 ln -sfn "$PWD/target/release/antex" ~/.local/bin/antex
 ```

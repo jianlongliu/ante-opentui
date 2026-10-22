@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ante-opentui"
+name = "antex"
 version = "0.1.0"
 dependencies = [
  "ante-sdk",
