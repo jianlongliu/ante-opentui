@@ -4533,6 +4533,20 @@ fn replay_session(id: &str, handed: &[(String, String)]) -> Vec<Value> {
                 // Nothing has run yet, so the first call is dispatched now.
                 anchor = created;
             }
+            // A `!command` Ante ran in this conversation. It is not part of a step
+            // — it belongs to no model call — so it goes straight into the
+            // transcript at the point it happened, under its own shell id. The
+            // live path publishes the same row from the same fields.
+            Evt::ShellOutput { command, stdout, stderr, exit_code } => {
+                let shell_id = format!("sh_{:016x}{:04x}", created as u64, ordinal);
+                let payload = shell_ended(id, &shell_id, &command, &stdout, &stderr, exit_code);
+                let mut row = payload["shell"].clone();
+                row["output"] = payload["output"].clone();
+                row["type"] = json!("shell");
+                row["shellID"] = json!(shell_id);
+                row["time"] = json!({ "created": created, "completed": created });
+                messages.push(row);
+            }
             Evt::ThinkingDelta(delta) => {
                 open_reasoning!();
                 if let Some(fold) = step.as_ref()
@@ -6437,5 +6451,39 @@ mod tests {
             Some("op_new"),
         );
         assert!(matches!(fresh, Replay::Pass));
+    }
+
+    /// A `!command` Ante ran belongs to no model call, so it must survive the
+    /// transcript read as its own row — reopening a session that ran one used to
+    /// come back without it.
+    #[test]
+    fn a_shell_row_reads_back_with_its_output() {
+        let dir = std::env::temp_dir().join(format!("antex-shell-replay-{}", std::process::id()));
+        let archive = "ses_shell_replay";
+        std::fs::create_dir_all(dir.join("sessions").join(archive)).expect("temp session dir");
+        let log = dir.join("sessions").join(archive).join("events.jsonl");
+        let line = json!({
+            "timestamp": "2026-10-22T00:00:00Z",
+            "id": "evt_shell",
+            "event": { "ShellOutput": { "command": "echo hi", "stdout": "hi\n", "stderr": "", "exit_code": 0 } },
+        });
+        std::fs::write(&log, format!("{line}\n")).expect("write log");
+
+        let previous = std::env::var_os("ANTE_HOME");
+        // SAFETY: this test owns the variable for its duration; the suite runs on
+        // one thread per test and nothing else reads ANTE_HOME concurrently here.
+        unsafe { std::env::set_var("ANTE_HOME", &dir) };
+        let rows = replay_session(archive, &[]);
+        match previous {
+            Some(value) => unsafe { std::env::set_var("ANTE_HOME", value) },
+            None => unsafe { std::env::remove_var("ANTE_HOME") },
+        }
+
+        assert_eq!(rows.len(), 1, "one shell row");
+        assert_eq!(rows[0]["type"], json!("shell"));
+        assert_eq!(rows[0]["command"], json!("echo hi"));
+        assert_eq!(rows[0]["output"]["output"], json!("hi\n"));
+        assert!(rows[0]["shellID"].as_str().is_some_and(|id| id.starts_with("sh_")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
