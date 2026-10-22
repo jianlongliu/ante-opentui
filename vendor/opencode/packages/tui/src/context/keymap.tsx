@@ -319,12 +319,14 @@ function useLeaderActive() {
 }
 
 /// antex patch: commands the Ante backend cannot serve, keyed by slash name or
-/// command id. Ante has no VCS/diff, no MCP, no revert, no share and no PTY —
+/// command id. Ante has no VCS/diff, no share and no PTY —
 /// every one of these is silence at best (the shim answers 200 with an empty
 /// body, so nothing errors) and a broken view at worst. Filtering the entry
 /// list removes them from the palette *and* slash completion at once, because
 /// both are built from it; their keybinds are switched off in `cli.json`.
 /// `/connect` is *not* here: the shim serves the integration API and signs in.
+/// `/undo` and `/redo` are *not* here either (2026-10-22): Ante can rewind a
+/// conversation (`Op::RewindSession`), so the shim serves the revert routes.
 /// `/mcps` is *not* here either (2026-10-22): Ante reports its MCP servers and
 /// their tools over the wire, so the dialog has real content — only its
 /// connect/disconnect action is refused (Ante has no runtime switch).
@@ -335,8 +337,6 @@ const ANTE_MISSING = new Set([
   "share",
   "fork",
   "unshare",
-  "undo",
-  "redo",
   "worktrees",
   "terminal",
   "update",

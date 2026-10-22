@@ -1144,18 +1144,25 @@ export function createData(config: CreateDataInput) {
         if (store.session.info[event.data.sessionID]) {
           setStore("session", "info", event.data.sessionID, "revert", undefined)
         }
-        // The projector also deletes inbox items enqueued at or after the boundary without a cancel event.
+        // antex patch: the boundary is found by *position*, not by comparing id
+        // strings. Ante's message ids come in two shapes — `msg_<hex timestamp>`
+        // for prompts we sent and `msg_<turn id>_<step>` for the replies — and
+        // they do not sort lexically (`'op…' > '0…'`), so `id >= to` would cut at
+        // the first assistant row and keep the prompts that came after it.
+        message.update(event.data.sessionID, (draft, index) => {
+          const position = draft.findIndex((item) => item.id === event.data.to)
+          if (position === -1) return
+          for (const item of draft.splice(position)) index.delete(item.id)
+        })
+        // Any pending prompt the splice removed is no longer a promise the server
+        // made, so it leaves the queue with it.
+        const kept = new Set((store.session.message[event.data.sessionID] ?? []).map((item) => item.id))
         setStore(
           "session",
           "pending",
           event.data.sessionID,
-          (store.session.pending[event.data.sessionID] ?? []).filter((item) => item.id < event.data.to),
+          (store.session.pending[event.data.sessionID] ?? []).filter((item) => kept.has(item.id)),
         )
-        message.update(event.data.sessionID, (draft, index) => {
-          const position = draft.findIndex((item) => item.id >= event.data.to)
-          if (position === -1) return
-          for (const item of draft.splice(position)) index.delete(item.id)
-        })
         return
       case "session.compaction.delta":
         message.update(event.data.sessionID, (draft) => {

@@ -275,6 +275,29 @@ struct Ante {
     /// and when the guard was armed. Everything the pump sees until then is the
     /// replay. See [`Ante::dropping`].
     replay_turn: Arc<Mutex<Option<ReplayArm>>>,
+    /// `turn id → the client's message id` for prompts this process handed over,
+    /// per session, in the order they were sent.
+    ///
+    /// `Op::RewindSession` names its boundary with a *turn id* — the id of the op
+    /// that submitted that input, which is what `Evt::TurnStart` reports.
+    /// opencode's revert names it with a *message id*, and the two share no
+    /// structure, so the id the client sends has to be translated here. Order
+    /// matters: a successful rewind truncates this list at the boundary, the way
+    /// Ante truncates its own log.
+    turns: Arc<Mutex<HashMap<String, Vec<(String, String)>>>>,
+    /// `op id → the client's message id` for prompts just handed to Ante, waiting
+    /// to be claimed by the `TurnStart` that op starts. That event's id *is* the
+    /// turn id, so this is the join between "the prompt the client knows" and
+    /// "the turn Ante names" — see [`Ante::turns`].
+    turning: Arc<Mutex<HashMap<String, String>>>,
+    /// A staged revert, by session: `(the client's message id, that turn's id)`.
+    /// The client stages on `/undo` and commits on the *next* submit, so the pair
+    /// survives in between.
+    revert: Arc<Mutex<HashMap<String, (String, String)>>>,
+    /// Who is waiting for `RewindSession`'s answer. `SessionRewound` closes it as
+    /// `Ok`, an `Evt::Error` as `Err`; a dropped sender leaves the caller's
+    /// timeout to report it.
+    rewind_wait: Arc<Mutex<Option<tokio::sync::oneshot::Sender<Result<(), String>>>>>,
     /// Which opencode session the events belong to. One Ante session is
     /// mirrored, so this is the most recent one the TUI opened.
     active: Arc<Mutex<Option<String>>>,
@@ -399,6 +422,10 @@ impl Ante {
             ops: Arc::new(tokio::sync::Mutex::new(None)),
             live: Arc::new(Mutex::new(None)),
             replay_turn: Arc::new(Mutex::new(None)),
+            turns: Arc::new(Mutex::new(HashMap::new())),
+            turning: Arc::new(Mutex::new(HashMap::new())),
+            revert: Arc::new(Mutex::new(HashMap::new())),
+            rewind_wait: Arc::new(Mutex::new(None)),
             active: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(None)),
             agent: Arc::new(Mutex::new(reported_agent().to_string())),
@@ -479,7 +506,16 @@ impl Ante {
 
     fn remember_archive(&self, client_id: &str, archive: String) {
         if let Ok(mut archives) = self.archives.lock() {
-            archives.insert(client_id.to_string(), archive);
+            archives.insert(client_id.to_string(), archive.clone());
+        }
+        // The turn mapping is keyed by session, and which id the client asks
+        // under is not known when the turn starts (`TurnStart` precedes
+        // `SessionStart`). Re-key it here, once the archive name is known, so a
+        // later `/undo` finds it under either name.
+        if let Ok(mut turns) = self.turns.lock()
+            && let Some(list) = turns.remove(client_id)
+        {
+            turns.entry(archive).or_insert(list);
         }
     }
 
@@ -548,6 +584,84 @@ impl Ante {
         if let Ok(mut slot) = self.replay_turn.lock() {
             *slot = Some(arm);
         }
+    }
+
+    /// Note that the turn now starting was started by `inbox_id`'s prompt, so a
+    /// later undo naming that message can find the turn id Ante wants.
+    fn remember_turn(&self, session: &str, turn: &str, inbox_id: &str) {
+        // Keyed by whatever the *client* calls this session, and the transcript
+        // list is what the TUI shows: it reports Ante's archive id there. So the
+        // entry goes under both names — the one the prompt was sent for, and the
+        // archive's, once that is known.
+        let canonical = self.archive_of(session).unwrap_or_else(|| session.to_string());
+        if let Ok(mut turns) = self.turns.lock() {
+            let list = turns.entry(canonical).or_default();
+            if list.iter().any(|(known, _)| known == turn) {
+                return;
+            }
+            list.push((turn.to_string(), inbox_id.to_string()));
+        }
+    }
+
+    /// Remember that this op's `UserInput`/`Steer` carries that client prompt, so
+    /// the `TurnStart` naming the op can be tied back to the message. A steer
+    /// folds into a running turn and starts none of its own, so its entry is
+    /// simply never claimed; the map is small and re-written per send.
+    fn note_turning(&self, op_id: &str, inbox_id: &str) {
+        if let Ok(mut turning) = self.turning.lock() {
+            turning.insert(op_id.to_string(), inbox_id.to_string());
+        }
+    }
+
+    fn take_pending_turn(&self, turn: &str) -> Option<String> {
+        self.turning.lock().ok()?.remove(turn)
+    }
+
+    /// The turn id for a client message id, if this process sent the prompt that
+    /// started it. Older turns of a resumed session are not in here: Ante was
+    /// handed those by an earlier process, and it refuses to rewind to them too.
+    fn turn_of(&self, session: &str, inbox_id: &str) -> Option<String> {
+        let canonical = self.archive_of(session).unwrap_or_else(|| session.to_string());
+        let turns = self.turns.lock().ok()?;
+        for key in [session, canonical.as_str()] {
+            if let Some(found) = turns
+                .get(key)
+                .and_then(|list| list.iter().find(|(_, message)| message == inbox_id))
+            {
+                return Some(found.0.clone());
+            }
+        }
+        None
+    }
+
+    /// Drop every turn at or after `turn`, mirroring what Ante did to its own
+    /// log. The conversation continues from there, so those prompts are gone and
+    /// must not be offered as undo boundaries again.
+    fn forget_turns_from(&self, session: &str, turn: &str) {
+        let canonical = self.archive_of(session).unwrap_or_else(|| session.to_string());
+        if let Ok(mut turns) = self.turns.lock() {
+            for key in [session, canonical.as_str()] {
+                if let Some(list) = turns.get_mut(key)
+                    && let Some(position) = list.iter().position(|(known, _)| known == turn)
+                {
+                    list.truncate(position);
+                }
+            }
+        }
+    }
+
+    fn stage_revert(&self, session: &str, message: &str, turn: &str) {
+        if let Ok(mut revert) = self.revert.lock() {
+            revert.insert(session.to_string(), (message.to_string(), turn.to_string()));
+        }
+    }
+
+    fn staged_revert(&self, session: &str) -> Option<(String, String)> {
+        self.revert.lock().ok()?.get(session).cloned()
+    }
+
+    fn clear_revert(&self, session: &str) -> Option<(String, String)> {
+        self.revert.lock().ok()?.remove(session)
     }
 
     /// Whether this event is part of a resume's replay and must not reach the
@@ -718,6 +832,7 @@ impl Store {
     fn handed(&self) -> Vec<(String, String)> {
         self.handed.lock().map(|handed| handed.clone()).unwrap_or_default()
     }
+
 
     fn forget_sent(&self, inbox_id: &str) {
         if let Ok(mut sent) = self.sent.lock() {
@@ -1538,14 +1653,13 @@ const DISABLED_PLUGINS: &[&str] = &["-opencode.diffs", "-opencode.plugins", "-op
 // nothing while the list is empty, so a session with no servers is unchanged.
 
 /// Binds that ship live for commands with nothing behind them
-/// (`tui/config/keybind.ts`: `<leader>t`, `ctrl+b`, `<leader>u`, `<leader>r`,
-/// `<leader>down/up`). The command blacklist in the keymap patch only keeps them
-/// out of the palette — the keys still fire without this. `session.export` left
-/// this list: `/export` and `/copy` read the shim's own export endpoint, so
-/// `<leader>x` is a working key again.
+/// (`tui/config/keybind.ts`: `<leader>t`, `ctrl+b`). The command blacklist in
+/// the keymap patch only keeps them out of the palette — the keys still fire
+/// without this. `session.export` left this list: `/export` and `/copy` read the
+/// shim's own export endpoint, so `<leader>x` is a working key again.
+/// `session.undo`/`session.redo` left it too (2026-10-22): Ante can rewind a
+/// conversation, so `/undo` and `/redo` reach the shim's revert routes.
 const DEAD_KEYBINDS: &[&str] = &[
-    "session.undo",
-    "session.redo",
     "session.background",
     "terminal.toggle",
     "terminal.select",
@@ -2412,6 +2526,13 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
             }
             Evt::TurnStart { turn_id } => {
                 turn = turn_id.to_string();
+                // Which prompt started this turn decides whether `/undo` can name
+                // it later. Ante reports the turn's id, not the message's, and the
+                // two are unrelated strings — so the pair is recorded here, where
+                // both are known.
+                if let Some(inbox) = store.ante.take_pending_turn(&turn) {
+                    store.ante.remember_turn(&session, &turn, &inbox);
+                }
                 steps = 0;
                 step_open = false;
                 step_tokens = None;
@@ -2813,6 +2934,47 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
                     );
                 }
                 flush_queue(&store, &session).await;
+            }
+            // Ante refused something — most often a `RewindSession` (it declines
+            // while a turn runs, when the boundary predates a resume, or when a
+            // compaction has rewritten that history). Whoever is waiting for the
+            // rewind's answer turns this into the client's error toast; every
+            // other refusal is left to the paths that already report it.
+            Evt::Error(message) => {
+                if let Some(wait) = store.ante.rewind_wait.lock().ok().and_then(|mut slot| slot.take()) {
+                    log_line(&format!("ante: 回溯被拒：{message}"));
+                    let _ = wait.send(Err(message));
+                }
+            }
+            // The conversation was rewound: Ante truncated its own log, so the
+            // prompts after the boundary are gone. Drop them from the mapping and
+            // tell the client, whose handler splices every row at or after `to`
+            // and clears the staged revert.
+            Evt::SessionRewound { to } => {
+                let turn = to.to_string();
+                log_line(&format!("ante: 会话已回退到 {turn}"));
+                // Look the boundary up *before* truncating: the mapping is what
+                // knows which client message started this turn, and dropping the
+                // turns from here on takes that entry with it.
+                let boundary = store
+                    .ante
+                    .turns
+                    .lock()
+                    .ok()
+                    .and_then(|turns| {
+                        turns.get(&session)?.iter().find(|(known, _)| known == &turn).map(|(_, message)| message.clone())
+                    });
+                store.ante.forget_turns_from(&session, &turn);
+                if let Some(wait) = store.ante.rewind_wait.lock().ok().and_then(|mut slot| slot.take()) {
+                    let _ = wait.send(Ok(()));
+                }
+                if let Some(boundary) = boundary {
+                    store.publish_durable(
+                        "session.revert.committed",
+                        json!({ "sessionID": session, "to": boundary }),
+                        &session,
+                    );
+                }
             }
             // Ante pauses the turn for a decision; the TUI shows this as a
             // permission prompt and answers on the reply route.
@@ -3228,11 +3390,154 @@ async fn mcp_runtime_unsupported(Path(server): Path<String>) -> Response {
         .into_response()
 }
 
+/// `POST /api/experimental/session/{id}/wait` — "block until the session is idle".
+///
+/// The client calls this between interrupting and staging a revert. Ante has no
+/// wait op, so the shim polls its own busy flag: the interrupt was already sent,
+/// and a turn that is still shutting down must settle before the rewind is
+/// allowed (Ante refuses one while a turn runs). The wait is bounded — a
+/// background job can keep the flag up far longer than a person will wait.
+async fn session_wait(State(store): State<Store>, Path(_id): Path<String>) -> Response {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        if !store.ante.busy() {
+            return axum::http::StatusCode::NO_CONTENT.into_response();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    log_line("ante: 等回合停下超时（20s），照旧继续");
+    axum::http::StatusCode::NO_CONTENT.into_response()
+}
+
 async fn session_terminals_empty() -> Json<Value> {
     Json(json!({ "data": [] }))
 }
 
-async fn fs_list(
+/// A refusal in one of the client's declared error shapes, so it reaches the
+/// user as a toast instead of an opaque status code. 409 is "busy" (Ante
+/// declines a rewind while a turn runs), 400 is "cannot be done here".
+fn refused(status: axum::http::StatusCode, message: String) -> Response {
+    let message = json!({ "message": message });
+    (status, Json(message)).into_response()
+}
+
+/// `POST /api/session/{id}/revert/stage` — `/undo`.
+///
+/// opencode's undo is two-step: this picks the boundary and the edits are made
+/// when the client *commits*, which it does on the next submit. Ante's
+/// `Op::RewindSession` is a single move, so the shim only records the
+/// translation here and performs it on the commit. The reply is the staged
+/// revert the dialog and the "nothing to undo" checks read back.
+async fn session_revert_stage(
+    State(store): State<Store>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(message_id) = body.get("messageID").and_then(Value::as_str) else {
+        return refused(axum::http::StatusCode::BAD_REQUEST, "messageID is required".to_string());
+    };
+    let Some(turn) = store.ante.turn_of(&id, message_id) else {
+        // The common case is a resumed session: Ante was handed those prompts by
+        // an earlier process, and it refuses to rewind into them as well.
+        return refused(
+            axum::http::StatusCode::BAD_REQUEST,
+            "This message is from a resumed conversation: Ante can only rewind to a \
+             prompt this session sent. Undo works on the current conversation."
+                .to_string(),
+        );
+    };
+    store.ante.stage_revert(&id, message_id, &turn);
+    // The dialog reads the staged boundary off `session.revert.staged`: it hides
+    // that message and everything after it and draws the "N messages will be
+    // reverted" strip. Without the event the stage looks like a no-op on screen
+    // even though the commit would work. `files` stays empty on purpose — Ante
+    // rewinds the conversation, never the working tree, and the dialog prints
+    // the file list it is given.
+    store.publish_durable(
+        "session.revert.staged",
+        json!({ "sessionID": id, "revert": { "messageID": message_id, "files": [] } }),
+        &id,
+    );
+    Json(json!({
+        "data": { "messageID": message_id },
+    }))
+    .into_response()
+}
+
+/// `DELETE /api/session/{id}/revert` — `/redo`.
+///
+/// The stage is the shim's own bookkeeping (Ante has not been told anything
+/// yet), so dropping it is all a redo needs.
+async fn session_revert_clear(State(store): State<Store>, Path(id): Path<String>) -> Response {
+    store.ante.clear_revert(&id);
+    // Same reason as the stage: the dialog only stops hiding rows and drops its
+    // "N messages will be reverted" strip when this event arrives.
+    store.publish_durable(
+        "session.revert.cleared",
+        json!({ "sessionID": id }),
+        &id,
+    );
+    axum::http::StatusCode::NO_CONTENT.into_response()
+}
+
+/// `POST /api/session/{id}/revert/commit` — the client submitting after `/undo`.
+///
+/// This is the one that reaches Ante. It truncates the conversation, so it can
+/// be refused (a turn in flight, a boundary Ante cannot restore); the answer is
+/// held until `Evt::SessionRewound` or `Evt::Error` comes back, and the
+/// client-side truncation rides on that event rather than on this reply.
+async fn session_revert_commit(State(store): State<Store>, Path(id): Path<String>) -> Response {
+    let Some((_, turn)) = store.ante.staged_revert(&id) else {
+        // Nothing staged: the client commits unconditionally before submits.
+        return axum::http::StatusCode::NO_CONTENT.into_response();
+    };
+    if store.ante.busy() {
+        return refused(
+            axum::http::StatusCode::CONFLICT,
+            "Ante is still working on this session; stop it before undoing.".to_string(),
+        );
+    }
+    let Ok(turn_id) = turn.parse::<Id>() else {
+        store.ante.clear_revert(&id);
+        return refused(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("Ante cannot rewind to {turn}"),
+        );
+    };
+    let Some(ops) = store.ante.ops.lock().await.clone() else {
+        return refused(
+            axum::http::StatusCode::CONFLICT,
+            "Ante is not connected right now; try again in a moment.".to_string(),
+        );
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if let Ok(mut slot) = store.ante.rewind_wait.lock() {
+        *slot = Some(tx);
+    }
+    if let Err(err) = ops.send(ante_sdk::protocol::op_msg(Op::RewindSession { to: turn_id })).await {
+        log_line(&format!("ante: 回溯发送失败：{err}"));
+        store.ante.rewind_wait.lock().ok().map(|mut slot| slot.take());
+        return refused(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Could not reach Ante: {err}"),
+        );
+    }
+    store.ante.clear_revert(&id);
+    // Ante answers with `SessionRewound` or `Evt::Error`; the pump settles this.
+    // A host that dies mid-rewind never answers, so the wait is bounded.
+    match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        Ok(Ok(Ok(()))) => axum::http::StatusCode::NO_CONTENT.into_response(),
+        Ok(Ok(Err(message))) => refused(axum::http::StatusCode::CONFLICT, message),
+        Ok(Err(_)) => refused(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Ante stopped before answering the rewind.".to_string(),
+        ),
+        Err(_) => refused(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Ante did not answer the rewind in time.".to_string(),
+        ),
+    }
+}async fn fs_list(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Json<Value> {
     let base = params
@@ -3785,10 +4090,17 @@ fn ante_session_info(id: &str) -> Option<Value> {
 }
 
 async fn session_get(State(store): State<Store>, Path(id): Path<String>) -> Json<Value> {
-    let info = store
+    let mut info = store
         .session(&id)
         .or_else(|| ante_session_info(&id))
         .unwrap_or_else(|| session_info(&id, "Ante session", store.current_model(), &store.current_variant()));
+    // A staged undo lives in this process, and the client only learns about it
+    // from the event that announced it — which is gone after a restart. Reporting
+    // it here is what keeps `/redo` (and the "N messages will be reverted" strip)
+    // working across one.
+    if let Some((message_id, _)) = store.ante.staged_revert(&id) {
+        info["revert"] = json!({ "messageID": message_id, "files": [] });
+    }
     // The route's schema is `{data: Session.Info}` with additionalProperties:false;
     // a bare object makes the client read `.id` off undefined.
     Json(json!({ "data": info }))
@@ -4483,6 +4795,7 @@ async fn flush_queue(store: &Store, session: &str) {
         return;
     };
     let input = ante_sdk::protocol::op_msg(Op::UserInput(text));
+    store.ante.note_turning(&input.id.to_string(), &inbox_id);
     if store.ante.live_id().as_deref() != Some(session) {
         attach_session(store, &ops, session, current_permission_mode(store), &input.id, &inbox_id)
             .await;
@@ -4546,7 +4859,9 @@ async fn session_inbox_update(
                 log_line("ante: 排队的那条现在交给 Ante（当前没有正在跑的回合）");
                 Op::UserInput(text)
             };
-            if let Err(err) = ops.send(ante_sdk::protocol::op_msg(op)).await {
+            let input = ante_sdk::protocol::op_msg(op);
+            store.ante.note_turning(&input.id.to_string(), &inbox_id);
+            if let Err(err) = ops.send(input).await {
                 log_line(&format!("ante: 排队消息插嘴失败：{err}"));
                 store.set_delivery(&id, &inbox_id, "queue");
                 return axum::http::StatusCode::NO_CONTENT;
@@ -4769,6 +5084,7 @@ async fn session_prompt(
                 // resumed conversation before it gets to this `UserInput`, and
                 // the guard drops that replay until the turn this op id starts.
                 let input = ante_sdk::protocol::op_msg(Op::UserInput(staged.clone()));
+                store.ante.note_turning(&input.id.to_string(), &user_id);
                 let fresh = store.ante.resumable_archive_of(&id).is_none();
                 attach_session(&store, &ops, &id, mode, &input.id, &user_id).await;
                 if fresh {
@@ -4799,7 +5115,9 @@ async fn session_prompt(
                 // changed, since `shift+tab` never calls the switch route.
                 let update = SessionUpdate { permission_mode: Some(mode), ..Default::default() };
                 let _ = ops.send(ante_sdk::protocol::op_msg(Op::UpdateSession(update))).await;
-                if let Err(err) = ops.send(ante_sdk::protocol::op_msg(Op::UserInput(staged.clone()))).await {
+                let input = ante_sdk::protocol::op_msg(Op::UserInput(staged.clone()));
+                store.ante.note_turning(&input.id.to_string(), &user_id);
+                if let Err(err) = ops.send(input).await {
                     log_line(&format!("ante: 消息发送失败：{err}"));
                 }
             }
@@ -4996,6 +5314,22 @@ async fn main() {
         .route("/api/session", get(sessions_list).post(session_create))
         .route("/api/session/active", get(active_session))
         .route("/api/session/{id}", get(session_get).delete(session_delete).patch(session_update))
+        .route(
+            "/api/experimental/session/{id}/wait",
+            post(session_wait),
+        )
+        .route(
+            "/api/session/{id}/revert/stage",
+            post(session_revert_stage),
+        )
+        .route(
+            "/api/session/{id}/revert",
+            delete(session_revert_clear),
+        )
+        .route(
+            "/api/session/{id}/revert/commit",
+            post(session_revert_commit),
+        )
         .route("/api/session/{id}/move", post(session_move))
         .route("/api/session/{id}/message", get(session_messages))
         .route("/api/session/{id}/prompt", post(session_prompt))
@@ -5474,7 +5808,7 @@ mod tests {
         // Every key can be spoken for, and then there is nothing to inject.
         let mine = r#"{"tabs":{"mode":"on"},"session":{"image_preview":false},"prompt":{"image_preview":false},
             "plugins":["-opencode.diffs","-opencode.plugins","-opencode.btw"],
-            "keybinds":{"session.undo":"none","session.redo":"none","session.background":"none",
+            "keybinds":{"session.background":"none",
                         "terminal.toggle":"none","terminal.select":"none","terminal.close":"none"}}"#;
         assert_eq!(client_config_override(Some(mine), false), None);
 
@@ -5556,6 +5890,13 @@ mod tests {
         let value: Value = serde_json::from_str(&filled).expect("valid JSON");
         assert_eq!(value["keybinds"]["terminal.toggle"], json!("none"));
         assert_eq!(value["keybinds"]["session.background"], json!("none"));
+
+        // `/undo` and `/redo` reach real revert routes now, so neither layer may
+        // keep their binds (or their commands) switched off.
+        assert!(value["keybinds"].get("session.undo").is_none());
+        assert!(value["keybinds"].get("session.redo").is_none());
+        assert!(!DEAD_KEYBINDS.contains(&"session.undo"));
+        assert!(!DEAD_KEYBINDS.contains(&"session.redo"));
 
         // A deliberate bind in the file wins, and the rest are still filled in.
         let filled = client_config_override(Some(r#"{"keybinds":{"terminal.toggle":"<leader>t"}}"#), false)
@@ -5778,5 +6119,52 @@ mod tests {
         assert_eq!(store.ante.announced_mcp().len(), 1);
         store.ante.remember_mcp(&[]);
         assert!(store.ante.announced_mcp().is_empty());
+    }
+
+    /// The client names an undo boundary with a message id; Ante wants the id of
+    /// the turn that prompt started. Both are joined through the op the prompt
+    /// was sent as, which is what `TurnStart` reports back.
+    #[test]
+    fn an_undo_boundary_translates_from_a_message_to_its_turn() {
+        let store = Store::new();
+        store.ante.note_turning("op_first", "msg_first");
+        let claimed = store.ante.take_pending_turn("op_first").expect("the op is claimed");
+        store.ante.remember_turn("ses_a", "op_first", &claimed);
+        assert_eq!(store.ante.turn_of("ses_a", "msg_first").as_deref(), Some("op_first"));
+        // Claiming is once only: a second TurnStart for the same op gets nothing.
+        assert!(store.ante.take_pending_turn("op_first").is_none());
+        // A message this process never sent has no turn, which is the refusal.
+        assert!(store.ante.turn_of("ses_a", "msg_other").is_none());
+        assert!(store.ante.turn_of("ses_elsewhere", "msg_first").is_none());
+    }
+
+    /// A rewind truncates Ante's own log, so the prompts past the boundary are
+    /// gone — they must stop being offered as undo targets as well.
+    #[test]
+    fn a_rewind_forgets_the_turns_from_its_boundary_on() {
+        let store = Store::new();
+        for (turn, message) in [("op_a", "msg_a"), ("op_b", "msg_b"), ("op_c", "msg_c")] {
+            store.ante.remember_turn("ses_a", turn, message);
+        }
+        store.ante.forget_turns_from("ses_a", "op_b");
+        assert_eq!(store.ante.turn_of("ses_a", "msg_a").as_deref(), Some("op_a"));
+        assert!(store.ante.turn_of("ses_a", "msg_b").is_none());
+        assert!(store.ante.turn_of("ses_a", "msg_c").is_none());
+    }
+
+    /// Staging and clearing are the two halves of `/undo` then `/redo`.
+    #[test]
+    fn a_staged_revert_survives_until_it_is_cleared() {
+        let store = Store::new();
+        store.ante.stage_revert("ses_a", "msg_a", "op_a");
+        assert_eq!(
+            store.ante.staged_revert("ses_a"),
+            Some(("msg_a".to_string(), "op_a".to_string()))
+        );
+        assert_eq!(
+            store.ante.clear_revert("ses_a"),
+            Some(("msg_a".to_string(), "op_a".to_string()))
+        );
+        assert!(store.ante.staged_revert("ses_a").is_none());
     }
 }

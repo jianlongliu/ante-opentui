@@ -61,6 +61,7 @@ Ante（**你自己装的**：官方脚本装、`ante update` 升级）
 | **断线重连** | 退避重连 + `/api/health` 说真话 + 转录里一行说明，掉线期间排队的消息不丢。**回合没跑完就被杀掉的会话（盘上只剩 `events.jsonl`）Ante 打不开**，这种会话会新开一条继续 |
 | **常用命令** | `/compact`、`/rename`（走 Ante 自己的 `SessionUpdate.title`，别的前端也看得到；只有当前这条会话能这样改，别的会话改名落垫片自己的 `title.txt`）、`/copy`、`/export`（`GET …/experimental/session/{id}/export` 直接回垫片手上那份转录，`sanitize` 忽略——载荷本来就是 Ante 的日志，不重写路径）、`/stats`（数字全部来自 Ante 的 `meta.json`：会话数、token、活动日历、按 provider/model 分组；Ante 没写的报 0，协议里没有报价也没有子代理计数）、`/skills`（优先用 Ante 播报的技能清单——那是真能调用的集合，含项目域与 `no_skills`；首轮提示词之前才退到磁盘扫描） |
 | **交互** | 模型选择、`shift+tab` 权限模式、`@` 文件补全、Herdr 状态上报、boot 接口全套。多标签**临时**关掉（`tabs.mode = "off"` 只是个配置项，不是能力——它要服务端同时驱动多条会话，垫片只有一条连接；真做多标签见[待定与遗弃](#待定与遗弃)） |
+| **回溯**（`/undo`、`/redo`） | 客户端的两步 revert 接到 Ante 的 `Op::RewindSession`：`/undo` 只登记边界、下一次提交才真正截断（**Ante 会改写自己的 `events.jsonl` 与 `meta.json`**，不是前端遮一层），`/redo` 撤掉未提交的那次。边界 id 要从客户端的 message id 翻成 Ante 的 turn id，靠发提示时埋的对照表；只认本会话发出的提示，恢复来的旧对话会明说回溯不了 |
 | **MCP 服务器**（`/mcps`、侧栏 `▼ MCP`） | Ante 按会话从 `mcp_servers` 连服务器，连上后经 `ExtensionRefreshed` 把**每个服务器与它的工具**报给垫片（`McpServerInfo`，含远程服务器的 `url`）——垫片记下来，按客户端的 `Mcp.Server` 形状答 `/api/mcp`（有工具＝`connected`，没工具＝`failed`），并在每次 `ExtensionRefreshed` 后发一条带 location 的 `mcp.status.changed` 让面板刷新。**启停做不了**：Ante 的协议里没有运行时开关，服务器固定来自 `settings.json`、每会话连一次，所以 `connect`/`disconnect`/`add`/`remove` 一律回 400 + 一句写明改哪儿，而不是假装成功。**首轮提示词之前列表是空的**——Ante 侧会话要等首个 prompt 才启动 |
 | **不装样子** | Ante 没有的概念（LSP、VCS、终端、子代理会话）从界面里摘掉，而不是留个点了没反应的入口——插件 / 键位 / 命令黑名单 / 侧栏卡片四层，见 [docs/client-patches.md](docs/client-patches.md) 的「屏蔽做不了的入口」 |
 | **两个平台** | CI 出 Arch 包 + macOS（Apple Silicon）tar.gz，见[装包](#装包ci-产物) |
@@ -190,6 +191,7 @@ macOS 那份**只能在 macOS 上编**：垫片要 Apple SDK（Linux 上交叉�
 - [ ] ~~`/diff`、`/worktrees`~~ —— 无 diff / VCS / worktree 概念（`/api/vcs/*` 只能答空；`/api/vcs` 因此答**空分支** `{branch:{}}`，位置标签才不会挂上假 `:main`）
 - [ ] ~~`/terminal`、Terminals 面板、`!` shell 模式~~ —— 无 PTY、无 shell 会话 op（Bash 是工具调用，不是终端）
 - [ ] ~~`/plugins`、`/btw`~~ —— 无 opencode 插件系统；`/btw` 要的是「旁问」的独立 generate op
+- [x] **`/undo`、`/redo` 已转正**（2026-10-22）—— 见[功能](#功能)的「回溯」
 - [ ] ~~`/reload`、`/update`、`/restart`、`Ctrl+B` 后台化工具~~ —— 重新加载服务端配置 / 更新 opencode / 把工具调用扔后台，对 Ante 都无意义（**暂时遗弃**：等哪天有对应 op 再说）
 - [ ] ~~LSP、formatter~~ —— 无对应概念，打桩显示为空（入口已摘；**暂时遗弃**）
 - [ ] ~~子代理面板 / 点进子代理~~ —— 客户端的子代理 UI（内联块点进去看子会话、composer 的 subagents tab、mini 的 footer inspector）**整套都挂在「子代理 = 独立 child session」上**（`session.parentID` + 自己的事件流 + `sessionFamily()`）。Ante 没有这个概念：子代理只是父会话里的一次 `Agent` 工具调用，内部活动不推给前端——本机 188 条会话日志里 `ToolUpdate` 事件 **0 条**，一次 68 秒的 `Agent` 调用（14:42:20→14:43:28）中途**零事件**，结果只在 `ToolEnd.result_json.report` 里一次交付；协议里也没有 agent id / parent turn（`SessionInfo.subagents` 只是可委派清单）。硬造 child session 只有空壳，还会污染会话列表。能做的只有把 `Agent` 调用按客户端的 subagent 块渲染（已做）
