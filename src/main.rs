@@ -42,6 +42,9 @@ mod attachments;
 mod integrations;
 /// The sidebar's quota panel: what the client asks for over `/api/rpc`.
 mod quota;
+/// One-command mode owns the terminal: the client must die with us, and the tty
+/// must not outlive either of them in raw mode.
+mod terminal;
 
 /// Where the shim settles a request when the client does not say. The client
 /// normally passes `location[directory]` on every call, so this is only a
@@ -5703,23 +5706,33 @@ async fn main() {
     let directory =
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(default_directory()));
     let client = client_executable();
+    // Taken before the client runs: it is the client that switches the tty to
+    // raw mode, and these are the modes worth putting back (see `terminal`).
+    let terminal = terminal::Terminal::capture();
     let mut command = std::process::Command::new(&client);
     command
         .arg("--server")
         .arg(format!("http://127.0.0.1:{port}"))
         .arg(&directory);
+    // The client must not outlive us: an orphan TUI keeps the terminal in raw
+    // mode, where even Ctrl+C produces no signal to get out with.
+    terminal::die_with_parent(&mut command);
     if let Some(config) = client_config_from_disk() {
         command.env("OPENCODE_CLI_CONFIG_CONTENT", config);
     }
     match command.status() {
         // The TUI owns the terminal; when it exits, so do we.
         Ok(status) => {
+            // It restores the terminal itself on a clean exit, but not when it
+            // was killed — do it unconditionally, it is a no-op otherwise.
+            terminal.restore();
             // Hand the pane back before we go. Herdr would clear it anyway once
             // the shell is back, but that takes a second or two.
             herdr::release().await;
             std::process::exit(status.code().unwrap_or(0))
         }
         Err(err) => {
+            terminal.restore();
             eprintln!("起不了 opencode 客户端（{}）：{err}", client.display());
             eprintln!("用 ANTEX_CLIENT 指定它的路径；或只起服务：antex serve {port}");
             herdr::release().await;

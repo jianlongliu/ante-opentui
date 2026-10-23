@@ -16,6 +16,10 @@ chrono = "0.4"
 axum = "0.8"
 futures = "0.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
+# One-command mode ties the client's lifetime to ours (`PR_SET_PDEATHSIG`), so a
+# killed shim cannot leave an orphan TUI owning the terminal. Unix-only, and
+# already in the tree through tokio/reqwest — this just names it directly.
+libc = "0.2"
 # `/connect` only needs one round trip out — the OAuth token exchange.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

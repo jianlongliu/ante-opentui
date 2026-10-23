@@ -59,6 +59,7 @@ Ante（**你自己装的**：官方脚本装、`ante update` 升级）
 | **侧栏额度面板**（`▼ Quota`） | DeepSeek 余额、Command Code 的 5h/W/M + 余额、ChatGPT 订阅窗口、OpenCode Go 用量；数据垫片自己取（`src/quota.rs`），界面是自编客户端里的一块**内置插件**（`feature-plugins/sidebar/quota.tsx`）。**配过凭据的才显示**——没凭据、或凭据在但订阅用不了（401/403）的那几家整块不出现，`Unavailable` 只留给真故障。取数走 `POST /api/rpc/antex.quota/panel`（生成式 client 里唯一「任意 id + 任意方法」的通路，客户端补丁因此不必改生成代码），按 provider 缓存：成功 5 分钟、失败 60 秒，每 60 秒与每个 step 结束时刷新；凭据取环境变量 → `auth/api_keys.json`，ChatGPT 用 `/connect` 落下的 `auth/openai.json`（过期现刷、不写回）。**不装 opencode 插件**：插件那份的取数半边跑在 opencode 自己的 server 里，垫片不跑 JS（理由见 [docs/pitfalls.md](docs/pitfalls.md)） |
 | **贴图** | 粘贴即发。Ante 侧有硬上限（≈240KB base64、≈170KB 原文件），垫片先压到 160KB 以内，压不下就明说 |
 | **断线重连** | 退避重连 + `/api/health` 说真话 + 转录里一行说明，掉线期间排队的消息不丢。**回合没跑完就被杀掉的会话（盘上只剩 `events.jsonl`）Ante 打不开**，这种会话会新开一条继续 |
+| **终端不会被占住** | 一体化模式下垫片被杀（含 `SIGKILL`）、或客户端自己崩掉，终端都会回到可用的 shell：客户端被 `PR_SET_PDEATHSIG` 绑在垫片上（垫片一死内核就给它 `SIGTERM`，它自己会把 raw mode 放回去），垫片另存一份 termios 兜底。**修之前**客户端会变成孤儿霸着 tty、停在 `Connection lost…` 覆盖层，而且 raw mode 下 `ISIG` 关着，**Ctrl+C 也不产生信号** |
 | **常用命令** | `/compact`、`/rename`（走 Ante 自己的 `SessionUpdate.title`，别的前端也看得到；只有当前这条会话能这样改，别的会话改名落垫片自己的 `title.txt`）、`/copy`、`/export`（`GET …/experimental/session/{id}/export` 直接回垫片手上那份转录，`sanitize` 忽略——载荷本来就是 Ante 的日志，不重写路径）、`/stats`（数字全部来自 Ante 的 `meta.json`：会话数、token、活动日历、按 provider/model 分组；Ante 没写的报 0，协议里没有报价也没有子代理计数）、`/skills`（优先用 Ante 播报的技能清单——那是真能调用的集合，含项目域与 `no_skills`；首轮提示词之前才退到磁盘扫描） |
 | **交互** | 模型选择、`shift+tab` 权限模式、`@` 文件补全、Herdr 状态上报、boot 接口全套。多标签**临时**关掉（`tabs.mode = "off"` 只是个配置项，不是能力——它要服务端同时驱动多条会话，垫片只有一条连接；真做多标签见[待定与遗弃](#待定与遗弃)） |
 | **回溯**（`/undo`、`/redo`） | 客户端的两步 revert 接到 Ante 的 `Op::RewindSession`：`/undo` 只登记边界、下一次提交才真正截断（**Ante 会改写自己的 `events.jsonl` 与 `meta.json`**，不是前端遮一层），`/redo` 撤掉未提交的那次。边界 id 要从客户端的 message id 翻成 Ante 的 turn id，靠发提示时埋的对照表；只认本会话发出的提示，恢复来的旧对话会明说回溯不了 |
@@ -180,7 +181,6 @@ macOS 那份**只能在 macOS 上编**：垫片要 Apple SDK（Linux 上交叉�
 - [ ] 会话内 `/cd` —— **Ante 没有换目录的接口**：目录在建会话时由 `SessionRequest.cwd` 定死，`SessionUpdate` 里没有这个字段。会话内 `/cd` 走 `POST /api/session/{id}/move`，垫片回 400 + 一句「新建一个会话」的提示，TUI 原样弹在 toast 里；**没开会话时**的 `/cd` 是纯客户端行为（换的是界面目录），照常可用。退一步是「按新目录重开会话」（丢历史、会话列表多一行）
 - [ ] `/fork` —— **做得到、还没做**：Ante 有 `Op::ForkSession` / `Evt::SessionForked`（附带 `SessionInfo.forked_from`）。客户端走 `POST /api/session/{id}/fork`（`before` ＝ 从哪条输入切），对应 op 的 `at`；fork 出来的是**新会话、不自动开始**，界面要跳到它（`/fork` 的导航语义）
 - [ ] 真多标签（session tabs）—— **待定**：先验证 Ante 侧能否并发驱动多条会话，再谈垫片改造（现在只是把入口临时关掉）
-- [ ] 断线时的终端还原 —— TUI 只弹 `Connection lost · Reconnecting to the server automatically.`，终端留一屏裸 SGR；抓原始字节：用 PTY 跑一次（`script/tui_drive.py` 就是这条路子），把读到的 chunk **先原样落盘再喂 `pyte`**——SGR 序列只在原始字节里看得见
 
 ### 遗弃
 

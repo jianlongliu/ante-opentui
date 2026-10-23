@@ -107,11 +107,20 @@
   - **验证法**（画面）：`uv run --with pyte script/tui_drive.py --cmd "cd $HOME && exec ~/.local/bin/antex-tui --server http://127.0.0.1:41997 $HOME" --send $'3:\x18l' --send $'6:\r' --after 30 --cols 150 --rows 46`（`ctrl+x` `l` 开会话列表、回车进最新一条），侧栏应出现 `▼ Quota` 与四块内容。
   - **OpenCode Go 的实情（2026-10-14 实测）**：`/zen/go/v1/usage` 对没有 Go 订阅的 key 回 `403 EntitlementError`；连 Go 模型调用都回 `403 … An active OpenCode Go subscription is required to use Go models`（`deepseek-v4-flash` / `glm-5.2` / `minimax-m3` 都一样，且推理请求必须带 `x-opencode-session` 头，否则是另一条 `MissingSessionID`）。所以这一行现在**整块收起**（见上面「没登记就隐藏」）而不是假装有窗口，原因记进日志。真要看 5h/周/月窗口得走 console（`opencode.ai/console/api/go/status`，`access.meters.{fiveHour,week,month}`），那需要 console 会话令牌：垫片认 `OPENCODE_CONSOLE_TOKEN`（+ 可选 `OPENCODE_CONSOLE_ORG_ID`）环境变量，给了就走 console、没给才退回 key。
 
+- [x] **断线时的终端还原** —— 一体化模式下垫片被杀，客户端会变成孤儿继续霸占 tty：屏上停着 `Connection lost · Reconnecting to the server automatically.` 覆盖层，用户敲的字全被 TUI 吃掉（实测 `echo AFTER-KILL-OK` 变成 `Connection lost` 那行里的碎片），而 tty 留在 **raw mode**（`ICANON`/`ECHO`/`ISIG`/`IEXTEN` 全关）——`ISIG` 关着时 **Ctrl+C 连信号都不产生**，人也出不去。
+  - **两侧各有一种死法，各有一道闸**（`src/terminal.rs`）：
+    - **垫片先死**（被杀、panic、宿主重启 shell）：默认的信号死亡**不跑任何析构**，所以修法只能在内核——拉起客户端时 `prctl(PR_SET_PDEATHSIG, SIGTERM)` 把它绑在自己身上。实测客户端收到 SIGTERM 会走自己的清理路径完整还原（termios 四项全回 `true`，`?1049l`/`?1000l`/`?2004l`/`?2031l` 齐），所以不用改客户端、不用重编它。
+    - **客户端先死**（SIGKILL、OOM）：没人替它把模式放回去，于是垫片在**启动客户端之前**存一份 termios，退出时无条件 `tcsetattr` 还原（干净退出时是空操作）。
+  - **`pre_exec` 里那两件事不能省**：设完 `PDEATHSIG` 还要查 `getppid() == 1`——父进程若死在 fork 与 exec 之间，信号已经发过了，再 exec 出来就是一个没人管的 TUI，此时应让 spawn 失败。
+  - **为什么不在垫片侧自己进/出 raw mode**：那是客户端的职责，垫片插手会跟它对打；这里只做「它死了我兜底」。
+  - **验证法（判据是 shell 能不能用，不是屏幕长什么样）**：`script/tui_drive.py` 那套不够用（它按 pid 收尾），要跑真实 shell —— PTY 里 `exec zsh -f -i`，敲 `antex PORT & echo $! > /tmp/s.pid; fg`，进 TUI 后 `kill -9 $(cat /tmp/s.pid)`，再敲 `echo AFTER-KILL-OK`：**期望 zsh 立刻拿回提示符并正常执行**。修前同法必失败（留在 `Connection lost` 覆盖层、输入被吃、且 `ps` 里留一条 `antex-tui --server http://127.0.0.1:PORT` 孤儿）；`cargo test` 里 `a_child_takes_sigterm_when_its_spawning_thread_ends` 钉的是内核那一半。**收尾只按 pid 杀**——`pkill -f 'antex-tui --server'` 会把用户正在用的客户端一起杀掉（实测过两次）。
+  - **`serve` 模式不受影响**：不接管终端、不 spawn 客户端，`Terminal::capture()` 在没有 tty 时是空对象。
+
 ### 未完成项的验证法
 
 **不在这张表里了**：遗弃项不用验（Ante 没有这个概念），待定项不用验（没做就是没做）。判断某个入口该不该留在界面上，看 [README](../README.md) 的「状态」清单，再用 [client-patches.md](client-patches.md) 的验收法复核一次即可。
 
-**待定现在只剩三条**，两条都在 README「状态」里：真多标签（要先证 Ante 能并发驱动多会话）、断线时的终端还原（要抓 PTY 原始字节），加上会话内 `/cd` 的退化方案（`/cd` 本身已经会明确报错）。
+**待定现在只剩三条，都在 README 的「待定与遗弃」里**：真多标签（要先证 Ante 能并发驱动多会话）、`/fork`（op 齐了、界面还没接）、会话内 `/cd` 的退化方案（`/cd` 本身已经会明确报错）。
 
 ## 审批
 
@@ -125,7 +134,7 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 ## 验收与排错开关
 
 - **改完垫片必须重启进程**：`target/release/antex` 是产物，旧进程不会自更新——改动不上线，看着像「没修好」。
-- **别按端口杀 antex**：一体化模式端口被占会**自动顺延**，所以 `fuser -k <port>/tcp` 很可能杀掉的是**另一个正在用**的 antex（症状：`Connection lost · Reconnecting to the server automatically.` + 终端留一屏裸 SGR，看着像崩）。要停就按 PID、或先 `ss -ltnp | grep antex` 认清是谁。
+- **别按端口杀 antex**：一体化模式端口被占会**自动顺延**，所以 `fuser -k <port>/tcp` 很可能杀掉的是**另一个正在用**的 antex（症状：那个正在用的界面走到断线态、转录里多一行 `Connection lost` 说明；终端本身现在由 `src/terminal.rs` 兜底，不会再留一屏裸 SGR）。要停就按 PID、或先 `ss -ltnp | grep antex` 认清是谁。
 - **肉眼验收要加 `--print-logs --log-level debug`**——客户端抛异常只弹一个小 toast，正文里什么都不显示，「没反应」多半是它。
 - **TUI 自动化验收用 PTY + pyte 探针**：`script/tui_drive.py` 驱动客户端——`--send '18:文本\r'` 按**绝对秒数**发键（`\r` 提交、`\n` 换行、`\e` 转义），`--after` 是最后一次发键后再等多久，`--dump` 把最终屏文本写文件（不写就只打印；屏上空白行会被滤掉）。**本机没装 tmux**；`uv` 已装（本机那条 `shot-home.py` / `tui_drive.py` 直接 `uv run --with pyte …` 就能跑）——不想用 uv 时另起一次性 venv：`python3 -m venv /tmp/tuivenv && /tmp/tuivenv/bin/pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pyte`，再用 `/tmp/tuivenv/bin/python script/tui_drive.py …`。表单渲染、`AskUser` 作答、首页版本号都是这么验的。
 - **接口级验证不必进 TUI**：`antex serve PORT` 后直接 `curl`，逐条对着「实现清单」的验证法做。
@@ -269,6 +278,6 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 
 **已发布**：`.6`（prompt 请求体上限 2MB → 32MB、「做不了的入口」两层钉死、附件被丢时说出来）→ `2026.10.02`（五条命令放开，见上）→ `2026.10.03`（`ante-sdk` 0.2.7；模型兜底改读 `settings.json`）→ `2026.10.03.2`（恢复会话时提问落位）→ `2026.10.05`（启动自检按版本系列判）→ `2026.10.13`（`ante-sdk` 0.2.10、上游 opencode 2.0.26）→ `2026.10.15`（`/connect` 转正、侧栏额度面板；顺带修了 CI 的 ring + LTO + lld 链接失败）→ `2026.10.15.3`（上游 opencode 2.0.29；垫片喂进界面的文案全改英文、启动自检中英双语）。过去列在缺口里的中断收尾、多轮消息落位、会话列表、agent 切换、`/compact`、恢复旧会话后继续对话都已实现并实测。
 
-要接着做，就挑 [README](../README.md)「状态」清单里 **空框** 的那几条（会话内 `/cd` 的退化方案、真多标签、断线时的终端还原）；**带删除线** 的一条都别再提议——Ante 底层没有那些概念。
+要接着做，就挑 [README](../README.md)「状态」清单里 **空框** 的那几条（会话内 `/cd` 的退化方案、真多标签）；**带删除线** 的一条都别再提议——Ante 底层没有那些概念。
 
 **已知瑕疵（不影响使用）**：TUI 新建会话时 id 是**客户端本地发号**的（`packages/tui/src/component/prompt/index.tsx` 的乐观创建），Ante 那边则按自己的 id 另建一条同格式目录。于是刚建的会话在重启前只以客户端 id 存在于内存里（本进程内就按它跟踪），重启后要从列表里按 Ante 的 id 恢复——内容一直在 Ante 那条目录里，不会丢，两个 id 也不会互相冒充。
