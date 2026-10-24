@@ -5720,9 +5720,55 @@ async fn main() {
     if let Some(config) = client_config_from_disk() {
         command.env("OPENCODE_CLI_CONFIG_CONTENT", config);
     }
-    match command.status() {
-        // The TUI owns the terminal; when it exits, so do we.
-        Ok(status) => {
+    // Spawn here, on the thread that lives as long as the process: the Linux
+    // parent-death signal fires when *the spawning thread* exits, so spawning
+    // from a short-lived thread would kill the TUI immediately.
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            terminal.restore();
+            eprintln!("起不了 opencode 客户端（{}）：{err}", client.display());
+            eprintln!("用 ANTEX_CLIENT 指定它的路径；或只起服务：antex serve {port}");
+            herdr::release().await;
+            std::process::exit(1);
+        }
+    };
+    // A `kill` on us must reach the client too, or it outlives us holding the
+    // terminal in raw mode. Stopped as soon as the client is gone, so a late
+    // signal cannot land on a recycled pid.
+    let (forwarder, forwarded) = terminal::forward_death_signals(child.id());
+
+    // The TUI owns the terminal; when it exits, so do we. Waiting on a blocking
+    // thread keeps the signal forwarder (a runtime task) alive to do its job.
+    enum Ended {
+        Exited(std::io::Result<std::process::ExitStatus>),
+        /// Waiting itself failed (the blocking task panicked or was cancelled).
+        Lost(tokio::task::JoinError),
+        /// A signal was forwarded and the client still has not gone in 5s.
+        Wedged,
+    }
+    let mut wait_task = tokio::task::spawn_blocking(move || {
+        let mut child = child;
+        child.wait()
+    });
+    // No timeout while the user is working — the TUI runs for hours. Only once a
+    // signal has been forwarded does the wait become bounded, so a client that
+    // ignores it cannot keep the shim (and the tty) hostage.
+    let ended = tokio::select! {
+        joined = &mut wait_task => match joined {
+            Ok(status) => Ended::Exited(status),
+            Err(err) => Ended::Lost(err),
+        },
+        _ = forwarded => match tokio::time::timeout(std::time::Duration::from_secs(5), &mut wait_task).await {
+            Ok(Ok(status)) => Ended::Exited(status),
+            Ok(Err(err)) => Ended::Lost(err),
+            Err(_) => Ended::Wedged,
+        },
+    };
+    forwarder.abort();
+
+    match ended {
+        Ended::Exited(Ok(status)) => {
             // It restores the terminal itself on a clean exit, but not when it
             // was killed — do it unconditionally, it is a no-op otherwise.
             terminal.restore();
@@ -5731,12 +5777,25 @@ async fn main() {
             herdr::release().await;
             std::process::exit(status.code().unwrap_or(0))
         }
-        Err(err) => {
+        Ended::Exited(Err(err)) => {
             terminal.restore();
-            eprintln!("起不了 opencode 客户端（{}）：{err}", client.display());
-            eprintln!("用 ANTEX_CLIENT 指定它的路径；或只起服务：antex serve {port}");
+            eprintln!("opencode 客户端异常退出：{err}");
             herdr::release().await;
-            std::process::exit(1);
+            std::process::exit(1)
+        }
+        Ended::Lost(err) => {
+            terminal.restore();
+            eprintln!("等客户端退出时出错：{err}");
+            herdr::release().await;
+            std::process::exit(1)
+        }
+        // The forwarded signal did not stop it. Put the terminal back and go,
+        // rather than hang with the tty in whatever mode the client left it.
+        Ended::Wedged => {
+            log_line(&format!("terminal: 客户端 {} 收到信号后 5s 内没有退出，垫片自己收尾", client.display()));
+            terminal.restore();
+            herdr::release().await;
+            std::process::exit(128 + libc::SIGTERM)
         }
     }
 }

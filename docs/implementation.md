@@ -108,13 +108,17 @@
   - **OpenCode Go 的实情（2026-10-14 实测）**：`/zen/go/v1/usage` 对没有 Go 订阅的 key 回 `403 EntitlementError`；连 Go 模型调用都回 `403 … An active OpenCode Go subscription is required to use Go models`（`deepseek-v4-flash` / `glm-5.2` / `minimax-m3` 都一样，且推理请求必须带 `x-opencode-session` 头，否则是另一条 `MissingSessionID`）。所以这一行现在**整块收起**（见上面「没登记就隐藏」）而不是假装有窗口，原因记进日志。真要看 5h/周/月窗口得走 console（`opencode.ai/console/api/go/status`，`access.meters.{fiveHour,week,month}`），那需要 console 会话令牌：垫片认 `OPENCODE_CONSOLE_TOKEN`（+ 可选 `OPENCODE_CONSOLE_ORG_ID`）环境变量，给了就走 console、没给才退回 key。
 
 - [x] **断线时的终端还原** —— 一体化模式下垫片被杀，客户端会变成孤儿继续霸占 tty：屏上停着 `Connection lost · Reconnecting to the server automatically.` 覆盖层，用户敲的字全被 TUI 吃掉（实测 `echo AFTER-KILL-OK` 变成 `Connection lost` 那行里的碎片），而 tty 留在 **raw mode**（`ICANON`/`ECHO`/`ISIG`/`IEXTEN` 全关）——`ISIG` 关着时 **Ctrl+C 连信号都不产生**，人也出不去。
-  - **两侧各有一种死法，各有一道闸**（`src/terminal.rs`）：
-    - **垫片先死**（被杀、panic、宿主重启 shell）：默认的信号死亡**不跑任何析构**，所以修法只能在内核——拉起客户端时 `prctl(PR_SET_PDEATHSIG, SIGTERM)` 把它绑在自己身上。实测客户端收到 SIGTERM 会走自己的清理路径完整还原（termios 四项全回 `true`，`?1049l`/`?1000l`/`?2004l`/`?2031l` 齐），所以不用改客户端、不用重编它。
+  - **两种死法、两道闸**（`src/terminal.rs`）：
+    - **垫片被信号杀死**（`kill`、宿主收终端）：垫片自己 `forward_death_signals` 收到 `TERM`/`INT`/`HUP`/`QUIT` 就转成 `SIGTERM` 发给客户端，客户端走它自己的清理路径完整还原（实测 termios 四项全回 `true`，`?1049l`/`?1000l`/`?2004l`/`?2031l` 齐）。**不用改客户端、不用重编它。**
+    - **垫片被不可捕获地杀死**（`SIGKILL`、OOM）：没人能跑代码转发，只能靠内核——Linux 上拉起客户端时 `prctl(PR_SET_PDEATHSIG, SIGTERM)`，父线程一没内核就替我们发信号。**`PR_SET_PDEATHSIG` 只有 Linux 有**（`libc` 里它落在 linux_like 段，macOS 编不过），所以那半边用 `#[cfg(target_os = "linux")]` 门着；**macOS 这条仍然开着**（`SIGKILL` 会留孤儿），catchable 的那种由转发覆盖——这是平台事实，不是没写完。
     - **客户端先死**（SIGKILL、OOM）：没人替它把模式放回去，于是垫片在**启动客户端之前**存一份 termios，退出时无条件 `tcsetattr` 还原（干净退出时是空操作）。
+  - **spawn 必须在主线程**：`PDEATHSIG` 在**发起调用的那条线程**退出时触发，从短命线程里 spawn 会立刻把 TUI 杀掉——所以 `command.spawn()` 在主线程，等待交给 `spawn_blocking`。
+  - **超时只在转发之后才计**：TUI 正常要跑几个钟头，所以等待客户端的默认状态是**无限**；只有真转过信号之后才给它 5 秒，卡死的客户端不该连带把垫片和 tty 扣住。
   - **`pre_exec` 里那两件事不能省**：设完 `PDEATHSIG` 还要查 `getppid() == 1`——父进程若死在 fork 与 exec 之间，信号已经发过了，再 exec 出来就是一个没人管的 TUI，此时应让 spawn 失败。
   - **为什么不在垫片侧自己进/出 raw mode**：那是客户端的职责，垫片插手会跟它对打；这里只做「它死了我兜底」。
-  - **验证法（判据是 shell 能不能用，不是屏幕长什么样）**：`script/tui_drive.py` 那套不够用（它按 pid 收尾），要跑真实 shell —— PTY 里 `exec zsh -f -i`，敲 `antex PORT & echo $! > /tmp/s.pid; fg`，进 TUI 后 `kill -9 $(cat /tmp/s.pid)`，再敲 `echo AFTER-KILL-OK`：**期望 zsh 立刻拿回提示符并正常执行**。修前同法必失败（留在 `Connection lost` 覆盖层、输入被吃、且 `ps` 里留一条 `antex-tui --server http://127.0.0.1:PORT` 孤儿）；`cargo test` 里 `a_child_takes_sigterm_when_its_spawning_thread_ends` 钉的是内核那一半。**收尾只按 pid 杀**——`pkill -f 'antex-tui --server'` 会把用户正在用的客户端一起杀掉（实测过两次）。
+  - **验证法（判据是 shell 能不能用，不是屏幕长什么样）**：`script/tui_drive.py` 那套不够用（它按 pid 收尾），要跑真实 shell —— PTY 里 `exec zsh -f -i`，敲 `antex PORT & echo $! > /tmp/s.pid; fg`，进 TUI 后**分别** `kill -9`（内核那条）和 `kill -TERM`（转发那条）`$(cat /tmp/s.pid)`，再敲 `echo OK`：**两种情况都应立刻拿回 zsh 提示符并正常执行**。修前同法必失败（留在 `Connection lost` 覆盖层、输入被吃、`ps` 里留一条 `antex-tui --server http://127.0.0.1:PORT` 孤儿）；**另加一条回归线**：什么都不杀、让 TUI 空转 45 秒，垫片与客户端必须都还在（验「等待没有误加超时」）。`cargo test` 里 `a_child_takes_sigterm_when_its_spawning_thread_ends`（内核那半）与 `a_signal_aimed_at_us_is_forwarded_to_the_client`（转发那半）各钉一边。**收尾只按 pid 杀**——`pkill -f 'antex-tui --server'` 会把用户正在用的客户端一起杀掉（实测过两次）。
   - **`serve` 模式不受影响**：不接管终端、不 spawn 客户端，`Terminal::capture()` 在没有 tty 时是空对象。
+
 
 ### 未完成项的验证法
 

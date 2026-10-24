@@ -18,25 +18,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "antex"
-version = "0.1.0"
-dependencies = [
- "ante-sdk",
- "axum",
- "base64 0.22.1",
- "chrono",
- "futures",
- "image",
- "libc",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tokio-stream",
-]
-
-[[package]]
 name = "ante-protocol-shape"
 version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -62,6 +43,25 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "which",
+]
+
+[[package]]
+name = "antex"
+version = "0.1.0"
+dependencies = [
+ "ante-sdk",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "futures",
+ "image",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]

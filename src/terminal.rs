@@ -3,17 +3,26 @@
 //! The client is the one that puts the tty into raw mode, so the shim cannot ask
 //! it to undo that on every way out. What it *can* do is make sure the terminal
 //! never outlives the pair in that state — the "bare SGR screen" that reads as a
-//! crash. Two failure shapes, two guards:
+//! crash. Measured before the fix: the orphaned TUI kept the terminal in raw
+//! mode, where `ISIG` is off, so even Ctrl+C produced no signal to get out with.
 //!
-//! * **The shim dies first** (killed, panics, host reboots the shell). Default
-//!   signal death runs no destructor at all, so the fix has to live in the
-//!   kernel: the client is armed with `PR_SET_PDEATHSIG = SIGTERM`, and a TUI
-//!   that gets SIGTERM restores the terminal and exits (measured: `ICANON`,
+//! Two guards, for the two ways this can go wrong:
+//!
+//! * **The shim is signalled** (`kill`, Ctrl+C at the shell, host shutting the
+//!   session down) — `forward_death_signals` catches it and passes SIGTERM to the
+//!   client, which restores the terminal itself and exits (measured: `ICANON`,
 //!   `ECHO`, `ISIG`, `IEXTEN` all back on, plus `?1049l`/`?1000l`/`?2004l`).
 //!
-//! * **The client dies first, unschedulable-y** (SIGKILL, OOM). Nobody is left
-//!   to put the modes back, so the shim remembers what they were before the
-//!   client ran and restores that on the way out.
+//! * **The shim dies uncatchably** (SIGKILL, OOM). No user code runs, so nothing
+//!   can forward anything. On Linux the kernel does it: `PR_SET_PDEATHSIG` is
+//!   armed in the forked child, so the client takes a SIGTERM the moment its
+//!   parent thread exits. **macOS has no such facility** — there that case still
+//!   leaves an orphan, which is why the shim also restores the modes itself on
+//!   the paths it does run (`Terminal::restore`).
+//!
+//! * **The client dies first** (SIGKILL, OOM). Nobody is left to put the modes
+//!   back, so the shim remembers what they were before the client ran and
+//!   restores that on the way out.
 //!
 //! Deliberately *not* done here: printing a "reconnect" epilogue or clearing the
 //! screen. Restoring the modes is what makes the shell usable again; the scroll
@@ -35,7 +44,7 @@ impl Terminal {
     /// Call it *before* spawning the client: once the client is up it has
     /// already switched to raw mode, and there is nothing left worth saving.
     pub fn capture() -> Self {
-        Self { saved: live_termios().map(|(fd, attrs)| (fd, attrs)) }
+        Self { saved: live_termios() }
     }
 
     /// Puts the saved modes back. Idempotent, and safe after a crash of the
@@ -79,16 +88,17 @@ fn live_termios() -> Option<(libc::c_int, libc::termios)> {
     None
 }
 
-/// Arms the child to take a SIGTERM when the thread that spawns it goes away.
+/// Arms the client to take a SIGTERM when its parent thread goes away.
 ///
-/// Called for the client so a killed shim cannot leave an orphan TUI holding the
-/// terminal. The parent-death signal is delivered by the kernel at thread exit,
-/// which is exactly the moment the shim's `main` stops existing — including the
-/// deaths that run no user code at all (SIGKILL, OOM kill, `std::process::exit`).
+/// Linux only, because the facility is: the kernel delivers the signal for
+/// deaths no process can catch (SIGKILL, OOM, `std::process::exit`), which is
+/// exactly what `forward_death_signals` cannot reach. Elsewhere this is a no-op
+/// and the orphan case stays open — see the module docs.
+#[cfg(target_os = "linux")]
 pub fn die_with_parent(command: &mut std::process::Command) {
-    // SAFETY: the closure runs between fork and exec. It only makes two libc
-    // calls and loads an integer — no allocation, no locks, nothing that could
-    // deadlock in a single-threaded child.
+    // SAFETY: the closure runs between fork and exec. It only makes libc calls
+    // and loads integers — no allocation, no locks, nothing that could deadlock
+    // in a single-threaded child.
     unsafe {
         command.pre_exec(|| {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong) != 0 {
@@ -105,17 +115,74 @@ pub fn die_with_parent(command: &mut std::process::Command) {
     }
 }
 
+/// No parent-death signal here; catchable deaths still go through forwarding.
+#[cfg(not(target_os = "linux"))]
+pub fn die_with_parent(_command: &mut std::process::Command) {}
+
+/// Passes a terminating signal aimed at us on to the client.
+///
+/// The client is waiting in `main` as a child process; when it gets this signal
+/// it restores the terminal and exits, and the shim's own exit path follows.
+///
+/// Returns the task and a receiver that fires once a signal has actually been
+/// forwarded. The shim waits for the client indefinitely in normal use, so the
+/// "give up on a wedged client" timer must only start from that moment.
+pub fn forward_death_signals(
+    client_pid: u32,
+) -> (tokio::task::JoinHandle<()>, tokio::sync::oneshot::Receiver<()>) {
+    let (forwarded, notify) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut caught = Vec::new();
+        for (name, kind) in [
+            ("TERM", SignalKind::terminate()),
+            ("INT", SignalKind::interrupt()),
+            ("HUP", SignalKind::hangup()),
+            ("QUIT", SignalKind::quit()),
+        ] {
+            match signal(kind) {
+                Ok(mut stream) => {
+                    caught.push(Box::pin(async move {
+                        stream.recv().await;
+                        name
+                    }) as std::pin::Pin<Box<dyn std::future::Future<Output = &'static str> + Send>>);
+                }
+                // One that will not install is not fatal: the others still work.
+                Err(err) => crate::log_line(&format!("terminal: {name} 处理器装不上：{err}")),
+            }
+        }
+        if caught.is_empty() {
+            return;
+        }
+        // Whichever fires first is the one that counts.
+        let name = futures::future::select_all(caught).await.0;
+        crate::log_line(&format!("terminal: 收到 SIG{name}，转给客户端 {client_pid}"));
+        // SAFETY: `kill` only reads its arguments; a pid that has gone away is a
+        // harmless ESRCH.
+        unsafe {
+            libc::kill(client_pid as libc::pid_t, libc::SIGTERM);
+        }
+        let _ = forwarded.send(());
+    });
+    (task, notify)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The guard the whole module exists for: a child spawned this way dies when
-    /// the thread that spawned it does — even though the process lives on.
+    /// A child armed for its parent's death must go when the spawning thread
+    /// ends — the process stays up, so the only thing that can stop it is the
+    /// kernel-delivered signal.
     ///
-    /// The child is a plain `sleep`, so its only chance of stopping is the
-    /// kernel-delivered SIGTERM; a zombie is enough proof it was delivered.
+    /// Linux-only in practice: `die_with_parent` is a no-op elsewhere, and there
+    /// is nothing to assert about a documented gap.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_child_takes_sigterm_when_its_spawning_thread_ends() {
+        use std::time::{Duration, Instant};
+
         let (tx, rx) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
             let mut command = std::process::Command::new("sleep");
@@ -126,10 +193,10 @@ mod tests {
             drop(child);
         });
 
-        let pid = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("pid");
+        let pid = rx.recv_timeout(Duration::from_secs(5)).expect("pid");
         thread.join().expect("spawning thread ends");
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
                 // Field 3 is the state; `Z` is a zombie, i.e. the signal landed.
@@ -141,11 +208,8 @@ mod tests {
                 }
                 Err(_) => return, // reaped already: also gone
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "child {pid} survived its spawning thread"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(25));
+            assert!(Instant::now() < deadline, "child {pid} survived its spawning thread");
+            std::thread::sleep(Duration::from_millis(25));
         }
     }
 
@@ -156,5 +220,48 @@ mod tests {
         let terminal = Terminal::capture();
         terminal.restore();
         terminal.restore();
+    }
+
+    /// The catchable half: a signal aimed at the shim must reach the client, or
+    /// the client outlives it holding the terminal.
+    ///
+    /// The client here is a `sleep`; it stops only if the forwarded SIGTERM
+    /// arrives. `sleep` exiting with the signal is what the assertion reads.
+    #[tokio::test]
+    async fn a_signal_aimed_at_us_is_forwarded_to_the_client() {
+        use std::time::Duration;
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let (forwarder, forwarded) = forward_death_signals(child.id());
+        // Give the handlers a moment to install before the signal can arrive.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // SAFETY: signal delivery to our own process; the handler above takes it.
+        unsafe {
+            libc::raise(libc::SIGTERM);
+        }
+        // The forwarder reports it actually sent the signal on to the client.
+        tokio::time::timeout(Duration::from_secs(2), forwarded)
+            .await
+            .expect("the forwarder should report a forwarded signal")
+            .expect("forwarder should send");
+
+        let waited = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::task::spawn_blocking(move || child.wait()).await
+        })
+        .await
+        .expect("client should exit once the signal is forwarded")
+        .expect("wait thread")
+        .expect("wait");
+
+        forwarder.abort();
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(waited.signal(), Some(libc::SIGTERM), "client should have taken the forwarded signal");
+        }
     }
 }
